@@ -289,8 +289,10 @@ defmodule SurrealDB.Codec.CBOR do
     mantissa = bits &&& 0x3FF
 
     cond do
+      # Half-precision infinity and NaN have no Erlang float representation, so fall back
+      # to 0.0. SurrealDB does not emit these in practice.
+      exponent == 0x1F -> 0.0
       exponent == 0 -> sign * :math.pow(2, -14) * (mantissa / 1024)
-      exponent == 0x1F -> sign * if(mantissa == 0, do: :math.pow(10, 308) * 10, else: 0.0)
       true -> sign * :math.pow(2, exponent - 15) * (1 + mantissa / 1024)
     end
   end
