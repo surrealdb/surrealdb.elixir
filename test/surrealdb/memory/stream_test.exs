@@ -1,15 +1,15 @@
-defmodule SurrealDB.Spectron.StreamTest do
+defmodule SurrealDB.Memory.StreamTest do
   use ExUnit.Case, async: true
 
   import Plug.Conn
 
-  alias SurrealDB.Spectron
+  alias SurrealDB.Memory
 
   setup do
     bypass = Bypass.open()
 
     client =
-      Spectron.new(
+      Memory.new(
         endpoint: "http://localhost:#{bypass.port}",
         context: "acme",
         api_key: "secret",
@@ -30,7 +30,7 @@ defmodule SurrealDB.Spectron.StreamTest do
       conn
     end)
 
-    assert {:ok, stream} = Spectron.chat(client, "hi", stream: true)
+    assert {:ok, stream} = Memory.chat(client, "hi", stream: true)
     chunks = Enum.to_list(stream)
     assert Enum.map(chunks, & &1["delta"]) == ["He", "llo"]
   end

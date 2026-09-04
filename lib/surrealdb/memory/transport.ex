@@ -1,13 +1,13 @@
-defmodule SurrealDB.Spectron.Transport do
+defmodule SurrealDB.Memory.Transport do
   @moduledoc false
-  # Synchronous JSON transport for the Spectron REST API, backed by Mint.
+  # Synchronous JSON transport for the Agent Memory REST API, backed by Mint.
   #
   # It builds the shared headers (Bearer auth, optional on-behalf-of delegation, an
   # idempotency key for mutating requests), performs the request, extracts the trace id,
   # decodes the JSON body, retries retryable failures with backoff, and maps non-2xx
-  # responses to `SurrealDB.Spectron.Error`.
+  # responses to `SurrealDB.Memory.Error`.
 
-  alias SurrealDB.Spectron.Error
+  alias SurrealDB.Memory.Error
 
   @trace_header "x-spectron-trace-id"
 

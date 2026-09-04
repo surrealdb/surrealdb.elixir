@@ -1,12 +1,12 @@
 # SurrealDB for Elixir
 
 An Elixir SDK for [SurrealDB](https://surrealdb.com) and
-[Spectron](https://surrealdb.com/platform/spectron), built for idiomatic Elixir: supervised
+[Agent Memory](https://surrealdb.com/agent-memory), built for idiomatic Elixir: supervised
 connections you pass around as handles, native value types, live queries delivered as
-process messages, and a typed Spectron memory client.
+process messages, and a typed agent memory client.
 
 It aims for feature parity with the official JavaScript SDKs (`surrealdb` and
-`@surrealdb/spectron`).
+`@surrealdb/memory`).
 
 ## Features
 
@@ -19,7 +19,7 @@ It aims for feature parity with the official JavaScript SDKs (`surrealdb` and
   `unset`, `query`, `select`, `create`, `insert`, `insert_relation`, `update`, `upsert`,
   `merge`, `patch`, `delete`, `relate`, `run`, `info`, `version`, plus `export`/`import`.
 - **Live queries** delivered to any process as messages.
-- **Spectron client** with the complete tool surface and namespaces.
+- **Agent Memory client** with the complete tool surface and namespaces.
 - Works in any Elixir project: it is a plain library with a supervisable connection
   process and no framework assumptions.
 
@@ -178,28 +178,28 @@ SurrealDB.kill(db, live_id)
 
 The HTTP engine does not support live queries. Use a `ws`/`wss` URL for those.
 
-## Spectron
+## Agent Memory
 
-Spectron is a typed REST service for agent memory. Create a client pinned to one context
+Agent Memory is a typed REST service for agent memory. Create a client pinned to one context
 and pass it to every call.
 
 ```elixir
 client =
-  SurrealDB.Spectron.new(
-    endpoint: System.fetch_env!("SPECTRON_ENDPOINT"),
+  SurrealDB.Memory.new(
+    endpoint: System.fetch_env!("AGENT_MEMORY_ENDPOINT"),
     context: "acme-prod",
-    api_key: System.fetch_env!("SPECTRON_API_KEY")
+    api_key: System.fetch_env!("AGENT_MEMORY_API_KEY")
   )
 
-{:ok, _} = SurrealDB.Spectron.remember(client, "I just got promoted to CTO", scopes: "user/tobie")
-{:ok, hits} = SurrealDB.Spectron.recall(client, "What is Tobie's role?", k: 10)
-{:ok, %{"reply" => reply}} = SurrealDB.Spectron.chat(client, "What do you know about me?")
+{:ok, _} = SurrealDB.Memory.remember(client, "I just got promoted to CTO", scopes: "user/tobie")
+{:ok, hits} = SurrealDB.Memory.recall(client, "What is Tobie's role?", k: 10)
+{:ok, %{"reply" => reply}} = SurrealDB.Memory.chat(client, "What do you know about me?")
 ```
 
 ### Streaming chat
 
 ```elixir
-{:ok, stream} = SurrealDB.Spectron.chat(client, "Tell me a story", stream: true)
+{:ok, stream} = SurrealDB.Memory.chat(client, "Tell me a story", stream: true)
 
 for chunk <- stream do
   IO.write(chunk["delta"])
@@ -211,14 +211,14 @@ end
 Grouped operations live in dedicated modules, each taking the client first:
 
 ```elixir
-{:ok, doc} = SurrealDB.Spectron.Documents.upload(client, title: "Handbook", file: "handbook.pdf")
-{:ok, chunks} = SurrealDB.Spectron.Documents.chunks(client, doc["id"])
+{:ok, doc} = SurrealDB.Memory.Documents.upload(client, title: "Handbook", file: "handbook.pdf")
+{:ok, chunks} = SurrealDB.Memory.Documents.chunks(client, doc["id"])
 
-{:ok, session} = SurrealDB.Spectron.Sessions.create(client)
-{:ok, _} = SurrealDB.Spectron.Session.turns(session, [%{role: "user", content: "hi"}])
-{:ok, _} = SurrealDB.Spectron.Session.close(session)
+{:ok, session} = SurrealDB.Memory.Sessions.create(client)
+{:ok, _} = SurrealDB.Memory.Session.turns(session, [%{role: "user", content: "hi"}])
+{:ok, _} = SurrealDB.Memory.Session.close(session)
 
-{:ok, minted} = SurrealDB.Spectron.Keys.create(client, name: "ci", ttl_seconds: 3600)
+{:ok, minted} = SurrealDB.Memory.Keys.create(client, name: "ci", ttl_seconds: 3600)
 ```
 
 The available namespaces are `Documents`, `Entities`, `Sessions`, `Lifecycle`, `Traces`,
@@ -230,20 +230,20 @@ The available namespaces are `Documents`, `Entities`, `Sessions`, `Lifecycle`, `
 header. The original client is unchanged.
 
 ```elixir
-as_alex = SurrealDB.Spectron.on_behalf_of(client, "principal:alex")
-{:ok, _} = SurrealDB.Spectron.remember(as_alex, "Reviewed the Q3 plan")
+as_alex = SurrealDB.Memory.on_behalf_of(client, "principal:alex")
+{:ok, _} = SurrealDB.Memory.remember(as_alex, "Reviewed the Q3 plan")
 ```
 
 ### Errors
 
-Spectron calls return `{:error, %SurrealDB.Spectron.Error{}}` whose `kind` is one of
+Agent Memory calls return `{:error, %SurrealDB.Memory.Error{}}` whose `kind` is one of
 `:auth`, `:validation`, `:not_found`, `:rate_limit`, `:scope`, `:server`, or `:connection`.
 Each error also carries the response `trace_id` when the server provided one.
 
 ## Testing
 
 The default test suite is fully hermetic (no network) and uses a mock engine for the
-database client and [Bypass](https://hex.pm/packages/bypass) for the Spectron client:
+database client and [Bypass](https://hex.pm/packages/bypass) for the Agent Memory client:
 
 ```sh
 mix test
