@@ -42,8 +42,8 @@ defmodule SurrealDB.MixProject do
   end
 
   defp description do
-    "Elixir SDK for SurrealDB and Spectron. WebSocket and HTTP engines, CBOR and JSON " <>
-      "protocols, live queries, and a typed Spectron memory client."
+    "Elixir SDK for SurrealDB and Agent Memory. WebSocket and HTTP engines, CBOR and JSON " <>
+      "protocols, live queries, and a typed agent memory client."
   end
 
   defp package do
@@ -88,17 +88,17 @@ defmodule SurrealDB.MixProject do
           SurrealDB.Bytes,
           SurrealDB.None
         ],
-        Spectron: [
-          SurrealDB.Spectron,
-          SurrealDB.Spectron.Documents,
-          SurrealDB.Spectron.Entities,
-          SurrealDB.Spectron.Sessions,
-          SurrealDB.Spectron.Lifecycle,
-          SurrealDB.Spectron.Traces,
-          SurrealDB.Spectron.Principals,
-          SurrealDB.Spectron.Scopes,
-          SurrealDB.Spectron.Keys,
-          SurrealDB.Spectron.Error
+        "Agent Memory": [
+          SurrealDB.Memory,
+          SurrealDB.Memory.Documents,
+          SurrealDB.Memory.Entities,
+          SurrealDB.Memory.Sessions,
+          SurrealDB.Memory.Lifecycle,
+          SurrealDB.Memory.Traces,
+          SurrealDB.Memory.Principals,
+          SurrealDB.Memory.Scopes,
+          SurrealDB.Memory.Keys,
+          SurrealDB.Memory.Error
         ]
       ]
     ]

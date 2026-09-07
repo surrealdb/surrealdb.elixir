@@ -1,6 +1,6 @@
-defmodule SurrealDB.Spectron.Error do
+defmodule SurrealDB.Memory.Error do
   @moduledoc """
-  Error returned by the Spectron client.
+  Error returned by the Agent Memory client.
 
   The `kind` mirrors the JavaScript SDK's error classes:
 
@@ -24,7 +24,7 @@ defmodule SurrealDB.Spectron.Error do
           details: term()
         }
 
-  defexception [:status, :trace_id, :details, kind: :server, message: "Spectron error"]
+  defexception [:status, :trace_id, :details, kind: :server, message: "Agent Memory error"]
 
   @doc "Builds a connection error."
   @spec connection(term()) :: t()
@@ -54,7 +54,7 @@ defmodule SurrealDB.Spectron.Error do
 
   defp message_for(%{"error" => message}, _status) when is_binary(message), do: message
   defp message_for(%{"message" => message}, _status) when is_binary(message), do: message
-  defp message_for(_body, status), do: "Spectron request failed with status #{status}"
+  defp message_for(_body, status), do: "Agent Memory request failed with status #{status}"
 
   @impl true
   def message(%__MODULE__{kind: kind, status: nil, message: message}), do: "[#{kind}] #{message}"

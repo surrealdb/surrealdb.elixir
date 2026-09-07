@@ -1,11 +1,11 @@
-defmodule SurrealDB.Spectron.Stream do
+defmodule SurrealDB.Memory.Stream do
   @moduledoc false
-  # Server-sent events streaming for `SurrealDB.Spectron.chat/3` with `stream: true`.
+  # Server-sent events streaming for `SurrealDB.Memory.chat/3` with `stream: true`.
   #
   # Returns a lazy `Stream` of decoded chunk maps. Each `data:` line is parsed as JSON; the
   # terminal `data: [DONE]` marker and the end of the HTTP response both stop the stream.
 
-  alias SurrealDB.Spectron.Error
+  alias SurrealDB.Memory.Error
 
   @doc "Builds a lazy stream of chat chunks for the given request."
   @spec start(struct(), String.t(), iodata(), [{String.t(), String.t()}]) :: Enumerable.t()

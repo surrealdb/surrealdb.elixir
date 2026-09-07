@@ -1,28 +1,28 @@
-defmodule SurrealDB.Spectron do
+defmodule SurrealDB.Memory do
   @moduledoc """
-  Client for the [Spectron](https://surrealdb.com/platform/spectron) memory API.
+  Client for the [Agent Memory](https://surrealdb.com/agent-memory) API.
 
-  Spectron is a typed REST service for agent memory. The client is a lightweight struct
+  Agent Memory is a typed REST service for agent memory. The client is a lightweight struct
   pinned to a single context; create one with `new/1` and pass it to every call:
 
       client =
-        SurrealDB.Spectron.new(
-          endpoint: System.fetch_env!("SPECTRON_ENDPOINT"),
+        SurrealDB.Memory.new(
+          endpoint: System.fetch_env!("AGENT_MEMORY_ENDPOINT"),
           context: "acme-prod",
-          api_key: System.fetch_env!("SPECTRON_API_KEY")
+          api_key: System.fetch_env!("AGENT_MEMORY_API_KEY")
         )
 
-      {:ok, _facts} = SurrealDB.Spectron.remember(client, "I just got promoted to CTO", scopes: "user/tobie")
-      {:ok, hits} = SurrealDB.Spectron.recall(client, "What is Tobie's role?", k: 10)
-      {:ok, %{"reply" => reply}} = SurrealDB.Spectron.chat(client, "What do you know about me?")
+      {:ok, _facts} = SurrealDB.Memory.remember(client, "I just got promoted to CTO", scopes: "user/tobie")
+      {:ok, hits} = SurrealDB.Memory.recall(client, "What is Tobie's role?", k: 10)
+      {:ok, %{"reply" => reply}} = SurrealDB.Memory.chat(client, "What do you know about me?")
 
   ## Namespaces
 
   Grouped operations live in dedicated modules, each taking the client as the first
-  argument: `SurrealDB.Spectron.Documents`, `SurrealDB.Spectron.Entities`,
-  `SurrealDB.Spectron.Sessions`, `SurrealDB.Spectron.Lifecycle`,
-  `SurrealDB.Spectron.Traces`, `SurrealDB.Spectron.Principals`,
-  `SurrealDB.Spectron.Scopes`, and `SurrealDB.Spectron.Keys`.
+  argument: `SurrealDB.Memory.Documents`, `SurrealDB.Memory.Entities`,
+  `SurrealDB.Memory.Sessions`, `SurrealDB.Memory.Lifecycle`,
+  `SurrealDB.Memory.Traces`, `SurrealDB.Memory.Principals`,
+  `SurrealDB.Memory.Scopes`, and `SurrealDB.Memory.Keys`.
 
   ## Delegation
 
@@ -31,7 +31,7 @@ defmodule SurrealDB.Spectron do
   original client is left unchanged.
   """
 
-  alias SurrealDB.Spectron.{Stream, Transport}
+  alias SurrealDB.Memory.{Stream, Transport}
 
   @enforce_keys [:endpoint, :context, :api_key]
   defstruct [
@@ -54,14 +54,14 @@ defmodule SurrealDB.Spectron do
           retry: map() | false
         }
 
-  @type result :: {:ok, term()} | {:error, SurrealDB.Spectron.Error.t()}
+  @type result :: {:ok, term()} | {:error, SurrealDB.Memory.Error.t()}
 
   @doc """
   Builds a client.
 
   ## Options
 
-    * `:endpoint` (required) - base URL of the Spectron API.
+    * `:endpoint` (required) - base URL of the Agent Memory API.
     * `:context` (required) - the context this client is pinned to.
     * `:api_key` (required) - API key sent as a Bearer token.
     * `:timeout` - per-request timeout in milliseconds (default 30000).
@@ -86,7 +86,7 @@ defmodule SurrealDB.Spectron do
     %{client | on_behalf_of: principal_id}
   end
 
-  # ── Memory operations ────────────────────────────────────────────────────────
+  # ── Agent Memory operations ────────────────────────────────────────────────────────
 
   @doc "Persists facts from free text and/or caller-supplied options. Idempotent."
   @spec remember(t(), String.t() | nil, keyword()) :: result()
