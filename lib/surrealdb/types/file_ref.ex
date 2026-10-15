@@ -7,8 +7,9 @@ defmodule SurrealDB.FileRef do
       iex> SurrealDB.FileRef.new("avatars", "/tobie.png")
       %SurrealDB.FileRef{bucket: "avatars", key: "/tobie.png"}
 
-  Files are an experimental server feature: the server must run with
-  `--allow-experimental files`.
+  Sending and receiving a file reference as a value works on any server. Using the file
+  itself (reading, writing, or listing bucket contents, or writing an `f"..."` literal in
+  SurrealQL) is an experimental server feature that needs `--allow-experimental files`.
   """
 
   @enforce_keys [:bucket, :key]
