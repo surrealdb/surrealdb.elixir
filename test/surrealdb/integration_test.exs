@@ -435,6 +435,73 @@ defmodule SurrealDB.IntegrationTest do
     end
   end
 
+  describe "streaming queries, gql, and api" do
+    test "query_stream delivers rows in batches and a failed statement's error" do
+      db = connect()
+      {:ok, _} = SurrealDB.query(db, "FOR $i IN 0..1000 { CREATE big SET n = $i }")
+
+      frames =
+        db
+        |> SurrealDB.query_stream("RETURN 1; THROW 'x'; SELECT n FROM big ORDER BY n")
+        |> Enum.to_list()
+
+      assert {:begin, %{statements: 3}} = hd(frames)
+      assert {:end, %{results: 3, error: nil}} = List.last(frames)
+      assert {:value, 0, 1} in frames
+
+      assert Enum.any?(frames, &match?({:finished, 1, %{error: %SurrealDB.Error{}}}, &1))
+
+      rows = for {:rows, 2, rows} <- frames, row <- rows, do: row["n"]
+      assert rows == Enum.to_list(0..999)
+      assert Enum.count(frames, &match?({:rows, 2, _}, &1)) > 1
+    end
+
+    test "stopping a stream early cancels it and leaves the connection usable" do
+      db = connect()
+      {:ok, _} = SurrealDB.query(db, "FOR $i IN 0..2000 { CREATE big SET n = $i }")
+
+      assert [{:begin, _}, {:rows, 0, _}] =
+               db |> SurrealDB.query_stream("SELECT * FROM big") |> Enum.take(2)
+
+      {:ok, ref} = SurrealDB.stream_query(db, "SLEEP 2s; RETURN 1")
+      assert_receive {:surrealdb, :stream, ^ref, {:begin, _}}, 1_000
+      assert {:ok, _} = SurrealDB.cancel_query(db, ref)
+      refute_receive {:surrealdb, :stream, ^ref, _}, 300
+
+      assert {:ok, [2]} = SurrealDB.query(db, "RETURN 2")
+    end
+
+    test "gql runs graph queries" do
+      db = connect()
+
+      {:ok, _} =
+        SurrealDB.query(db, """
+        CREATE person:a SET name = 'A'; CREATE person:b SET name = 'B';
+        RELATE person:a->knows->person:b
+        """)
+
+      assert {:ok, [[%{"b.name" => "B"}]]} =
+               SurrealDB.gql(db, "MATCH (a:person)-[:knows]->(b:person) RETURN b.name")
+    end
+
+    test "api calls a defined endpoint" do
+      db = connect()
+
+      {:ok, _} =
+        SurrealDB.query(db, """
+        DEFINE API "/echo" FOR any THEN {
+          RETURN { status: 201, body: { got: $request.body, q: $request.query, m: $request.method } }
+        }
+        """)
+
+      assert {:ok, %{status: 201, body: body}} =
+               SurrealDB.api(db, "/echo", method: :post, body: %{x: 1}, query: %{"a" => "b"})
+
+      assert body == %{"got" => %{"x" => 1}, "m" => "post", "q" => %{"a" => "b"}}
+      assert {:ok, %{status: 404}} = SurrealDB.api(db, "/missing")
+    end
+  end
+
   test "strings are never turned into record ids" do
     db = connect()
     {:ok, _} = SurrealDB.create(db, SurrealDB.RecordId.new("user", 1234), %{"n" => 1})

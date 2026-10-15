@@ -506,6 +506,187 @@ defmodule SurrealDB do
   defp call_opts(opts), do: Keyword.take(opts, [:timeout])
 
   @doc """
+  Runs a query with the server's streaming protocol and sends its results to a process as
+  they are produced, rather than all at once. Returns `{:ok, ref}`; the frames arrive as
+
+      {:surrealdb, :stream, ref, frame}
+
+  in this order:
+
+    * `{:begin, %{statements: n}}` - the stream is open. `n` is an upper bound on the
+      statements that will finish.
+    * `{:rows, index, rows}` - rows from statement `index`; more may follow. The statement's
+      value is every row it sent, in order.
+    * `{:value, index, value}` - statement `index` produced one value rather than rows.
+    * `{:finished, index, %{error: error, single: single, time: time, type: type}}` -
+      statement `index` is done. When `error` is set the statement failed and the rows
+      already sent for it must be discarded. With no payload frames, the statement's value
+      is `[]`, or `None` when `single` is true.
+    * `{:end, %{results: n, error: error}}` - the last frame. An `error` here retracts every
+      statement that had not finished, for example after a timeout or a failed commit.
+    * `{:error, error}` - the request failed (for example the connection was lost). Nothing
+      follows it.
+
+  Rows are provisional until their statement's `:finished` frame. `query_stream/4` wraps
+  this in an Elixir `Stream`. Needs a WebSocket connection and a server with the
+  `query_stream` method; an older server fails the request with a method-not-found error.
+
+  ## Options
+
+    * `:to` - the process to send frames to (default: the caller).
+    * `:timeout` - milliseconds before the stream fails with a `:timeout` error (default
+      `:infinity`).
+  """
+  @spec stream_query(conn(), String.t(), map(), keyword()) ::
+          {:ok, reference()} | {:error, Error.t()}
+  def stream_query(conn, surql, vars \\ %{}, opts \\ []) do
+    pid = Keyword.get(opts, :to, self())
+    Connection.stream(conn, "query_stream", [surql, vars], pid, Keyword.take(opts, [:timeout]))
+  end
+
+  @doc """
+  Cancels a streaming query started with `stream_query/4`. The server stops running it and
+  no more frames are sent for it.
+  """
+  @spec cancel_query(conn(), reference()) :: result()
+  def cancel_query(conn, ref) when is_reference(ref) do
+    case Connection.cancel_stream(conn, ref) do
+      {:ok, _} = ok ->
+        ok
+
+      # The stream finished before the cancel reached the server.
+      {:error, %Error{} = error} = result ->
+        if error.message =~ ~r/no streaming query/i, do: {:ok, nil}, else: result
+    end
+  end
+
+  @doc """
+  Runs a query with the server's streaming protocol and returns an Elixir `Stream` of its
+  frames, as `stream_query/4` describes them, ending with the `{:end, _}` frame (or
+  `{:error, error}`). The query starts when the stream is enumerated, and stopping early
+  cancels it.
+
+      db
+      |> SurrealDB.query_stream("SELECT * FROM event")
+      |> Stream.flat_map(fn
+        {:rows, 0, rows} -> rows
+        _frame -> []
+      end)
+      |> Enum.take(1_000)
+
+  Takes the `:timeout` option.
+  """
+  @spec query_stream(conn(), String.t(), map(), keyword()) :: Enumerable.t()
+  def query_stream(conn, surql, vars \\ %{}, opts \\ []) do
+    Stream.resource(
+      fn ->
+        server = Connection.server(conn)
+        monitor = Process.monitor(server)
+
+        case stream_query(conn, surql, vars, Keyword.put(opts, :to, self())) do
+          {:ok, ref} -> {:open, ref, monitor}
+          {:error, error} -> {:failed, error, monitor}
+        end
+      end,
+      fn
+        {:open, ref, monitor} = acc ->
+          receive do
+            {:surrealdb, :stream, ^ref, {:end, _info} = frame} ->
+              {[frame], {:done, ref, monitor}}
+
+            {:surrealdb, :stream, ^ref, {:error, _error} = frame} ->
+              {[frame], {:done, ref, monitor}}
+
+            {:surrealdb, :stream, ^ref, frame} ->
+              {[frame], acc}
+
+            {:DOWN, ^monitor, :process, _pid, reason} ->
+              error = Error.new(:connection, "the connection stopped: #{inspect(reason)}")
+              {[{:error, error}], {:done, ref, monitor}}
+          end
+
+        {:failed, error, monitor} ->
+          {[{:error, error}], {:done, nil, monitor}}
+
+        {:done, _ref, _monitor} = acc ->
+          {:halt, acc}
+      end,
+      fn
+        {:open, ref, monitor} ->
+          cancel_query(conn, ref)
+          Process.demonitor(monitor, [:flush])
+          flush_frames(ref)
+
+        {:done, _ref, monitor} ->
+          Process.demonitor(monitor, [:flush])
+      end
+    )
+  end
+
+  defp flush_frames(ref) do
+    receive do
+      {:surrealdb, :stream, ^ref, _frame} -> flush_frames(ref)
+    after
+      0 -> :ok
+    end
+  end
+
+  @doc """
+  Runs a GQL (ISO graph query language) query, returning one result per statement as
+  `query/4` does. Needs a server built with GQL support.
+
+      {:ok, [rows]} = SurrealDB.gql(db, "MATCH (p:person)-[:knows]->(f:person) RETURN f.name")
+  """
+  @spec gql(conn(), String.t(), map(), keyword()) :: result()
+  def gql(conn, query, vars \\ %{}, opts \\ []) do
+    Connection.call(conn, "gql", [query, vars], call_opts(opts))
+  end
+
+  @doc """
+  Calls a user-defined API endpoint (`DEFINE API`) through the connection, with
+  `api::invoke`, and returns the response as `%{status: _, headers: _, body: _}`.
+
+      {:ok, %{status: 200, body: body}} =
+        SurrealDB.api(db, "/users", method: :post, body: %{name: "Tobie"})
+
+  ## Options
+
+    * `:method` - `:get` (default), `:post`, `:put`, `:patch`, `:delete`, and so on.
+    * `:body` - the request body.
+    * `:query` - query parameters, as a map of strings.
+    * `:headers` - request headers, as a map of strings.
+    * `:timeout` - milliseconds before the request times out.
+  """
+  @spec api(conn(), String.t(), keyword()) ::
+          {:ok, %{status: integer(), headers: map(), body: term()}} | {:error, Error.t()}
+  def api(conn, path, opts \\ []) do
+    request =
+      %{"method" => opts |> Keyword.get(:method, :get) |> to_string() |> String.downcase()}
+      |> put_present("body", Keyword.get(opts, :body))
+      |> put_present("query", Keyword.get(opts, :query))
+      |> put_present("headers", Keyword.get(opts, :headers))
+
+    sql = "RETURN api::invoke($path, $request)"
+
+    case query(conn, sql, %{"path" => path, "request" => request}, call_opts(opts)) do
+      {:ok, [%{"status" => status} = response]} ->
+        {:ok, %{status: status, headers: response["headers"] || %{}, body: response["body"]}}
+
+      {:ok, [other]} ->
+        {:error, Error.new(:decode, "unexpected API response: #{inspect(other)}")}
+
+      {:error, %Error{kind: :query, details: %{results: [{:error, error}]}}} ->
+        {:error, error}
+
+      {:error, error} ->
+        {:error, error}
+    end
+  end
+
+  defp put_present(map, _key, nil), do: map
+  defp put_present(map, key, value), do: Map.put(map, key, value)
+
+  @doc """
   Runs a query and returns the raw per-statement objects, each with `"status"`, `"time"`,
   and `"result"`, without raising on a failed statement.
   """

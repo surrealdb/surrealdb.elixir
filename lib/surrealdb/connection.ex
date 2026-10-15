@@ -78,6 +78,8 @@ defmodule SurrealDB.Connection do
     renew_access: true,
     # session id => {timer, tag} that renews the session's access token before it expires
     renewals: %{},
+    # streaming query ref => request id
+    streams: %{},
     # session id => failed renewals in a row, for the retry backoff
     renewal_failures: %{},
     status: :connected,
@@ -169,6 +171,29 @@ defmodule SurrealDB.Connection do
   @doc false
   @spec server(handle()) :: GenServer.server()
   def server(handle), do: elem(target(handle), 0)
+
+  @doc """
+  Starts a streaming RPC (`query_stream`) whose frames are sent to `pid` as
+  `{:surrealdb, :stream, ref, frame}`, and returns `{:ok, ref}`. See
+  `SurrealDB.stream_query/4` for the frames.
+  """
+  @spec stream(handle(), String.t(), list(), pid(), keyword()) ::
+          {:ok, reference()} | {:error, Error.t()}
+  def stream(handle, method, params, pid, opts \\ []) do
+    {server, session, txn} = target(handle)
+    meta = %{timeout: Keyword.get(opts, :timeout, :infinity)}
+    meta = if session, do: Map.put(meta, :session, session), else: meta
+    meta = if txn, do: Map.put(meta, :txn, txn), else: meta
+    GenServer.call(server, {:stream, method, params, pid, meta}, :infinity)
+  end
+
+  @doc """
+  Cancels a streaming query started with `stream/5`. No more frames are sent for it, and
+  the server stops running it.
+  """
+  @spec cancel_stream(handle(), reference()) :: {:ok, term()} | {:error, Error.t()}
+  def cancel_stream(handle, ref),
+    do: GenServer.call(server(handle), {:cancel_stream, ref}, :infinity)
 
   @doc "Adds `pid` to the subscribers of a live query id."
   @spec subscribe_live(GenServer.server(), term(), pid()) :: :ok
@@ -277,6 +302,48 @@ defmodule SurrealDB.Connection do
           {id, state} = next_id(state)
           dispatch(state, id, from, method, params, start_timer(meta, id, timeout))
         end
+    end
+  end
+
+  def handle_call({:stream, method, params, pid, meta}, from, state) do
+    ref = make_ref()
+    {id, state} = next_id(state)
+    meta = start_timer(meta, id, meta.timeout)
+    state = %{state | streams: Map.put(state.streams, ref, id)}
+    stream_from = {:stream, pid, ref}
+
+    cond do
+      not state.engine.supports_live?() ->
+        cancel_timer(meta)
+        message = "streaming queries need a WebSocket connection"
+        state = %{state | streams: Map.delete(state.streams, ref)}
+        {:reply, {:error, Error.new(:unsupported, message)}, state}
+
+      state.status == :reconnecting ->
+        GenServer.reply(from, {:ok, ref})
+        {:noreply, %{state | queue: [{id, stream_from, method, params, meta} | state.queue]}}
+
+      true ->
+        case send_request(state, id, stream_from, method, params, meta) do
+          {:ok, state} ->
+            {:reply, {:ok, ref}, state}
+
+          {:error, error, state} ->
+            {:reply, {:error, error}, %{state | streams: Map.delete(state.streams, ref)}}
+        end
+    end
+  end
+
+  # Stop delivering the stream's frames, then ask the server to stop running it.
+  def handle_call({:cancel_stream, ref}, from, state) do
+    case Map.pop(state.streams, ref) do
+      {nil, _streams} ->
+        {:reply, {:ok, nil}, state}
+
+      {id, streams} ->
+        state = %{state | streams: streams, pending: mute_stream(state.pending, id)}
+        queue = Enum.reject(state.queue, &match?({^id, _, _, _, _}, &1))
+        handle_call({:rpc, "query_cancel", [id], %{}}, from, %{state | queue: queue})
     end
   end
 
@@ -958,7 +1025,8 @@ defmodule SurrealDB.Connection do
 
   # While a reconnect restores the session, calls join the queue at once (so their timers
   # start) and queued calls time out on time, rather than waiting in the stash.
-  defp absorb(%{status: :reconnecting} = state, {:"$gen_call", from, {:rpc, _, _, _} = call}) do
+  defp absorb(%{status: :reconnecting} = state, {:"$gen_call", from, call})
+       when elem(call, 0) in [:rpc, :stream, :cancel_stream] do
     case handle_call(call, from, state) do
       {:noreply, state} ->
         {:ok, state}
@@ -1045,6 +1113,63 @@ defmodule SurrealDB.Connection do
   defp deliver_reply(decoded, state), do: deliver_result(decoded["id"], to_result(decoded), state)
 
   defp deliver_result(id, result, state) do
+    case Map.get(state.pending, id) do
+      {{:stream, _pid, _ref}, _method, _params, _meta} -> deliver_frame(id, result, state)
+      _other -> deliver_reply(id, result, state)
+    end
+  end
+
+  # A streaming request is answered by a series of frames with its id. It stays pending
+  # until the `end` frame, or an error, finishes it.
+  defp deliver_frame(id, result, state) do
+    {{:stream, pid, ref} = from, _method, _params, meta} = Map.fetch!(state.pending, id)
+
+    case result do
+      {:ok, %{"stream" => "end"} = frame} ->
+        cancel_timer(meta)
+        state = %{state | pending: Map.delete(state.pending, id)}
+        send_frame(pid, ref, RPC.stream_frame(frame))
+        %{state | streams: Map.delete(state.streams, ref)}
+
+      {:ok, %{"stream" => _kind} = frame} ->
+        case RPC.stream_frame(frame) do
+          nil -> :ok
+          frame -> send_frame(pid, ref, frame)
+        end
+
+        state
+
+      {:ok, other} ->
+        cancel_timer(meta)
+        state = %{state | pending: Map.delete(state.pending, id)}
+
+        reply(
+          state,
+          from,
+          id,
+          {:error, Error.new(:decode, "unexpected stream frame: #{inspect(other)}")}
+        )
+
+      {:error, _error} = error ->
+        cancel_timer(meta)
+        reply(%{state | pending: Map.delete(state.pending, id)}, from, id, error)
+    end
+  end
+
+  defp send_frame(nil, _ref, _frame), do: :ok
+  defp send_frame(pid, ref, frame), do: send(pid, {:surrealdb, :stream, ref, frame})
+
+  defp mute_stream(pending, id) do
+    case Map.fetch(pending, id) do
+      {:ok, {{:stream, _pid, ref}, method, params, meta}} ->
+        Map.put(pending, id, {{:stream, nil, ref}, method, params, meta})
+
+      _ ->
+        pending
+    end
+  end
+
+  defp deliver_reply(id, result, state) do
     case Map.pop(state.pending, id) do
       {nil, _pending} ->
         state
@@ -1277,11 +1402,13 @@ defmodule SurrealDB.Connection do
 
   defp public_reply("query", %{raw: true}, {:ok, statements}), do: {:ok, statements}
 
-  defp public_reply("query", %{statements: true}, {:ok, statements}) when is_list(statements),
-    do: {:ok, RPC.statement_results(statements)}
+  defp public_reply(method, %{statements: true}, {:ok, statements})
+       when method in ["query", "gql"] and is_list(statements),
+       do: {:ok, RPC.statement_results(statements)}
 
-  defp public_reply("query", _meta, {:ok, statements}) when is_list(statements),
-    do: RPC.parse_query(statements)
+  defp public_reply(method, _meta, {:ok, statements})
+       when method in ["query", "gql"] and is_list(statements),
+       do: RPC.parse_query(statements)
 
   # Over JSON the server sends a live query id as a string. Return it as the `Uuid` the
   # notifications carry, so a caller can match one against the other.
@@ -1633,6 +1760,17 @@ defmodule SurrealDB.Connection do
   end
 
   defp reply(state, nil, _id, _result), do: state
+
+  # A streaming request that fails ends with an `{:error, error}` frame.
+  defp reply(state, {:stream, pid, ref}, _id, result) do
+    case result do
+      {:error, _error} = error -> send_frame(pid, ref, error)
+      _other -> :ok
+    end
+
+    %{state | streams: Map.delete(state.streams, ref)}
+  end
+
   defp reply(state, :sync, id, result), do: %{state | sync: Map.put(state.sync, id, result)}
 
   defp reply(state, from, _id, result) do

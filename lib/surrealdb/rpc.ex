@@ -78,4 +78,38 @@ defmodule SurrealDB.RPC do
       other -> other
     end
   end
+
+  @doc """
+  Translates a `query_stream` frame into the tuple `SurrealDB.stream_query/4` delivers, or
+  `nil` for a frame kind this SDK does not know (which the protocol says to ignore).
+  """
+  @spec stream_frame(map()) :: tuple() | nil
+  def stream_frame(%{"stream" => "begin"} = frame),
+    do: {:begin, %{statements: frame["statements"], version: frame["version"] || 1}}
+
+  def stream_frame(%{"stream" => "rows", "index" => index, "values" => values}),
+    do: {:rows, index, values}
+
+  def stream_frame(%{"stream" => "value", "index" => index} = frame),
+    do: {:value, index, Map.get(frame, "value", SurrealDB.None.none())}
+
+  def stream_frame(%{"stream" => "finished", "index" => index} = frame) do
+    {:finished, index,
+     %{
+       time: frame["time"],
+       type: frame["type"],
+       single: frame["single"] == true,
+       error: frame_error(frame["error"])
+     }}
+  end
+
+  def stream_frame(%{"stream" => "end"} = frame),
+    do:
+      {:end,
+       %{results: frame["results"], time: frame["time"], error: frame_error(frame["error"])}}
+
+  def stream_frame(_frame), do: nil
+
+  defp frame_error(%{} = error), do: SurrealDB.Error.from_rpc(error)
+  defp frame_error(_none), do: nil
 end
