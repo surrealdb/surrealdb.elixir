@@ -159,6 +159,71 @@ defmodule SurrealDB.ConnectionTest do
     assert {:ok, _} = SurrealDB.unset(db, "x")
   end
 
+  describe "version check" do
+    defp version_responder(version) do
+      fn
+        "version", _params -> {:ok, version}
+        _method, _params -> {:ok, nil}
+      end
+    end
+
+    test "refuses to start against an unsupported server" do
+      Process.flag(:trap_exit, true)
+
+      assert {:error, %SurrealDB.Error{kind: :unsupported}} =
+               SurrealDB.Connection.start_link(
+                 url: "ws://mock/rpc",
+                 engine: SurrealDB.Engine.Mock,
+                 responder: version_responder("surrealdb-5.0.0")
+               )
+    end
+
+    test "starts against an unsupported server when the check is off" do
+      db = start(responder: version_responder("surrealdb-5.0.0"), version_check: false)
+      assert SurrealDB.info_session(db).version == "surrealdb-5.0.0"
+    end
+
+    test "records the server version" do
+      db = start(responder: version_responder("surrealdb-3.3.4"))
+      assert SurrealDB.info_session(db).version == "surrealdb-3.3.4"
+    end
+  end
+
+  describe "timeouts" do
+    test "a request times out after the given timeout and the connection carries on" do
+      db = start()
+
+      {micros, result} =
+        :timer.tc(fn -> SurrealDB.Connection.call(db, "hang", [], timeout: 50) end)
+
+      assert {:error, %SurrealDB.Error{kind: :timeout}} = result
+      assert micros < 1_000_000
+      assert :sys.get_state(db).pending == %{}
+      assert {:ok, _} = SurrealDB.Connection.call(db, "ping", [])
+    end
+
+    test "the connection-wide timeout applies by default" do
+      db = start(timeout: 50)
+
+      assert {:error, %SurrealDB.Error{kind: :timeout}} =
+               SurrealDB.Connection.call(db, "hang", [])
+    end
+  end
+
+  test "reset clears the session state" do
+    db =
+      start(
+        namespace: "test",
+        database: "app",
+        auth: %SurrealDB.Auth.Root{user: "root", pass: "root"}
+      )
+
+    assert {:ok, _} = SurrealDB.reset(db)
+
+    info = SurrealDB.info_session(db)
+    assert {info.namespace, info.database, info.token} == {nil, nil, nil}
+  end
+
   describe "connection loss" do
     @tag :capture_log
     test "a closed transport fails pending calls and stops the process" do

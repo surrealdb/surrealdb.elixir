@@ -23,6 +23,26 @@ defmodule SurrealDB.Rest do
     end
   end
 
+  @spec health(map(), keyword()) :: :ok | {:error, Error.t()}
+  def health(session, opts) do
+    timeout = Keyword.get(opts, :timeout, 10_000)
+
+    case request(session, "GET", "/health", [], "", timeout) do
+      {:ok, status, _body} when status in 200..299 ->
+        :ok
+
+      {:ok, status, body} ->
+        {:error,
+         Error.new(:http, "the server is not healthy (HTTP #{status})",
+           code: status,
+           details: body
+         )}
+
+      {:error, error} ->
+        {:error, error}
+    end
+  end
+
   @spec import(map(), String.t(), keyword()) :: {:ok, :imported} | {:error, Error.t()}
   def import(session, surql, opts) do
     headers = [{"content-type", "text/plain"}, {"accept", "application/json"}]

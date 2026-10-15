@@ -8,7 +8,7 @@ defmodule SurrealDB.Engine.HTTPTest do
     {:ok, bypass: bypass, url: "http://localhost:#{bypass.port}/rpc"}
   end
 
-  defp start(url), do: start_supervised!({SurrealDB.Connection, url: url})
+  defp start(url), do: start_supervised!({SurrealDB.Connection, url: url, version_check: false})
 
   defp reply(conn, status, content_type, body) do
     conn

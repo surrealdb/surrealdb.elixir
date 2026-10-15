@@ -54,8 +54,13 @@ defmodule SurrealDB do
     * `:auth` - a `SurrealDB.Auth` struct to sign in with on connect.
     * `:codec` - `:cbor` (default) or `:json`.
     * `:name` - a name to register the process under.
-    * `:connect_timeout` - milliseconds to wait for the connect-time `use`/`signin`
-      (default 15000).
+    * `:connect_timeout` - milliseconds to wait for each connect-time call (`version`,
+      `signin`, `use`) (default 15000).
+    * `:timeout` - milliseconds before a request times out, or `:infinity` (default 30000).
+      Calls that take options, such as `query/4`, can override it per request.
+    * `:version_check` - when `true` (the default), the connection asks the server for its
+      version and refuses to start unless it is supported: `>= 2.1.0` and `< 5.0.0`. See
+      `SurrealDB.Version`.
     * `:transport_opts` - extra options passed to the transport (for example TLS settings).
   """
   @spec start_link(keyword()) :: GenServer.on_start()
@@ -126,9 +131,24 @@ defmodule SurrealDB do
   @spec info(conn()) :: result()
   def info(conn), do: Connection.call(conn, "info", [])
 
-  @doc "Returns the SurrealDB server version."
+  @doc "Returns the SurrealDB server version, for example `\"surrealdb-3.3.4\"`."
   @spec version(conn()) :: result()
   def version(conn), do: Connection.call(conn, "version", [])
+
+  @doc """
+  Checks the server's health with the HTTP `/health` endpoint, derived from the connection
+  URL whatever the engine. Returns `:ok` when the server and its storage are healthy.
+  """
+  @spec health(conn(), keyword()) :: :ok | {:error, Error.t()}
+  def health(conn, opts \\ []), do: SurrealDB.Rest.health(Connection.session_info(conn), opts)
+
+  @doc """
+  Resets the session: signs out and clears the namespace, database, and connection
+  parameters. The server also kills the session's live queries and cancels its open
+  transactions.
+  """
+  @spec reset(conn()) :: result()
+  def reset(conn), do: Connection.call(conn, "reset", [])
 
   @doc "Defines a connection-scoped parameter usable in later queries as `$name`."
   @spec let(conn(), String.t(), term()) :: result()
@@ -159,10 +179,15 @@ defmodule SurrealDB do
       end
 
   Use `query_results/3` to always get the per-statement outcomes.
+
+  ## Options
+
+    * `:timeout` - milliseconds before the request times out, or `:infinity`. Defaults to
+      the connection's `:timeout`.
   """
-  @spec query(conn(), String.t(), map()) :: result()
-  def query(conn, surql, vars \\ %{}) do
-    Connection.call(conn, "query", [surql, vars])
+  @spec query(conn(), String.t(), map(), keyword()) :: result()
+  def query(conn, surql, vars \\ %{}, opts \\ []) do
+    Connection.call(conn, "query", [surql, vars], call_opts(opts))
   end
 
   @doc """
@@ -173,11 +198,13 @@ defmodule SurrealDB do
       {:ok, [{:ok, _}, {:error, error}, {:ok, _}]} =
         SurrealDB.query_results(db, "CREATE a; THROW 'no'; CREATE b")
   """
-  @spec query_results(conn(), String.t(), map()) ::
+  @spec query_results(conn(), String.t(), map(), keyword()) ::
           {:ok, [{:ok, term()} | {:error, Error.t()}]} | {:error, Error.t()}
-  def query_results(conn, surql, vars \\ %{}) do
-    Connection.call(conn, "query", [surql, vars], meta: %{statements: true})
+  def query_results(conn, surql, vars \\ %{}, opts \\ []) do
+    Connection.call(conn, "query", [surql, vars], [meta: %{statements: true}] ++ call_opts(opts))
   end
+
+  defp call_opts(opts), do: Keyword.take(opts, [:timeout])
 
   @doc """
   Runs a query and returns the raw per-statement objects, each with `"status"`, `"time"`,

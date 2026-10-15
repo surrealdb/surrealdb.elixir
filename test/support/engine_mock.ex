@@ -68,6 +68,6 @@ defmodule SurrealDB.Engine.Mock do
   defp default_responder("signin", _params), do: {:ok, "mock.jwt.token"}
   defp default_responder("signup", _params), do: {:ok, "mock.jwt.token"}
   defp default_responder("authenticate", _params), do: {:ok, nil}
-  defp default_responder("version", _params), do: {:ok, "surrealdb-2.0.0"}
+  defp default_responder("version", _params), do: {:ok, "surrealdb-3.0.0"}
   defp default_responder(_method, params), do: {:ok, params}
 end
