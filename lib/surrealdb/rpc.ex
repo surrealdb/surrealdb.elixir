@@ -49,7 +49,7 @@ defmodule SurrealDB.RPC do
   defp statement_result(%{"status" => "OK"} = statement), do: {:ok, statement["result"]}
 
   defp statement_result(%{"status" => "ERR", "result" => message} = statement) do
-    {:error, SurrealDB.Error.new(:rpc, to_string(message), details: statement)}
+    {:error, SurrealDB.Error.from_statement(%{statement | "result" => message})}
   end
 
   defp statement_result(other), do: {:ok, other}
