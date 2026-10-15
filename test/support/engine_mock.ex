@@ -21,7 +21,13 @@ defmodule SurrealDB.Engine.Mock do
   def connect(_uri, opts) do
     codec = SurrealDB.Codec.resolve(Keyword.get(opts, :codec, :cbor))
     responder = Keyword.get(opts, :responder, &default_responder/2)
-    {:ok, %__MODULE__{codec: codec, responder: responder}}
+
+    # A responder can refuse the connection by answering the pseudo-method "__connect__"
+    # with `{:error, reason}`.
+    case responder.("__connect__", []) do
+      {:error, reason} -> {:error, reason}
+      _ -> {:ok, %__MODULE__{codec: codec, responder: responder}}
+    end
   end
 
   @impl true
@@ -64,6 +70,7 @@ defmodule SurrealDB.Engine.Mock do
   @impl true
   def supports_live?, do: true
 
+  defp default_responder("__connect__", _params), do: :ok
   defp default_responder("use", _params), do: {:ok, nil}
   defp default_responder("signin", _params), do: {:ok, "mock.jwt.token"}
   defp default_responder("signup", _params), do: {:ok, "mock.jwt.token"}

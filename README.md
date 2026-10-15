@@ -67,6 +67,27 @@ Options:
 `SurrealDB.health/1` checks the server's `/health` endpoint, `SurrealDB.version/1` returns
 its version, and `SurrealDB.reset/1` signs out and clears the session.
 
+### Reconnecting
+
+A WebSocket connection reconnects automatically with exponential backoff when it drops,
+and restores its session before it serves requests again: authentication, namespace and
+database, `let` parameters, and live queries (which keep their ids). Requests in flight when
+it dropped fail rather than run twice; requests made while reconnecting wait and are sent
+once it is back. Subscribe to status events to follow along:
+
+```elixir
+:ok = SurrealDB.subscribe_status(db)
+
+receive do
+  {:surrealdb, :status, :reconnecting, %{attempt: n, error: error}} -> ...
+  {:surrealdb, :status, :connected, _info} -> ...
+  {:surrealdb, :status, :disconnected, %{error: error}} -> ...  # gave up; the process stops
+end
+```
+
+Tune it with `reconnect: [attempts: 10, delay: 500, max_delay: 30_000]`, or turn it off with
+`reconnect: false`.
+
 ### In a supervision tree
 
 ```elixir

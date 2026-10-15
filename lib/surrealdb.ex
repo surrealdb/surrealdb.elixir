@@ -58,6 +58,11 @@ defmodule SurrealDB do
       `signin`, `use`) (default 15000).
     * `:timeout` - milliseconds before a request times out, or `:infinity` (default 30000).
       Calls that take options, such as `query/4`, can override it per request.
+    * `:reconnect` - whether a WebSocket connection reconnects and restores its session
+      after it drops (default `true`). Pass a keyword list to tune the backoff:
+      `attempts` (default 5, or `:infinity`), `delay` (first delay in ms, default 1000),
+      `max_delay` (default 60000), `multiplier` (default 2.0), and `jitter` (default 0.1).
+      See `SurrealDB.Connection` for what is restored.
     * `:version_check` - when `true` (the default), the connection asks the server for its
       version and refuses to start unless it is supported: `>= 2.1.0` and `< 5.0.0`. See
       `SurrealDB.Version`.
@@ -72,6 +77,20 @@ defmodule SurrealDB do
   @doc "Closes the connection and stops its process."
   @spec close(conn()) :: :ok
   def close(conn), do: GenServer.stop(conn)
+
+  @doc """
+  Sends connection status events to `pid` (default: the caller):
+
+      {:surrealdb, :status, :reconnecting | :connected | :disconnected, info}
+
+  `info` holds the reconnect `:attempt` and, when there is one, the `:error`.
+  """
+  @spec subscribe_status(conn(), pid()) :: :ok
+  def subscribe_status(conn, pid \\ self()), do: Connection.subscribe_status(conn, pid)
+
+  @doc "Stops sending connection status events to `pid` (default: the caller)."
+  @spec unsubscribe_status(conn(), pid()) :: :ok
+  def unsubscribe_status(conn, pid \\ self()), do: Connection.unsubscribe_status(conn, pid)
 
   @doc "Returns session info: active namespace, database, engine, codec, and live support."
   @spec info_session(conn()) :: map()

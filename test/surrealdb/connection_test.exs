@@ -233,7 +233,8 @@ defmodule SurrealDB.ConnectionTest do
         SurrealDB.Connection.start_link(
           url: "ws://mock/rpc",
           engine: SurrealDB.Engine.Mock,
-          responder: responder()
+          responder: responder(),
+          reconnect: false
         )
 
       ref = Process.monitor(db)

@@ -1,0 +1,212 @@
+defmodule SurrealDB.ReconnectTest do
+  use ExUnit.Case, async: true
+
+  @moduletag :capture_log
+
+  alias SurrealDB.{Codec, Connection, Uuid}
+
+  @first_live "0190d6f2-8b1e-7000-8000-000000000001"
+  @second_live "0190d6f2-8b1e-7000-8000-000000000002"
+
+  # Records every RPC the connection sends, hands out a new live query id each time `live`
+  # is called, and refuses connections while the process flag `:refuse` is set. It runs in
+  # the connection process, so it keeps its counters in that process's dictionary.
+  defp responder(parent) do
+    fn
+      "__connect__", _params ->
+        if Process.get(:refuse), do: {:error, :econnrefused}, else: :ok
+
+      method, params ->
+        send(parent, {:rpc, method, params})
+
+        case method do
+          "signin" ->
+            {:ok, "token.#{Process.put(:signins, (Process.get(:signins) || 0) + 1) || 0}"}
+
+          "live" ->
+            n = Process.put(:lives, (Process.get(:lives) || 0) + 1) || 0
+            {:ok, Uuid.new(Enum.at([@first_live, @second_live], n, @second_live))}
+
+          "version" ->
+            {:ok, "surrealdb-3.3.4"}
+
+          "hang" ->
+            :noreply
+
+          _other ->
+            {:ok, nil}
+        end
+    end
+  end
+
+  defp start(opts \\ []) do
+    base = [
+      url: "ws://mock/rpc",
+      engine: SurrealDB.Engine.Mock,
+      responder: responder(self()),
+      reconnect: [delay: 10, max_delay: 50]
+    ]
+
+    start_supervised!({Connection, Keyword.merge(base, opts)})
+  end
+
+  defp drain do
+    receive do
+      {:rpc, _, _} -> drain()
+    after
+      0 -> :ok
+    end
+  end
+
+  defp notify(db, live_id) do
+    payload = %{"result" => %{"id" => Uuid.new(live_id), "action" => "CREATE", "result" => %{}}}
+    send(db, {:mock_message, Codec.CBOR.encode(payload)})
+  end
+
+  test "restores auth, namespace, database, parameters, and live queries" do
+    db =
+      start(
+        namespace: "test",
+        database: "app",
+        auth: %SurrealDB.Auth.Root{user: "root", pass: "root"}
+      )
+
+    {:ok, _} = SurrealDB.let(db, "x", 1)
+    {:ok, _} = SurrealDB.let(db, "y", 2)
+    {:ok, _} = SurrealDB.unset(db, "y")
+    {:ok, live_id} = SurrealDB.live(db, "person")
+    :ok = SurrealDB.subscribe_status(db)
+    drain()
+
+    send(db, :mock_closed)
+
+    assert_receive {:surrealdb, :status, :reconnecting, %{attempt: 1}}
+    assert_receive {:surrealdb, :status, :connected, %{attempt: 1}}
+
+    assert_received {:rpc, "version", []}
+    assert_received {:rpc, "authenticate", ["token.0"]}
+    assert_received {:rpc, "use", ["test", "app"]}
+    assert_received {:rpc, "let", ["x", 1]}
+    refute_received {:rpc, "let", ["y", _]}
+    assert_received {:rpc, "live", [%SurrealDB.Table{name: "person"}, false]}
+
+    # Notifications for the restarted live query arrive under the id the caller has.
+    notify(db, @second_live)
+    assert_receive {:surrealdb, :live, ^live_id, %{action: :create}}
+
+    # Killing it by that id kills the new server-side live query.
+    assert {:ok, _} = SurrealDB.kill(db, live_id)
+    assert_receive {:rpc, "kill", [%Uuid{value: @second_live}]}
+  end
+
+  test "signs in again with the credentials when the token is refused" do
+    parent = self()
+    base = responder(parent)
+
+    responder = fn
+      "authenticate", params ->
+        send(parent, {:rpc, "authenticate", params})
+        {:error, %{"code" => -32_002, "message" => "Token expired", "kind" => "NotAllowed"}}
+
+      method, params ->
+        base.(method, params)
+    end
+
+    db = start(responder: responder, auth: %SurrealDB.Auth.Root{user: "root", pass: "root"})
+    :ok = SurrealDB.subscribe_status(db)
+    drain()
+
+    send(db, :mock_closed)
+    assert_receive {:surrealdb, :status, :connected, _}
+    assert_received {:rpc, "authenticate", ["token.0"]}
+    assert_received {:rpc, "signin", [%{"user" => "root", "pass" => "root"}]}
+    assert SurrealDB.info_session(db).token == "token.1"
+  end
+
+  test "fails requests in flight instead of sending them again" do
+    db = start()
+    task = Task.async(fn -> Connection.call(db, "hang", []) end)
+    assert_receive {:rpc, "hang", []}
+
+    send(db, :mock_closed)
+
+    assert {:error, %SurrealDB.Error{kind: :connection}} = Task.await(task)
+    refute_receive {:rpc, "hang", []}, 100
+  end
+
+  test "holds requests made while reconnecting and sends them once connected" do
+    db = start(reconnect: [delay: 200])
+    :ok = SurrealDB.subscribe_status(db)
+    send(db, :mock_closed)
+    assert_receive {:surrealdb, :status, :reconnecting, _}
+
+    task = Task.async(fn -> SurrealDB.query(db, "RETURN 1") end)
+    refute_receive {:rpc, "query", _}, 50
+
+    assert_receive {:surrealdb, :status, :connected, _}, 1_000
+    assert_receive {:rpc, "query", ["RETURN 1", %{}]}
+    assert {:ok, _} = Task.await(task)
+  end
+
+  test "a held request still times out" do
+    db = start(reconnect: [delay: 500])
+    send(db, :mock_closed)
+    Process.sleep(10)
+
+    assert {:error, %SurrealDB.Error{kind: :timeout}} =
+             Connection.call(db, "ping", [], timeout: 50)
+  end
+
+  test "stops after the last attempt fails" do
+    Process.flag(:trap_exit, true)
+    parent = self()
+    base = responder(parent)
+
+    responder = fn
+      "__connect__", _params ->
+        if Process.get(:connected),
+          do: {:error, :econnrefused},
+          else: Process.put(:connected, true)
+
+      method, params ->
+        base.(method, params)
+    end
+
+    {:ok, db} =
+      Connection.start_link(
+        url: "ws://mock/rpc",
+        engine: SurrealDB.Engine.Mock,
+        responder: responder,
+        reconnect: [attempts: 3, delay: 5, max_delay: 10]
+      )
+
+    ref = Process.monitor(db)
+    :ok = SurrealDB.subscribe_status(db)
+    send(db, :mock_closed)
+
+    assert_receive {:surrealdb, :status, :reconnecting, %{attempt: 1}}
+    assert_receive {:surrealdb, :status, :reconnecting, %{attempt: 2}}
+    assert_receive {:surrealdb, :status, :reconnecting, %{attempt: 3}}
+    assert_receive {:surrealdb, :status, :disconnected, %{error: %SurrealDB.Error{}}}
+    assert_receive {:DOWN, ^ref, :process, ^db, {:shutdown, {:connection_lost, _}}}
+  end
+
+  test "reconnect can be turned off" do
+    Process.flag(:trap_exit, true)
+
+    {:ok, db} =
+      Connection.start_link(url: "ws://mock/rpc", engine: SurrealDB.Engine.Mock, reconnect: false)
+
+    ref = Process.monitor(db)
+    send(db, :mock_closed)
+    assert_receive {:DOWN, ^ref, :process, ^db, {:shutdown, {:connection_lost, _}}}
+  end
+
+  test "backoff grows by the multiplier up to the cap" do
+    config = [delay: 100, max_delay: 1_000, multiplier: 2.0, jitter: 0.0]
+    assert Enum.map(1..6, &Connection.backoff(config, &1)) == [100, 200, 400, 800, 1_000, 1_000]
+
+    jittered = Connection.backoff(Keyword.put(config, :jitter, 0.1), 1)
+    assert jittered in 90..110
+  end
+end
