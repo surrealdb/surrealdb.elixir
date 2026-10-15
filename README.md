@@ -97,6 +97,14 @@ tobie = SurrealDB.RecordId.new("person", "tobie")
 # Parameterised queries. Each statement's result is returned in order.
 {:ok, [rows]} = SurrealDB.query(db, "SELECT * FROM person WHERE age > $min", %{min: 18})
 
+# If any statement fails, the error still carries every statement's outcome.
+{:error, %SurrealDB.Error{kind: :query, details: %{results: results}}} =
+  SurrealDB.query(db, "RETURN 1; THROW 'no'; RETURN 3")
+
+# Or always get one {:ok, value} | {:error, error} per statement.
+{:ok, [{:ok, 1}, {:error, _}, {:ok, 3}]} =
+  SurrealDB.query_results(db, "RETURN 1; THROW 'no'; RETURN 3")
+
 # Graph edges
 article = SurrealDB.RecordId.new("article", "surreal")
 {:ok, _} = SurrealDB.relate(db, tobie, "wrote", article, %{year: 2024})

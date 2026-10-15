@@ -5,6 +5,8 @@ defmodule SurrealDB.Error do
   The `kind` field categorises the failure:
 
     * `:rpc` - the server returned an error for an RPC call (`code`/`message` set).
+    * `:query` - one or more statements of a `SurrealDB.query/3` failed. `details.results`
+      holds every statement's outcome as `{:ok, value}` or `{:error, error}`.
     * `:connection` - the transport could not be established or was lost.
     * `:decode` - a response could not be decoded.
     * `:auth` - authentication or authorisation failed (including HTTP 401 and 403).
@@ -13,7 +15,7 @@ defmodule SurrealDB.Error do
     * `:unsupported` - the operation is not available on the active engine.
   """
 
-  @type kind :: :rpc | :connection | :decode | :auth | :http | :timeout | :unsupported
+  @type kind :: :rpc | :query | :connection | :decode | :auth | :http | :timeout | :unsupported
   @type t :: %__MODULE__{
           kind: kind(),
           message: String.t(),

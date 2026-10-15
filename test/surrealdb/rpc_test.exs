@@ -18,13 +18,25 @@ defmodule SurrealDB.RPCTest do
       assert RPC.parse_query(statements) == {:ok, [[%{"n" => 1}], []]}
     end
 
-    test "returns the first ERR statement as an error" do
+    test "keeps every statement's outcome when one fails" do
       statements = [
-        %{"status" => "OK", "result" => []},
-        %{"status" => "ERR", "result" => "boom"}
+        %{"status" => "OK", "result" => [1]},
+        %{"status" => "ERR", "result" => "boom"},
+        %{"status" => "OK", "result" => [3]},
+        %{"status" => "ERR", "result" => "bang"}
       ]
 
-      assert {:error, %SurrealDB.Error{kind: :rpc, message: "boom"}} = RPC.parse_query(statements)
+      assert {:error, %SurrealDB.Error{kind: :query, message: message, details: details}} =
+               RPC.parse_query(statements)
+
+      assert message == "2 of 4 statements failed; statement 2: boom"
+
+      assert [
+               {:ok, [1]},
+               {:error, %SurrealDB.Error{message: "boom"}},
+               {:ok, [3]},
+               {:error, %SurrealDB.Error{message: "bang"}}
+             ] = details.results
     end
   end
 

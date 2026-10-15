@@ -147,12 +147,36 @@ defmodule SurrealDB do
   @doc """
   Runs a SurrealQL query with optional bound variables.
 
-  Returns `{:ok, results}` with one entry per statement, or `{:error, error}` for the first
-  statement that failed.
+  Returns `{:ok, results}` with one result per statement when every statement succeeded.
+
+  When any statement fails it returns `{:error, %SurrealDB.Error{kind: :query}}`. The
+  error's `details.results` holds every statement's outcome, in order, as `{:ok, value}`
+  or `{:error, error}`, so nothing after the first failure is lost:
+
+      case SurrealDB.query(db, "CREATE a; THROW 'no'; CREATE b") do
+        {:ok, [a, _, b]} -> {a, b}
+        {:error, %SurrealDB.Error{kind: :query, details: %{results: results}}} -> results
+      end
+
+  Use `query_results/3` to always get the per-statement outcomes.
   """
   @spec query(conn(), String.t(), map()) :: result()
   def query(conn, surql, vars \\ %{}) do
     Connection.call(conn, "query", [surql, vars])
+  end
+
+  @doc """
+  Runs a SurrealQL query and returns every statement's outcome, in order, as
+  `{:ok, value}` or `{:error, %SurrealDB.Error{}}`. A failed statement does not hide the
+  ones after it.
+
+      {:ok, [{:ok, _}, {:error, error}, {:ok, _}]} =
+        SurrealDB.query_results(db, "CREATE a; THROW 'no'; CREATE b")
+  """
+  @spec query_results(conn(), String.t(), map()) ::
+          {:ok, [{:ok, term()} | {:error, Error.t()}]} | {:error, Error.t()}
+  def query_results(conn, surql, vars \\ %{}) do
+    Connection.call(conn, "query", [surql, vars], meta: %{statements: true})
   end
 
   @doc """
