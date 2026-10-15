@@ -10,9 +10,12 @@ defmodule SurrealDB.Engine.Mock do
   `{:mock_message, encoded_payload}` message; `handle_transport/2` forwards it like any
   other engine message. Send `:mock_closed` to simulate a dead transport, or
   `{:mock_reset, reason}` to simulate lost in-flight requests. A responder that returns
-  `:noreply` leaves the request unanswered, and `{:frames, results}` answers it with one
-  response per result, as a streaming query is answered. A responder of arity 3 also gets the decoded
-  request, to check its `"session"` and `"txn"` fields.
+  `:noreply` leaves the request unanswered, `{:delay, ms, result}` (or
+  `{:delay, ms, {:error, error}}`) answers after `ms`, `{:batch, result, payloads}`
+  delivers the reply and the extra payloads in one transport message, and
+  `{:frames, results}` answers it with one response per result, as a streaming query is
+  answered. A responder of arity 3 also gets the decoded request, to check its `"session"`
+  and `"txn"` fields.
   """
 
   @behaviour SurrealDB.Engine
@@ -56,6 +59,18 @@ defmodule SurrealDB.Engine.Mock do
 
       {:error, error} ->
         send(self(), {:mock_message, codec.encode(%{"id" => id, "error" => error})})
+
+      {:delay, ms, {:error, error}} ->
+        reply = codec.encode(%{"id" => id, "error" => error})
+        Process.send_after(self(), {:mock_message, reply}, ms)
+
+      {:delay, ms, result} ->
+        reply = codec.encode(%{"id" => id, "result" => result})
+        Process.send_after(self(), {:mock_message, reply}, ms)
+
+      {:batch, result, payloads} ->
+        reply = codec.encode(%{"id" => id, "result" => result})
+        send(self(), {:mock_batch, [reply | Enum.map(payloads, &codec.encode/1)]})
     end
 
     {:ok, conn}
@@ -70,6 +85,10 @@ defmodule SurrealDB.Engine.Mock do
   @impl true
   def handle_transport(conn, {:mock_message, payload}) do
     {:ok, [{:message, IO.iodata_to_binary(payload)}], conn}
+  end
+
+  def handle_transport(conn, {:mock_batch, payloads}) do
+    {:ok, Enum.map(payloads, &{:message, IO.iodata_to_binary(&1)}), conn}
   end
 
   def handle_transport(conn, {:mock_failed, id, error}), do: {:ok, [{:failed, id, error}], conn}

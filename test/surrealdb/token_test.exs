@@ -138,6 +138,74 @@ defmodule SurrealDB.TokenTest do
     assert %{refresh_token: nil} = SurrealDB.info_session(db)
   end
 
+  test "a failed renewal is tried again after a backoff, not at once" do
+    error = %{"code" => -32_002, "message" => "Not allowed", "kind" => "NotAllowed"}
+    db = start(%{"signin" => [{:ok, jwt(1)}, {:error, error}]})
+
+    {:ok, _} = SurrealDB.signin(db, %SurrealDB.Auth.Root{user: "root", pass: "root"})
+    assert_received {:rpc, "signin", _}
+    assert_receive {:rpc, "signin", _}, 2_000
+
+    # The first retry waits a second.
+    refute_receive {:rpc, "signin", _}, 700
+    assert_receive {:rpc, "signin", _}, 2_000
+  end
+
+  test "a renewal that times out is tried again" do
+    db = start(%{"signin" => [{:ok, jwt(1)}, :noreply, {:ok, jwt(3600)}]}, timeout: 200)
+
+    {:ok, _} = SurrealDB.signin(db, %SurrealDB.Auth.Root{user: "root", pass: "root"})
+    assert_received {:rpc, "signin", _}
+    assert_receive {:rpc, "signin", _}, 2_000
+    assert_receive {:rpc, "signin", _}, 3_000
+  end
+
+  test "a renewal that fails after a newer refresh keeps the newer refresh token" do
+    pair = %{"access" => jwt(2), "refresh" => "refresh.1"}
+    new_pair = %{"access" => jwt(3600), "refresh" => "refresh.2"}
+    refused = %{"code" => -32_002, "message" => "Invalid refresh token", "kind" => "NotAllowed"}
+
+    db =
+      start(%{
+        "signin" => {:ok, pair},
+        "refresh" => [{:delay, 400, {:error, refused}}, {:ok, new_pair}]
+      })
+
+    {:ok, _} = SurrealDB.signin(db, @record)
+    assert_received {:rpc, "signin", _}
+    assert_receive {:rpc, "refresh", [^pair]}, 3_000
+    assert {:ok, ^new_pair} = SurrealDB.refresh(db)
+
+    refute_receive {:rpc, "signin", _}, 700
+    assert %{refresh_token: "refresh.2"} = SurrealDB.info_session(db)
+  end
+
+  test "a renewal that succeeds after a newer authenticate does not undo it" do
+    db = start(%{"signin" => [{:ok, jwt(2)}, {:delay, 400, jwt(3600, "old")}]})
+
+    {:ok, _} = SurrealDB.signin(db, %SurrealDB.Auth.Root{user: "root", pass: "root"})
+    assert_received {:rpc, "signin", _}
+    assert_receive {:rpc, "signin", _}, 3_000
+    {:ok, _} = SurrealDB.authenticate(db, "newer.token")
+    assert_received {:rpc, "authenticate", ["newer.token"]}
+
+    # The renewal's late success is dropped, and the session put back on the newer token.
+    assert_receive {:rpc, "authenticate", ["newer.token"]}, 1_000
+    assert %{token: "newer.token"} = SurrealDB.info_session(db)
+  end
+
+  test "a forked session renews its own access token" do
+    pair = %{"access" => jwt(2), "refresh" => "refresh.1"}
+    new_pair = %{"access" => jwt(3600), "refresh" => "refresh.2"}
+    db = start(%{"signin" => {:ok, pair}, "refresh" => {:ok, new_pair}})
+
+    {:ok, _} = SurrealDB.signin(db, @record)
+    {:ok, _session} = SurrealDB.fork_session(db)
+
+    assert_receive {:rpc, "refresh", _}, 3_000
+    assert_receive {:rpc, "refresh", _}, 3_000
+  end
+
   test "does not renew with renew_access: false, or with only a token" do
     db = start(%{"signin" => {:ok, jwt(1)}}, renew_access: false)
     {:ok, _} = SurrealDB.signin(db, %SurrealDB.Auth.Root{user: "root", pass: "root"})

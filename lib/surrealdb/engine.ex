@@ -73,11 +73,21 @@ defmodule SurrealDB.Engine do
   @callback handle_transport(conn(), message :: term()) ::
               {:ok, [event()], conn()} | {:error, term(), conn()} | :unknown
 
+  @doc """
+  Called when request `id` timed out and its caller has been told. An engine that cannot
+  leave a request behind (HTTP/1.1 answers requests in order, so a stuck one blocks those
+  after it) cleans up here, and returns events for any other requests that fail as a
+  result. Optional; engines without it do nothing.
+  """
+  @callback cancel(conn(), id :: term()) :: {:ok, [event()], conn()}
+
   @doc "Closes the transport."
   @callback close(conn()) :: :ok
 
   @doc "Whether this engine supports live queries."
   @callback supports_live?() :: boolean()
+
+  @optional_callbacks cancel: 2
 
   @doc "Resolves the engine module to use for a URL scheme."
   @spec for_scheme(String.t()) :: {:ok, module()} | {:error, term()}

@@ -26,12 +26,14 @@ defmodule SurrealDB do
   Methods such as `select/2` and `create/3` accept a "thing" that identifies what to act on:
 
     * a string (for example `"person"`) or a `SurrealDB.Table` targets a whole table. A
-      string is always a table name, even if it contains a colon.
+      string is always a table name, even if it contains a colon. JSON cannot tell such a
+      name from a record id, so over the JSON codec it returns an `:unsupported` error.
     * a `SurrealDB.RecordId` targets a single record. Build one with
       `SurrealDB.RecordId.new/2`, or parse text with `SurrealDB.RecordId.parse!/1`.
     * a `SurrealDB.StringRecordId` targets a single record whose id the server parses.
     * a `SurrealDB.RecordIdRange` targets the records in a range of ids, for example
-      `SurrealDB.RecordIdRange.new("person", {:incl, 1}, {:excl, 100})`.
+      `SurrealDB.RecordIdRange.new("person", {:incl, 1}, {:excl, 100})`. JSON has no
+      way to send one, so over the JSON codec it returns an `:unsupported` error.
 
   The SDK never guesses that a string is a record id: a value such as `"user:1234"` read
   from user input stays a string.
@@ -41,7 +43,10 @@ defmodule SurrealDB do
 
   @typedoc """
   A connection handle, or a `SurrealDB.Session` or `SurrealDB.Transaction` on one. Every
-  call that takes a connection also takes a session or transaction and runs in it.
+  call that takes a connection also takes a session and runs in it. A transaction runs
+  queries and record operations (`query`, `select`, `create`, and so on); calls that change
+  session state (`use`, `signin`, `let`, ...), live queries, `run`, and `export`/`import`
+  return an `:unsupported` error for one.
   """
   @type conn :: GenServer.server() | SurrealDB.Session.t() | Transaction.t()
   @type thing ::
@@ -827,7 +832,9 @@ defmodule SurrealDB do
     * `:timeout` - milliseconds to wait for the response (default 60000).
   """
   @spec export(conn(), keyword()) :: {:ok, String.t()} | {:error, Error.t()}
-  def export(conn, opts \\ []), do: SurrealDB.Rest.export(Connection.session_info(conn), opts)
+  def export(conn, opts \\ [])
+  def export(%Transaction{}, _opts), do: {:error, http_in_txn("export")}
+  def export(conn, opts), do: SurrealDB.Rest.export(Connection.session_info(conn), opts)
 
   @doc """
   Imports a SurrealQL script into the selected namespace and database, as `export/2`
@@ -850,9 +857,16 @@ defmodule SurrealDB do
     * `:timeout` - milliseconds to wait for the response (default 60000).
   """
   @spec import(conn(), String.t(), keyword()) :: {:ok, :imported} | {:error, Error.t()}
-  def import(conn, surql, opts \\ []) do
+  def import(conn, surql, opts \\ [])
+  def import(%Transaction{}, _surql, _opts), do: {:error, http_in_txn("import")}
+
+  def import(conn, surql, opts) do
     SurrealDB.Rest.import(Connection.session_info(conn), surql, opts)
   end
+
+  # The HTTP endpoints run outside any transaction, so its writes would survive a cancel.
+  defp http_in_txn(name),
+    do: Error.new(:unsupported, "#{name} goes over HTTP and cannot run in a transaction")
 
   # ── Thing normalisation ──────────────────────────────────────────────────────
 

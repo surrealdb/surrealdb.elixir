@@ -9,7 +9,8 @@ defmodule SurrealDB.RecordIdRange do
       iex> SurrealDB.RecordIdRange.new("person", {:incl, 1}, {:incl, 100})
       %SurrealDB.RecordIdRange{table: "person", begin: {:incl, 1}, end: {:incl, 100}}
 
-  Over CBOR it is a record id (tag 8) whose key is a range (tag 49).
+  Over CBOR it is a record id (tag 8) whose key is a range (tag 49). JSON cannot carry
+  one, so a JSON connection refuses it with an `:unsupported` error.
   """
 
   @enforce_keys [:table]
