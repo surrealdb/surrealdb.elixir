@@ -10,8 +10,9 @@ defmodule SurrealDB.Engine.Mock do
   `{:mock_message, encoded_payload}` message; `handle_transport/2` forwards it like any
   other engine message. Send `:mock_closed` to simulate a dead transport, or
   `{:mock_reset, reason}` to simulate lost in-flight requests. A responder that returns
-  `:noreply` leaves the request unanswered, and `{:closing, result}` answers and closes the
-  transport in the same batch.
+  `:noreply` leaves the request unanswered, `{:delay, ms, result}` answers after `ms`,
+  `{:batch, result, payloads}` delivers the reply and the extra payloads in one transport
+  message, and `{:closing, result}` answers and closes the transport in the same batch.
   """
 
   @behaviour SurrealDB.Engine
@@ -22,7 +23,13 @@ defmodule SurrealDB.Engine.Mock do
   def connect(_uri, opts) do
     codec = SurrealDB.Codec.resolve(Keyword.get(opts, :codec, :cbor))
     responder = Keyword.get(opts, :responder, &default_responder/2)
-    {:ok, %__MODULE__{codec: codec, responder: responder}}
+
+    # A responder can refuse the connection by answering the pseudo-method "__connect__"
+    # with `{:error, reason}`.
+    case responder.("__connect__", []) do
+      {:error, reason} -> {:error, reason}
+      _ -> {:ok, %__MODULE__{codec: codec, responder: responder}}
+    end
   end
 
   @impl true
@@ -47,6 +54,17 @@ defmodule SurrealDB.Engine.Mock do
 
       {:error, error} ->
         send(self(), {:mock_message, codec.encode(%{"id" => id, "error" => error})})
+
+      {:delay, ms, result} ->
+        Process.send_after(
+          self(),
+          {:mock_message, codec.encode(%{"id" => id, "result" => result})},
+          ms
+        )
+
+      {:batch, result, payloads} ->
+        reply = codec.encode(%{"id" => id, "result" => result})
+        send(self(), {:mock_batch, [reply | Enum.map(payloads, &codec.encode/1)]})
     end
 
     {:ok, conn}
@@ -55,6 +73,10 @@ defmodule SurrealDB.Engine.Mock do
   @impl true
   def handle_transport(conn, {:mock_message, payload}) do
     {:ok, [{:message, IO.iodata_to_binary(payload)}], conn}
+  end
+
+  def handle_transport(conn, {:mock_batch, payloads}) do
+    {:ok, Enum.map(payloads, &{:message, IO.iodata_to_binary(&1)}), conn}
   end
 
   def handle_transport(conn, {:mock_closing, payload}),
@@ -71,6 +93,7 @@ defmodule SurrealDB.Engine.Mock do
   @impl true
   def supports_live?, do: true
 
+  defp default_responder("__connect__", _params), do: :ok
   defp default_responder("use", _params), do: {:ok, nil}
   defp default_responder("signin", _params), do: {:ok, "mock.jwt.token"}
   defp default_responder("signup", _params), do: {:ok, "mock.jwt.token"}

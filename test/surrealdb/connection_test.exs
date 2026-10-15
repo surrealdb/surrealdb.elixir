@@ -397,7 +397,7 @@ defmodule SurrealDB.ConnectionTest do
       assert :sys.get_state(db).pending == %{}
     end
 
-    test "a timed-out let is forgotten, since its reply changes nothing tracked" do
+    test "a timed-out let still records the parameter when its reply arrives late" do
       responder = fn
         "let", _params -> :noreply
         "version", _params -> {:ok, "surrealdb-3.3.4"}
@@ -406,7 +406,11 @@ defmodule SurrealDB.ConnectionTest do
 
       db = start(responder: responder, timeout: 50)
       assert {:error, %SurrealDB.Error{kind: :timeout}} = SurrealDB.let(db, "x", 1)
-      assert :sys.get_state(db).pending == %{}
+
+      [id] = Map.keys(:sys.get_state(db).pending)
+      send(db, {:mock_message, Codec.CBOR.encode(%{"id" => id, "result" => nil})})
+
+      assert :sys.get_state(db).vars == %{"x" => 1}
     end
 
     test "a live query that starts after its call timed out is killed" do
@@ -428,6 +432,28 @@ defmodule SurrealDB.ConnectionTest do
 
       assert_receive {:kill, [%Uuid{value: @live_uuid}]}
       assert :sys.get_state(db).live == %{}
+    end
+
+    test "a call that runs out of time in the mailbox is not sent" do
+      parent = self()
+
+      responder = fn
+        "create", params -> tap({:ok, params}, fn _ -> send(parent, :created) end)
+        "version", _params -> {:ok, "surrealdb-3.3.4"}
+        _method, params -> {:ok, params}
+      end
+
+      db = start(responder: responder)
+      :ok = :sys.suspend(db)
+
+      task =
+        Task.async(fn -> SurrealDB.Connection.call(db, "create", ["person"], timeout: 50) end)
+
+      Process.sleep(150)
+      :ok = :sys.resume(db)
+
+      assert {:error, %SurrealDB.Error{kind: :timeout}} = Task.await(task)
+      refute_receive :created, 100
     end
 
     test "the connection-wide timeout applies by default" do
@@ -461,7 +487,8 @@ defmodule SurrealDB.ConnectionTest do
         SurrealDB.Connection.start_link(
           url: "ws://mock/rpc",
           engine: SurrealDB.Engine.Mock,
-          responder: responder()
+          responder: responder(),
+          reconnect: false
         )
 
       ref = Process.monitor(db)
@@ -488,7 +515,8 @@ defmodule SurrealDB.ConnectionTest do
         SurrealDB.Connection.start_link(
           url: "ws://mock/rpc",
           engine: SurrealDB.Engine.Mock,
-          responder: responder
+          responder: responder,
+          reconnect: false
         )
 
       subscriber = spawn(fn -> Process.sleep(:infinity) end)
@@ -557,6 +585,23 @@ defmodule SurrealDB.ConnectionTest do
       send(db, {:mock_message, Codec.CBOR.encode(notification)})
 
       assert_receive {:relayed, {:surrealdb, :live, _id, %{action: :update}}}, 1_000
+    end
+
+    test "over JSON, live returns the same Uuid its notifications carry" do
+      responder = fn
+        "live", _params -> {:ok, String.upcase(@live_uuid)}
+        "version", _params -> {:ok, "surrealdb-3.3.4"}
+        _method, params -> {:ok, params}
+      end
+
+      db = start(codec: :json, responder: responder)
+      {:ok, live_id} = SurrealDB.live(db, "person")
+      assert live_id == Uuid.new(@live_uuid)
+
+      notification = %{"result" => %{"id" => @live_uuid, "action" => "CREATE", "result" => %{}}}
+      send(db, {:mock_message, Codec.JSON.encode(notification)})
+
+      assert_receive {:surrealdb, :live, ^live_id, %{action: :create}}, 1_000
     end
   end
 

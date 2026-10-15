@@ -104,8 +104,20 @@ defmodule SurrealDB.IntegrationTest do
       {proxy, "#{scheme}://127.0.0.1:#{TCPProxy.port(proxy)}/rpc"}
     end
 
+    defp proxied_ws(proxy_url, opts) do
+      base = [
+        url: proxy_url,
+        namespace: "test",
+        database: Process.get(:it_database),
+        auth: %SurrealDB.Auth.Root{user: "root", pass: "root"},
+        reconnect: [delay: 50, max_delay: 200]
+      ]
+
+      start_supervised!({SurrealDB.Connection, Keyword.merge(base, opts)}, id: :proxied)
+    end
+
     @tag :capture_log
-    test "a dropped WebSocket stops the connection instead of leaving it dead" do
+    test "a dropped WebSocket stops the connection when reconnect is off" do
       Process.flag(:trap_exit, true)
       {proxy, url} = proxied("ws")
 
@@ -114,7 +126,8 @@ defmodule SurrealDB.IntegrationTest do
           url: url,
           namespace: "test",
           database: Process.get(:it_database),
-          auth: %SurrealDB.Auth.Root{user: "root", pass: "root"}
+          auth: %SurrealDB.Auth.Root{user: "root", pass: "root"},
+          reconnect: false
         )
 
       ref = Process.monitor(db)
@@ -125,6 +138,61 @@ defmodule SurrealDB.IntegrationTest do
       TCPProxy.cut(proxy)
 
       assert {:error, %SurrealDB.Error{kind: :connection}} = Task.await(task, 1_000)
+      assert_receive {:DOWN, ^ref, :process, ^db, {:shutdown, {:connection_lost, _}}}, 1_000
+    end
+
+    @tag :capture_log
+    test "a dropped WebSocket reconnects and restores the session and live queries" do
+      {proxy, url} = proxied("ws")
+      db = proxied_ws(url, [])
+
+      {:ok, _} = SurrealDB.query(db, "DEFINE TABLE watched")
+      {:ok, _} = SurrealDB.let(db, "greeting", "hello")
+      {:ok, live_id} = SurrealDB.live(db, "watched")
+      :ok = SurrealDB.subscribe_status(db)
+
+      TCPProxy.cut(proxy)
+      assert_receive {:surrealdb, :status, :reconnecting, _}, 1_000
+      assert_receive {:surrealdb, :status, :connected, _}, 5_000
+
+      # Namespace, database, auth, and parameters are back.
+      assert {:ok, ["hello"]} = SurrealDB.query(db, "RETURN $greeting")
+      assert {:ok, [[]]} = SurrealDB.query(db, "SELECT * FROM watched")
+
+      # The live query was started again and still reports under the original id.
+      {:ok, _} = SurrealDB.create(db, "watched", %{"value" => 1})
+      assert_receive {:surrealdb, :live, ^live_id, %{action: :create}}, 2_000
+
+      assert {:ok, _} = SurrealDB.kill(db, live_id)
+      assert TCPProxy.accepted(proxy) == 2
+    end
+
+    @tag :capture_log
+    test "requests made during an outage are sent after reconnecting" do
+      {proxy, url} = proxied("ws")
+      db = proxied_ws(url, [])
+      :ok = SurrealDB.subscribe_status(db)
+
+      TCPProxy.pause(proxy)
+      assert_receive {:surrealdb, :status, :reconnecting, _}, 1_000
+      task = Task.async(fn -> SurrealDB.query(db, "RETURN 42") end)
+      Process.sleep(200)
+      TCPProxy.resume(proxy)
+
+      assert {:ok, [42]} = Task.await(task, 5_000)
+      assert_received {:surrealdb, :status, :connected, _}
+    end
+
+    @tag :capture_log
+    test "gives up and stops after the last attempt" do
+      Process.flag(:trap_exit, true)
+      {proxy, url} = proxied("ws")
+      db = proxied_ws(url, reconnect: [attempts: 2, delay: 20, max_delay: 40])
+      ref = Process.monitor(db)
+      :ok = SurrealDB.subscribe_status(db)
+
+      TCPProxy.pause(proxy)
+      assert_receive {:surrealdb, :status, :disconnected, _}, 2_000
       assert_receive {:DOWN, ^ref, :process, ^db, {:shutdown, {:connection_lost, _}}}, 1_000
     end
 
