@@ -402,6 +402,28 @@ defmodule SurrealDB.ConnectionTest do
       assert :sys.get_state(db).live == %{}
     end
 
+    test "a call that runs out of time in the mailbox is not sent" do
+      parent = self()
+
+      responder = fn
+        "create", params -> tap({:ok, params}, fn _ -> send(parent, :created) end)
+        "version", _params -> {:ok, "surrealdb-3.3.4"}
+        _method, params -> {:ok, params}
+      end
+
+      db = start(responder: responder)
+      :ok = :sys.suspend(db)
+
+      task =
+        Task.async(fn -> SurrealDB.Connection.call(db, "create", ["person"], timeout: 50) end)
+
+      Process.sleep(150)
+      :ok = :sys.resume(db)
+
+      assert {:error, %SurrealDB.Error{kind: :timeout}} = Task.await(task)
+      refute_receive :created, 100
+    end
+
     test "the connection-wide timeout applies by default" do
       db = start(timeout: 50)
 

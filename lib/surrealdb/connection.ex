@@ -205,12 +205,17 @@ defmodule SurrealDB.Connection do
   def handle_call({:rpc, method, params, meta}, from, state) do
     case json_ambiguous_table(state, params) do
       nil ->
-        {id, state} = next_id(state)
+        meta = local_sent_at(meta, from)
+        timeout = Map.get(meta, :timeout, state.timeout)
 
-        meta =
-          meta |> local_sent_at(from) |> start_timer(id, Map.get(meta, :timeout, state.timeout))
-
-        dispatch(state, id, from, method, params, meta)
+        # A call that waited out its whole timeout in the mailbox (behind a reconnect, say)
+        # is answered here: its caller has given up, so it must not be sent.
+        if out_of_time?(meta, timeout) do
+          {:reply, timeout_error(method), state}
+        else
+          {id, state} = next_id(state)
+          dispatch(state, id, from, method, params, start_timer(meta, id, timeout))
+        end
 
       error ->
         {:reply, {:error, error}, state}
@@ -581,8 +586,9 @@ defmodule SurrealDB.Connection do
   end
 
   # Use the token if the server still accepts it, otherwise sign in again with the stored
-  # credentials. A failed sign-in fails the attempt; with no credentials to sign in with,
-  # the session carries on signed out.
+  # credentials. A refused token with no credentials to fall back on, or a failed sign-in,
+  # fails the attempt: serving queued requests signed out would run them with the wrong
+  # permissions.
   defp restore_auth(%{token: nil, credentials: nil} = state), do: {:ok, state}
 
   defp restore_auth(%{token: nil} = state), do: restore_signin(state)
@@ -597,14 +603,12 @@ defmodule SurrealDB.Connection do
       {:error, %Error{kind: kind} = error, state} when kind in [:connection, :timeout] ->
         {:error, error, state}
 
+      {:error, refused, state} when is_nil(credentials) ->
+        {:error, refused, state}
+
       {:error, _unusable, state} ->
         restore_signin(%{state | token: nil, refresh_token: nil, credentials: credentials})
     end
-  end
-
-  defp restore_signin(%{credentials: nil} = state) do
-    Logger.warning("SurrealDB reconnected signed out: the token is no longer valid")
-    {:ok, state}
   end
 
   defp restore_signin(state) do
@@ -612,8 +616,7 @@ defmodule SurrealDB.Connection do
       {:ok, _result, state} ->
         {:ok, state}
 
-      # Serving queued requests signed out would run them with the wrong permissions, so
-      # the attempt fails and the next one tries again.
+      # The attempt fails and the next one tries again.
       {:error, error, state} ->
         {:error, error, state}
     end
@@ -1142,6 +1145,9 @@ defmodule SurrealDB.Connection do
 
   defp waited(%{sent_at: sent_at}), do: System.monotonic_time(:millisecond) - sent_at
   defp waited(_meta), do: 0
+
+  defp out_of_time?(_meta, :infinity), do: false
+  defp out_of_time?(meta, timeout), do: waited(meta) >= timeout
 
   # Monotonic time is only comparable within one node.
   defp local_sent_at(meta, {pid, _tag}) when node(pid) == node(), do: meta
