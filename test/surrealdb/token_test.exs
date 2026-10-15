@@ -318,6 +318,21 @@ defmodule SurrealDB.TokenTest do
     assert %{token: "access.1"} = SurrealDB.info_session(db)
   end
 
+  test "a stale renewal message leaves the current renewal timer in place" do
+    token = jwt(3600)
+    db = start(%{"signin" => {:ok, token}})
+
+    {:ok, _} = SurrealDB.signin(db, %SurrealDB.Auth.Root{user: "root", pass: "root"})
+    assert_received {:rpc, "signin", _}
+    %{nil => {timer, _tag}} = :sys.get_state(db).renewals
+
+    # A cancelled timer's message, already in the mailbox when a newer timer replaced it.
+    send(db, {:renew_access, nil, token, make_ref()})
+
+    refute_receive {:rpc, "signin", _}, 100
+    assert %{nil => {^timer, _tag}} = :sys.get_state(db).renewals
+  end
+
   test "a revoke that times out still ends renewal when its reply comes late" do
     pair = %{"access" => jwt(3600), "refresh" => "refresh.1"}
     db = start(%{"signin" => {:ok, pair}, "revoke" => :noreply}, timeout: 100)
