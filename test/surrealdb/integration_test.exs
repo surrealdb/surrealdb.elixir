@@ -4,9 +4,11 @@ defmodule SurrealDB.IntegrationTest do
 
   Start a server and run them with:
 
-      docker run --rm -p 8000:8000 surrealdb/surrealdb:latest \
-        start --user root --pass root
+      docker run --rm -p 8000:8000 surrealdb/surrealdb:v3 \
+        start --user root --pass root memory
       mix test --include integration
+
+  CI runs them against the latest 3.x release and the nightly build.
 
   Override the URL with the SURREALDB_URL environment variable (default
   `ws://localhost:8000/rpc`).
