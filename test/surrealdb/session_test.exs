@@ -158,6 +158,58 @@ defmodule SurrealDB.SessionTest do
       assert :sys.get_state(db).sessions |> Map.keys() == [nil]
     end
 
+    test "sessions returns UUIDs over JSON too" do
+      id = "0190d6f2-8b1e-7000-8000-0000000000cc"
+
+      db =
+        start(codec: :json, responder: responder(self(), %{"sessions" => {:ok, [Uuid.new(id)]}}))
+
+      assert {:ok, [%Uuid{value: ^id}]} = SurrealDB.sessions(db)
+    end
+
+    test "forking a closed session fails without attaching a new one" do
+      db = start()
+      {:ok, session} = SurrealDB.new_session(db)
+      {:ok, _} = SurrealDB.close_session(session)
+      drain()
+
+      assert {:error, %Error{kind: :connection}} = SurrealDB.fork_session(session)
+      refute_received {:rpc, "attach", _, _, _}
+    end
+
+    test "a fork interrupted by a reconnect can still sign in again on its own" do
+      parent = self()
+      base = responder(parent)
+      expired = %{"code" => -32_002, "message" => "Token expired", "kind" => "NotAllowed"}
+
+      responder = fn
+        # The fork's `use`, just after it authenticated: drop the connection.
+        "use", params, %{"session" => sid} = request when not is_nil(sid) ->
+          if Process.put(:dropped, true) do
+            base.("use", params, request)
+          else
+            send(self(), :mock_closed)
+            :noreply
+          end
+
+        "authenticate", params, request ->
+          if Process.get(:dropped),
+            do: tap({:error, expired}, fn _ -> base.("authenticate", params, request) end),
+            else: base.("authenticate", params, request)
+
+        method, params, request ->
+          base.(method, params, request)
+      end
+
+      auth = %SurrealDB.Auth.Root{user: "root", pass: "root"}
+      db = start(responder: responder, auth: auth, namespace: "ns", database: "db")
+      drain()
+
+      assert {:error, _} = SurrealDB.fork_session(db)
+      assert_receive {:rpc, "attach", [], fork, nil}, 5_000
+      assert_receive {:rpc, "signin", [_credentials], ^fork, nil}, 5_000
+    end
+
     test "a session attached again but not restored is detached" do
       parent = self()
       db = start()
@@ -281,6 +333,18 @@ defmodule SurrealDB.SessionTest do
 
       {:ok, _} = SurrealDB.query(txn, "RETURN 1")
       assert_received {:rpc, "query", _, nil, @txn}
+    end
+
+    test "transaction/2 re-raises the callback's error even if cancelling fails" do
+      Process.flag(:trap_exit, true)
+      db = start()
+
+      assert_raise RuntimeError, "boom", fn ->
+        SurrealDB.transaction(db, fn _txn ->
+          GenServer.stop(db)
+          raise "boom"
+        end)
+      end
     end
 
     test "transactions cannot be nested" do

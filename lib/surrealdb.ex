@@ -295,18 +295,31 @@ defmodule SurrealDB do
   @spec fork_session(conn()) :: {:ok, SurrealDB.Session.t()} | {:error, Error.t()}
   def fork_session(conn) do
     source = Connection.session_info(conn)
+    {_server, source_sid, _txn} = Connection.target(conn)
 
-    with {:ok, session} <- new_session(conn),
-         :ok <- copy_session(session, source),
-         :ok <- Connection.copy_auth(conn, session) do
+    with :ok <- attached(source),
+         {:ok, session} <- new_session(conn),
+         :ok <- copy_session(session, source, source_sid) do
       {:ok, session}
     end
   end
 
-  defp copy_session(session, source) do
+  defp attached(%{attached: true}), do: :ok
+
+  defp attached(%{session: id}) do
+    message = "session #{id} is not attached: it was closed, or dropped after a reconnect"
+    {:error, Error.new(:connection, message)}
+  end
+
+  defp copy_session(session, source, source_sid) do
+    authenticate = fn ->
+      meta = %{copy_auth_from: source_sid}
+      Connection.call(session, "authenticate", [source.token], meta: meta)
+    end
+
     steps =
       [
-        source.token && fn -> authenticate(session, source.token) end,
+        source.token && authenticate,
         (source.namespace || source.database) &&
           fn ->
             __MODULE__.use(session, namespace: source.namespace, database: source.database)
@@ -329,7 +342,16 @@ defmodule SurrealDB do
 
   @doc "Lists the ids of the sessions attached to the connection."
   @spec sessions(conn()) :: {:ok, [Uuid.t()]} | {:error, Error.t()}
-  def sessions(conn), do: Connection.call(Connection.server(conn), "sessions", [])
+  def sessions(conn) do
+    # Over JSON the ids arrive as strings.
+    case Connection.call(Connection.server(conn), "sessions", []) do
+      {:ok, ids} when is_list(ids) ->
+        {:ok, Enum.map(ids, fn id -> if is_binary(id), do: Uuid.new(id), else: id end)}
+
+      other ->
+        other
+    end
+  end
 
   @doc """
   Closes a session. The server kills its live queries and cancels its open transactions.
@@ -408,7 +430,7 @@ defmodule SurrealDB do
           fun.(txn)
         catch
           kind, reason ->
-            cancel(txn)
+            cancel_quietly(txn)
             :erlang.raise(kind, reason, __STACKTRACE__)
         end
 
@@ -426,6 +448,14 @@ defmodule SurrealDB do
           end
       end
     end
+  end
+
+  # Cleaning up after a failed callback must not replace its error: the connection may be
+  # what failed.
+  defp cancel_quietly(txn) do
+    cancel(txn)
+  catch
+    _kind, _reason -> :ok
   end
 
   # ── Queries ──────────────────────────────────────────────────────────────────

@@ -13,7 +13,7 @@ defmodule SurrealDB.Engine.Mock do
   `:noreply` leaves the request unanswered, `{:delay, ms, result}` (or
   `{:delay, ms, {:error, error}}`) answers after `ms`, and
   `{:batch, result, payloads}` delivers the reply and the extra payloads in one transport
-  message. A responder of arity 3 also gets the decoded request, to check its `"session"`
+  message. `{:send_error, reason}` fails the send itself. A responder of arity 3 also gets the decoded request, to check its `"session"`
   and `"txn"` fields.
   """
 
@@ -42,6 +42,9 @@ defmodule SurrealDB.Engine.Mock do
     params = request["params"] || []
 
     case respond(responder, method, params, request) do
+      {:send_error, reason} ->
+        {:error, reason}
+
       :noreply ->
         :ok
 
@@ -66,8 +69,10 @@ defmodule SurrealDB.Engine.Mock do
         reply = codec.encode(%{"id" => id, "result" => result})
         send(self(), {:mock_batch, [reply | Enum.map(payloads, &codec.encode/1)]})
     end
-
-    {:ok, conn}
+    |> case do
+      {:error, reason} -> {:error, reason}
+      _sent -> {:ok, conn}
+    end
   end
 
   # A 3-arity responder also gets the whole request, to see its session and txn.
