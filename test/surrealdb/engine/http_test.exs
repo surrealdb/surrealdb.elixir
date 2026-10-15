@@ -96,4 +96,28 @@ defmodule SurrealDB.Engine.HTTPTest do
     assert {:ok, "surrealdb-3.0.0"} = SurrealDB.version(db)
     assert {:ok, "surrealdb-3.0.0"} = SurrealDB.version(db)
   end
+
+  test "a JSON error body with structured fields fails the call", %{bypass: bypass, url: url} do
+    Bypass.stub(bypass, "POST", "/rpc", fn conn ->
+      reply(conn, 403, "application/json", ~s({"details":{"reason":"denied"}}))
+    end)
+
+    db = start(url)
+    assert {:error, %SurrealDB.Error{kind: :auth, code: 403}} = SurrealDB.version(db)
+    assert Process.alive?(db)
+  end
+
+  test "a reply goes to the request it answers, whatever id its body has", %{
+    bypass: bypass,
+    url: url
+  } do
+    Bypass.stub(bypass, "POST", "/rpc", fn conn ->
+      {_id, conn} = rpc_id(conn)
+      body = CBOR.encode(%{"id" => 999_999, "result" => "surrealdb-3.0.0"})
+      reply(conn, 200, "application/cbor", body)
+    end)
+
+    db = start(url)
+    assert {:ok, "surrealdb-3.0.0"} = timed(fn -> SurrealDB.version(db) end)
+  end
 end
