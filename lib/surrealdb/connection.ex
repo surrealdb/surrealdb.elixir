@@ -26,7 +26,8 @@ defmodule SurrealDB.Connection do
 
     1. the version check,
     2. authentication: the access token, or signing in again with the credentials the
-       session last signed in with,
+       session last signed in with. If that sign-in fails, the attempt fails and the next
+       one starts after the backoff,
     3. the namespace and database,
     4. connection parameters set with `SurrealDB.let/3`. If one cannot be set again, the
        attempt fails and the next one starts after the backoff,
@@ -134,6 +135,9 @@ defmodule SurrealDB.Connection do
     meta = if opts[:timeout], do: Map.put(meta, :timeout, opts[:timeout]), else: meta
     meta = if session, do: Map.put(meta, :session, session), else: meta
     meta = if txn, do: Map.put(meta, :txn, txn), else: meta
+    # The timeout runs from now, even if the connection is busy (say, reconnecting) when the
+    # call reaches it.
+    meta = Map.put(meta, :sent_at, System.monotonic_time(:millisecond))
 
     # The connection enforces the timeout and always replies, so this only waits forever
     # if the connection process itself is stuck, and the call exits if it dies.
@@ -262,7 +266,10 @@ defmodule SurrealDB.Connection do
 
       true ->
         {id, state} = next_id(state)
-        meta = start_timer(meta, id, Map.get(meta, :timeout, state.timeout))
+
+        meta =
+          meta |> local_sent_at(from) |> start_timer(id, Map.get(meta, :timeout, state.timeout))
+
         dispatch(state, id, from, method, params, meta)
     end
   end
@@ -336,8 +343,14 @@ defmodule SurrealDB.Connection do
 
   def handle_info({:request_timeout, id}, state) do
     case Map.pop(state.pending, id) do
-      {{from, method, _params, _meta}, pending} ->
+      {{from, method, params, meta}, pending} ->
         state = reply(%{state | pending: pending}, from, id, timeout_error(method))
+
+        state = %{
+          state
+          | pending: await_late_reply(state, state.pending, id, method, params, meta)
+        }
+
         cancel_in_engine(state, id)
 
       {nil, _pending} ->
@@ -389,6 +402,18 @@ defmodule SurrealDB.Connection do
     else
       {:noreply, state}
     end
+  end
+
+  # Methods whose reply changes what the connection tracks about the session.
+  @session_methods ~w(use signin signup authenticate invalidate reset let set unset)
+
+  # A timed-out request on an engine that cannot cancel it (a WebSocket) may still run on
+  # the server. If it changes session state, keep it pending with no caller, so its late
+  # reply still updates the namespace, database, and auth the connection reports and sends.
+  defp await_late_reply(state, pending, id, method, params, meta) do
+    if method in @session_methods and not function_exported?(state.engine, :cancel, 2),
+      do: Map.put(pending, id, {nil, method, params, Map.delete(meta, :timer)}),
+      else: pending
   end
 
   defp handle_transport(message, state) do
@@ -596,7 +621,9 @@ defmodule SurrealDB.Connection do
           {:ok, state}
         end
 
-      {:error, %Error{kind: :connection} = error, state} ->
+      # A dead transport fails startup whatever the check setting; with the check off,
+      # only a server that cannot answer `version` is let through.
+      {:error, %Error{kind: kind} = error, state} when kind in [:connection, :timeout] ->
         {:error, error, state}
 
       {:error, error, state} ->
@@ -663,7 +690,8 @@ defmodule SurrealDB.Connection do
   defp detach_on_error(result, _sid), do: result
 
   # Use the token if the server still accepts it, otherwise sign in again with the stored
-  # credentials. If neither works the session carries on signed out.
+  # credentials. A failed sign-in fails the attempt; with no credentials to sign in with,
+  # the session carries on signed out.
   defp restore_auth(state, sid) do
     case session(state, sid) do
       %Session{token: nil, credentials: nil} -> {:ok, state}
@@ -680,7 +708,7 @@ defmodule SurrealDB.Connection do
         {:ok,
          update_session(state, sid, &%{&1 | refresh_token: refresh, credentials: credentials})}
 
-      {:error, %Error{kind: :connection} = error, state} ->
+      {:error, %Error{kind: kind} = error, state} when kind in [:connection, :timeout] ->
         {:error, error, state}
 
       {:error, _unusable, state} ->
@@ -702,16 +730,11 @@ defmodule SurrealDB.Connection do
         {:ok, state}
 
       credentials ->
+        # Serving queued requests signed out would run them with the wrong permissions, so
+        # the attempt fails and the next one tries again.
         case rpc_sync(state, "signin", [credentials], sid) do
-          {:ok, _result, state} ->
-            {:ok, state}
-
-          {:error, %Error{kind: :connection} = error, state} ->
-            {:error, error, state}
-
-          {:error, error, state} ->
-            Logger.warning("SurrealDB reconnected signed out: #{Exception.message(error)}")
-            {:ok, update_session(state, sid, &%{&1 | credentials: nil})}
+          {:ok, _result, state} -> {:ok, state}
+          {:error, error, state} -> {:error, error, state}
         end
     end
   end
@@ -1268,8 +1291,16 @@ defmodule SurrealDB.Connection do
   defp start_timer(meta, _id, :infinity), do: meta
 
   defp start_timer(meta, id, timeout) when is_integer(timeout) do
-    Map.put(meta, :timer, Process.send_after(self(), {:request_timeout, id}, timeout))
+    remaining = max(timeout - waited(meta), 0)
+    Map.put(meta, :timer, Process.send_after(self(), {:request_timeout, id}, remaining))
   end
+
+  defp waited(%{sent_at: sent_at}), do: System.monotonic_time(:millisecond) - sent_at
+  defp waited(_meta), do: 0
+
+  # Monotonic time is only comparable within one node.
+  defp local_sent_at(meta, {pid, _tag}) when node(pid) == node(), do: meta
+  defp local_sent_at(meta, _from), do: Map.delete(meta, :sent_at)
 
   defp cancel_timer(%{timer: timer}), do: Process.cancel_timer(timer)
   defp cancel_timer(_meta), do: :ok

@@ -301,6 +301,81 @@ defmodule SurrealDB.ReconnectTest do
     assert_receive {:surrealdb, :live, ^live_id, %{action: :create}}
   end
 
+  test "over JSON, a colon table name made while reconnecting is refused, not queued" do
+    db = start(codec: :json, reconnect: [delay: 500])
+    :ok = SurrealDB.subscribe_status(db)
+    send(db, :mock_closed)
+    assert_receive {:surrealdb, :status, :reconnecting, _}
+
+    assert {:error, %SurrealDB.Error{kind: :unsupported}} = SurrealDB.delete(db, "user:1234")
+    assert :sys.get_state(db).queue == []
+  end
+
+  test "a failed sign-in while restoring fails the reconnect attempt" do
+    parent = self()
+    base = responder(parent)
+    refused = %{"code" => -32_002, "message" => "Not allowed", "kind" => "NotAllowed"}
+
+    responder = fn
+      "authenticate", params ->
+        send(parent, {:rpc, "authenticate", params})
+        {:error, refused}
+
+      "signin", params ->
+        n = Process.put(:signin_calls, (Process.get(:signin_calls) || 0) + 1) || 0
+
+        if n == 1,
+          do: tap({:error, refused}, fn _ -> send(parent, {:rpc, "signin", params}) end),
+          else: base.("signin", params)
+
+      method, params ->
+        base.(method, params)
+    end
+
+    db = start(responder: responder, auth: %SurrealDB.Auth.Root{user: "root", pass: "root"})
+    :ok = SurrealDB.subscribe_status(db)
+    send(db, :mock_closed)
+
+    assert_receive {:surrealdb, :status, :reconnecting, %{attempt: 2, error: %{kind: :rpc}}}
+    assert_receive {:surrealdb, :status, :connected, %{attempt: 2}}
+    assert :sys.get_state(db).sessions[nil].credentials
+  end
+
+  test "a call's timeout runs from when it was made, even during a slow handshake" do
+    parent = self()
+    base = responder(parent)
+
+    responder = fn
+      "__connect__", params ->
+        n = Process.put(:connects, (Process.get(:connects) || 0) + 1) || 0
+
+        if n > 0 do
+          send(parent, :handshaking)
+          Process.sleep(1_000)
+        end
+
+        base.("__connect__", params)
+
+      "version", params ->
+        n = Process.put(:versions, (Process.get(:versions) || 0) + 1) || 0
+        if n > 0, do: {:delay, 2_000, "surrealdb-3.3.4"}, else: base.("version", params)
+
+      method, params ->
+        base.(method, params)
+    end
+
+    db = start(responder: responder, reconnect: [delay: 10])
+    send(db, :mock_closed)
+    assert_receive :handshaking, 1_000
+
+    started = System.monotonic_time(:millisecond)
+
+    assert {:error, %SurrealDB.Error{kind: :timeout}} =
+             Connection.call(db, "ping", [], timeout: 800)
+
+    assert System.monotonic_time(:millisecond) - started < 1_500
+  end
+
   test "backoff stops growing at the cap, however many attempts" do
     config = [delay: 1_000, max_delay: 60_000, multiplier: 2.0, jitter: 0.0]
     assert Connection.backoff(config, 5_000) == 60_000
