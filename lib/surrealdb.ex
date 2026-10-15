@@ -270,6 +270,9 @@ defmodule SurrealDB do
   Needs a WebSocket connection and SurrealDB 3.0 or later.
   """
   @spec new_session(conn()) :: {:ok, SurrealDB.Session.t()} | {:error, Error.t()}
+  def new_session(%Transaction{}),
+    do: {:error, Error.new(:unsupported, "sessions cannot be started in a transaction")}
+
   def new_session(conn) do
     server = Connection.server(conn)
     session = %SurrealDB.Session{conn: server, id: Uuid.v4()}
