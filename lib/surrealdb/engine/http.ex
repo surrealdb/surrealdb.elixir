@@ -116,6 +116,30 @@ defmodule SurrealDB.Engine.HTTP do
     open(%{conn | requests: %{}})
   end
 
+  # HTTP/1.1 answers pipelined requests in order, so a request that timed out would hold up
+  # every request after it. Close the connection (the next request opens a new one) and
+  # fail the requests that were waiting behind it; they cannot be retried, since the server
+  # may already have run them.
+  @impl true
+  def cancel(%__MODULE__{} = conn, id) do
+    if Enum.any?(conn.requests, fn {_ref, request} -> request.id == id end) do
+      {:ok, mint} = Mint.HTTP.close(conn.mint)
+
+      error =
+        Error.new(
+          :connection,
+          "the HTTP connection was closed because an earlier request on it (#{id}) timed out"
+        )
+
+      events =
+        for {_ref, request} <- conn.requests, request.id != id, do: {:failed, request.id, error}
+
+      {:ok, events, %{conn | mint: mint, requests: %{}}}
+    else
+      {:ok, [], conn}
+    end
+  end
+
   @impl true
   def handle_transport(%__MODULE__{} = conn, message) do
     case Mint.HTTP.stream(conn.mint, message) do

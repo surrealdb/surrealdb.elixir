@@ -8,6 +8,7 @@ defmodule SurrealDB.ConnectionTest do
   defp responder do
     fn
       "use", _params -> {:ok, nil}
+      "version", _params -> {:ok, "surrealdb-3.0.0"}
       "signin", _params -> {:ok, "jwt.token"}
       "create", [thing, data] -> {:ok, [Map.put(data, "thing", inspect(thing))]}
       "select", [thing] -> {:ok, %{"selected" => inspect(thing)}}
@@ -23,7 +24,23 @@ defmodule SurrealDB.ConnectionTest do
 
   defp start(opts \\ []) do
     base = [url: "ws://mock/rpc", engine: SurrealDB.Engine.Mock, responder: responder()]
-    start_supervised!({SurrealDB.Connection, Keyword.merge(base, opts)})
+    opts = Keyword.merge(base, opts)
+    start_supervised!({SurrealDB.Connection, Keyword.update!(opts, :responder, &with_version/1)})
+  end
+
+  # Most responders here answer methods they do not care about with nil; give the version
+  # check a version to accept.
+  defp with_version(responder) do
+    fn
+      "version", params ->
+        case responder.("version", params) do
+          {:ok, nil} -> {:ok, "surrealdb-3.0.0"}
+          other -> other
+        end
+
+      method, params ->
+        responder.(method, params)
+    end
   end
 
   test "connects and authenticates on setup" do
@@ -202,6 +219,27 @@ defmodule SurrealDB.ConnectionTest do
                  engine: SurrealDB.Engine.Mock,
                  responder: version_responder("surrealdb-5.0.0")
                )
+    end
+
+    test "refuses a version reply that is not a string" do
+      Process.flag(:trap_exit, true)
+
+      for reply <- [nil, %{"v" => 1}] do
+        assert {:error, %SurrealDB.Error{kind: :unsupported}} =
+                 SurrealDB.Connection.start_link(
+                   url: "ws://mock/rpc",
+                   engine: SurrealDB.Engine.Mock,
+                   responder: version_responder(reply)
+                 )
+      end
+
+      db = start(responder: version_responder(%{"v" => 1}), version_check: false)
+      assert SurrealDB.info_session(db).version == nil
+    end
+
+    test "keeps the transport options for one-off HTTP requests" do
+      db = start(transport_opts: [verify: :verify_none])
+      assert SurrealDB.info_session(db).transport_opts == [verify: :verify_none]
     end
 
     test "starts against an unsupported server when the check is off" do

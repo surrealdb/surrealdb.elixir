@@ -37,6 +37,8 @@ defmodule SurrealDB.Connection do
     :refresh_token,
     :version,
     :timeout,
+    # transport options from start_link, for the one-off HTTP requests (health, export)
+    :transport_opts,
     next_id: 1,
     pending: %{},
     # live query id => MapSet of subscriber pids
@@ -105,7 +107,8 @@ defmodule SurrealDB.Connection do
         engine_state: engine_state,
         codec: codec,
         uri: uri,
-        timeout: Keyword.get(opts, :timeout, @default_timeout)
+        timeout: Keyword.get(opts, :timeout, @default_timeout),
+        transport_opts: Keyword.get(opts, :transport_opts)
       }
 
       setup(state, opts)
@@ -163,6 +166,7 @@ defmodule SurrealDB.Connection do
       authenticated: not is_nil(state.token),
       version: state.version,
       uri: state.uri,
+      transport_opts: state.transport_opts,
       engine: state.engine,
       codec: state.codec,
       supports_live?: state.engine.supports_live?()
@@ -186,7 +190,7 @@ defmodule SurrealDB.Connection do
         if from,
           do: GenServer.reply(from, {:error, Error.new(:timeout, "RPC #{method} timed out")})
 
-        {:noreply, %{state | pending: pending}}
+        cancel_in_engine(%{state | pending: pending}, id)
 
       {nil, _pending} ->
         {:noreply, state}
@@ -210,6 +214,20 @@ defmodule SurrealDB.Connection do
 
       {:error, reason, engine_state} ->
         connection_lost(%{state | engine_state: engine_state}, reason)
+    end
+  end
+
+  defp cancel_in_engine(state, id) do
+    if function_exported?(state.engine, :cancel, 2) do
+      {:ok, events, engine_state} = state.engine.cancel(state.engine_state, id)
+      state = %{state | engine_state: engine_state}
+
+      case Enum.reduce_while(events, {:ok, state}, &process_event/2) do
+        {:ok, state} -> {:noreply, state}
+        {:closed, state} -> connection_lost(state, "connection closed")
+      end
+    else
+      {:noreply, state}
     end
   end
 
@@ -240,8 +258,16 @@ defmodule SurrealDB.Connection do
           _ok -> {:ok, state}
         end
 
-      {:ok, _other, state} ->
-        {:ok, state}
+      {:ok, other, state} ->
+        if check? do
+          message =
+            "the server's version reply #{inspect(other)} is not a version; " <>
+              "pass `version_check: false` to connect anyway"
+
+          {:error, Error.new(:unsupported, message, details: other), state}
+        else
+          {:ok, state}
+        end
 
       {:error, error, state} ->
         if check?, do: {:error, error, state}, else: {:ok, state}
