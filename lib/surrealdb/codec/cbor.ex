@@ -36,6 +36,7 @@ defmodule SurrealDB.Codec.CBOR do
     None,
     Range,
     RecordId,
+    StringRecordId,
     Table,
     Uuid
   }
@@ -68,6 +69,7 @@ defmodule SurrealDB.Codec.CBOR do
   defp enc(%None{}), do: [head(6, 6), enc(nil)]
   defp enc(%Table{name: name}), do: [head(6, 7), enc(name)]
   defp enc(%RecordId{table: table, id: id}), do: [head(6, 8), enc([table, id])]
+  defp enc(%StringRecordId{id: id}), do: [head(6, 8), enc(id)]
 
   defp enc(%Uuid{} = uuid) do
     [head(6, 37), enc(Bytes.new(Uuid.to_binary(uuid)))]

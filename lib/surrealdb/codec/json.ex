@@ -13,7 +13,8 @@ defmodule SurrealDB.Codec.JSON do
 
   @behaviour SurrealDB.Codec
 
-  alias SurrealDB.{Bytes, Datetime, Duration, Geometry, None, Range, RecordId, Table, Uuid}
+  alias SurrealDB.{Bytes, Datetime, Duration, Geometry, None, Range, RecordId, StringRecordId}
+  alias SurrealDB.{Table, Uuid}
 
   @impl true
   def content_type, do: "application/json"
@@ -30,6 +31,7 @@ defmodule SurrealDB.Codec.JSON do
   defp prepare(%None{}), do: nil
   defp prepare(%Table{name: name}), do: name
   defp prepare(%RecordId{} = record), do: RecordId.to_string(record)
+  defp prepare(%StringRecordId{id: id}), do: id
   defp prepare(%Uuid{value: value}), do: value
   defp prepare(%Decimal{} = decimal), do: Decimal.to_string(decimal, :normal)
 

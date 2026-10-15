@@ -190,6 +190,22 @@ defmodule SurrealDB.IntegrationTest do
     end
   end
 
+  test "strings are never turned into record ids" do
+    db = connect()
+    {:ok, _} = SurrealDB.create(db, SurrealDB.RecordId.new("user", 1234), %{"n" => 1})
+
+    # "user:1234" is a table name here, and no such table exists.
+    assert {:error, %SurrealDB.Error{message: "The table 'user:1234' does not exist"}} =
+             SurrealDB.select(db, "user:1234")
+
+    assert {:ok, %{"n" => 1}} = SurrealDB.select(db, SurrealDB.RecordId.parse!("user:1234"))
+    assert {:ok, %{"n" => 1}} = SurrealDB.select(db, SurrealDB.StringRecordId.new("user:1234"))
+
+    # A string value stays a string.
+    assert {:ok, [created]} = SurrealDB.create(db, "note", %{"ref" => "user:1234"})
+    assert created["ref"] == "user:1234"
+  end
+
   test "works over the HTTP engine too" do
     http_url = String.replace(@url, ~r/^ws/, "http")
     db = connect(url: http_url)
