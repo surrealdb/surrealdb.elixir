@@ -298,6 +298,26 @@ defmodule SurrealDB.TokenTest do
     assert %{token: "access.2", refresh_token: "refresh.2"} = SurrealDB.info_session(db)
   end
 
+  test "a reconnect whose refresh is refused, with no credentials to sign in with, fails" do
+    expired = %{"code" => -32_002, "message" => "Token expired", "kind" => "NotAllowed"}
+    refused = %{"code" => -32_002, "message" => "Invalid refresh token", "kind" => "NotAllowed"}
+
+    db =
+      start(%{
+        "authenticate" => [{:ok, nil}, {:error, expired}, {:ok, nil}],
+        "refresh" => {:error, refused}
+      })
+
+    {:ok, _} = SurrealDB.authenticate(db, %{access: "access.1", refresh: "refresh.1"})
+    :ok = SurrealDB.subscribe_status(db)
+    send(db, :mock_closed)
+
+    assert_receive {:surrealdb, :status, :reconnecting, %{attempt: 2}}, 2_000
+    assert_receive {:surrealdb, :status, :connected, %{attempt: 2}}, 2_000
+    refute_received {:rpc, "signin", _}
+    assert %{token: "access.1"} = SurrealDB.info_session(db)
+  end
+
   test "a revoke that times out still ends renewal when its reply comes late" do
     pair = %{"access" => jwt(3600), "refresh" => "refresh.1"}
     db = start(%{"signin" => {:ok, pair}, "revoke" => :noreply}, timeout: 100)
