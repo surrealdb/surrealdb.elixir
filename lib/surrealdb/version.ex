@@ -64,10 +64,8 @@ defmodule SurrealDB.Version do
          )}
 
       :error ->
-        {:error,
-         SurrealDB.Error.new(
-           :unsupported,
-           "could not parse the server version #{inspect(string)}", details: string)}
+        message = "could not parse the server version #{inspect(string)}"
+        {:error, SurrealDB.Error.new(:unsupported, message, details: string)}
     end
   end
 
