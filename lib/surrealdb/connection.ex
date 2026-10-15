@@ -91,7 +91,11 @@ defmodule SurrealDB.Connection do
     end
   end
 
-  # The connect-time `use` and `signin` run synchronously here, inside init, where the
+  # Sign in before selecting the namespace and database: the server only creates a missing
+  # namespace or database for a caller allowed to, so a `use` sent before `signin` leaves a
+  # fresh database undefined and every later query fails.
+  #
+  # The connect-time `signin` and `use` run synchronously here, inside init, where the
   # caller is still blocked and holds no pid. That keeps the synchronous receive loop from
   # ever stealing a `$gen_call` issued by a user once start_link returns.
   defp setup(state, opts) do
@@ -102,8 +106,8 @@ defmodule SurrealDB.Connection do
 
     state = %{state | namespace: namespace, database: database}
 
-    with {:ok, state} <- maybe_use(state, namespace, database, timeout),
-         {:ok, state} <- maybe_signin(state, auth, timeout) do
+    with {:ok, state} <- maybe_signin(state, auth, timeout),
+         {:ok, state} <- maybe_use(state, namespace, database, timeout) do
       {:ok, state}
     else
       {:error, reason, _state} -> {:stop, reason}
