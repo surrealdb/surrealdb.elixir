@@ -116,7 +116,8 @@ article = SurrealDB.RecordId.new("article", "surreal")
 A "thing" passed to `select/2`, `create/3`, and friends can be:
 
 - a string (`"person"`) or a `SurrealDB.Table` - a whole table. A string is always a
-  table name, even when it contains a colon.
+  table name, even when it contains a colon. (JSON cannot tell such a name from a record
+  id, so over the JSON codec a table name with a colon returns an `:unsupported` error.)
 - a `SurrealDB.RecordId` - one record. Parse text with `SurrealDB.RecordId.parse!/1`, or
   wrap it in a `SurrealDB.StringRecordId` to have the server parse it.
 - a `SurrealDB.Range` - a record id range.
