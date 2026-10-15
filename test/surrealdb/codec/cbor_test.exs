@@ -34,6 +34,35 @@ defmodule SurrealDB.Codec.CBORTest do
       assert roundtrip(%{"a" => 1, "b" => [true, nil]}) == %{"a" => 1, "b" => [true, nil]}
     end
 
+    test "decodes half, single, and double precision floats" do
+      assert CBOR.decode(<<0xF9, 0x3E00::16>>) == {:ok, 1.5}
+      assert CBOR.decode(<<0xFA, 1.5::float-32>>) == {:ok, 1.5}
+      assert CBOR.decode(<<0xFB, 1.5::float-64>>) == {:ok, 1.5}
+    end
+
+    test "decodes infinities and NaN at every precision" do
+      for {inf, neg_inf, nan} <- [
+            {<<0xF9, 0x7C00::16>>, <<0xF9, 0xFC00::16>>, <<0xF9, 0x7E00::16>>},
+            {<<0xFA, 0x7F800000::32>>, <<0xFA, 0xFF800000::32>>, <<0xFA, 0x7FC00000::32>>},
+            {<<0xFB, 0x7FF0000000000000::64>>, <<0xFB, 0xFFF0000000000000::64>>,
+             <<0xFB, 0x7FF8000000000000::64>>}
+          ] do
+        assert CBOR.decode(inf) == {:ok, :infinity}
+        assert CBOR.decode(neg_inf) == {:ok, :neg_infinity}
+        assert CBOR.decode(nan) == {:ok, :nan}
+      end
+    end
+
+    test "decodes special floats followed by more items" do
+      assert CBOR.decode(<<0x82, 0xFA, 0x7F800000::32, 0x01>>) == {:ok, [:infinity, 1]}
+    end
+
+    test "round-trips infinities and NaN" do
+      for value <- [:infinity, :neg_infinity, :nan] do
+        assert roundtrip(value) == value
+      end
+    end
+
     test "encodes atom map keys as strings" do
       assert roundtrip(%{name: "tobie"}) == %{"name" => "tobie"}
     end
