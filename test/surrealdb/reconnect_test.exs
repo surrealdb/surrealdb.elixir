@@ -338,7 +338,7 @@ defmodule SurrealDB.ReconnectTest do
 
     assert_receive {:surrealdb, :status, :reconnecting, %{attempt: 2, error: %{kind: :rpc}}}
     assert_receive {:surrealdb, :status, :connected, %{attempt: 2}}
-    assert :sys.get_state(db).credentials
+    assert :sys.get_state(db).sessions[nil].credentials
   end
 
   test "a refused token with no credentials to sign in with fails the reconnect attempt" do
@@ -420,7 +420,7 @@ defmodule SurrealDB.ReconnectTest do
     assert_receive {:surrealdb, :status, :reconnecting, _}
     assert_receive {:rpc, "version", _}, 1_000
 
-    assert %{} = GenServer.call(db, :session_info, 500)
+    assert %{} = GenServer.call(db, {:session_info, nil}, 500)
     assert :ok = GenServer.call(db, {:unsubscribe_status, self()}, 500)
     assert :ok = GenServer.call(db, {:subscribe_status, self()}, 500)
     assert_receive {:surrealdb, :status, :connected, _}, 3_000

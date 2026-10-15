@@ -167,6 +167,19 @@ defmodule SurrealDB.Engine.HTTPTest do
     assert {:ok, "version"} = timed(fn -> SurrealDB.version(db) end)
   end
 
+  test "sessions and transactions are unsupported over HTTP", %{bypass: bypass, url: url} do
+    Bypass.stub(bypass, "POST", "/rpc", fn conn ->
+      {id, conn} = rpc_id(conn)
+      body = CBOR.encode(%{"id" => id, "result" => "surrealdb-3.0.0"})
+      reply(conn, 200, "application/cbor", body)
+    end)
+
+    db = start(url)
+    assert {:error, %SurrealDB.Error{kind: :unsupported}} = SurrealDB.new_session(db)
+    assert {:error, %SurrealDB.Error{kind: :unsupported}} = SurrealDB.begin(db)
+    assert {:error, %SurrealDB.Error{kind: :unsupported}} = SurrealDB.sessions(db)
+  end
+
   test "a request the server stops reading fails after the send timeout" do
     {:ok, listen} = :gen_tcp.listen(0, [:binary, active: false, reuseaddr: true])
     {:ok, port} = :inet.port(listen)

@@ -18,6 +18,8 @@ It aims for feature parity with the official JavaScript SDKs (`surrealdb` and
 - **Full RPC surface**: `use`, `signin`, `signup`, `authenticate`, `invalidate`, `let`,
   `unset`, `query`, `select`, `create`, `insert`, `insert_relation`, `update`, `upsert`,
   `merge`, `patch`, `delete`, `relate`, `run`, `info`, `version`, plus `export`/`import`.
+- **Sessions and interactive transactions** with handles you pass in place of the
+  connection.
 - **Live queries** delivered to any process as messages.
 - **Agent Memory client** with the complete tool surface and namespaces.
 - Works in any Elixir project: it is a plain library with a supervisable connection
@@ -71,7 +73,8 @@ its version, and `SurrealDB.reset/1` signs out and clears the session.
 
 A WebSocket connection reconnects automatically with exponential backoff when it drops,
 and restores its session before it serves requests again: authentication, namespace and
-database, `let` parameters, and live queries (which keep their ids). Requests in flight when
+database, `let` parameters, attached sessions, and live queries (which keep their ids).
+Open transactions are not restored. Requests in flight when
 it dropped fail rather than run twice; requests made while reconnecting wait and are sent
 once it is back. Subscribe to status events to follow along:
 
@@ -190,6 +193,44 @@ projected onto their closest JSON representation.
 {:ok, _} = SurrealDB.authenticate(db, token)
 {:ok, _} = SurrealDB.invalidate(db)
 ```
+
+## Sessions and transactions
+
+A connection can carry several sessions, each with its own namespace, database,
+authentication, and parameters. A session handle goes wherever a connection does:
+
+```elixir
+{:ok, tenant} = SurrealDB.new_session(db)
+{:ok, _} = SurrealDB.signin(tenant, %SurrealDB.Auth.Root{user: "root", pass: "root"})
+{:ok, _} = SurrealDB.use(tenant, namespace: "app", database: "tenant_a")
+{:ok, rows} = SurrealDB.select(tenant, "person")
+
+# Or start from a copy of an existing session's state.
+{:ok, copy} = SurrealDB.fork_session(db)
+
+{:ok, ids} = SurrealDB.sessions(db)
+{:ok, _} = SurrealDB.close_session(tenant)
+```
+
+Interactive transactions work the same way: calls with the transaction handle run inside
+it until you commit or cancel.
+
+```elixir
+{:ok, txn} = SurrealDB.begin(db)
+{:ok, _} = SurrealDB.create(txn, "account", %{balance: 100})
+{:ok, _} = SurrealDB.commit(txn)   # or SurrealDB.cancel(txn)
+
+# transaction/2 commits when the function succeeds and cancels when it returns
+# {:error, _} or raises.
+{:ok, :moved} =
+  SurrealDB.transaction(db, fn txn ->
+    {:ok, _} = SurrealDB.merge(txn, from, %{balance: 90})
+    {:ok, _} = SurrealDB.merge(txn, to, %{balance: 110})
+    :moved
+  end)
+```
+
+Sessions and transactions need a WebSocket connection and SurrealDB 3.0 or later.
 
 ## Errors
 

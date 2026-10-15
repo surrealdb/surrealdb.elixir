@@ -12,7 +12,9 @@ defmodule SurrealDB.Engine.Mock do
   `{:mock_reset, reason}` to simulate lost in-flight requests. A responder that returns
   `:noreply` leaves the request unanswered, `{:delay, ms, result}` answers after `ms`,
   `{:batch, result, payloads}` delivers the reply and the extra payloads in one transport
-  message, and `{:closing, result}` answers and closes the transport in the same batch.
+  message, and `{:closing, result}` answers and closes the transport in the same batch. A
+  responder of arity 3 also gets the decoded request, to check its `"session"` and `"txn"`
+  fields.
   """
 
   @behaviour SurrealDB.Engine
@@ -26,7 +28,7 @@ defmodule SurrealDB.Engine.Mock do
 
     # A responder can refuse the connection by answering the pseudo-method "__connect__"
     # with `{:error, reason}`.
-    case responder.("__connect__", []) do
+    case respond(responder, "__connect__", [], %{}) do
       {:error, reason} -> {:error, reason}
       _ -> {:ok, %__MODULE__{codec: codec, responder: responder}}
     end
@@ -39,7 +41,7 @@ defmodule SurrealDB.Engine.Mock do
     method = request["method"]
     params = request["params"] || []
 
-    case responder.(method, params) do
+    case respond(responder, method, params, request) do
       :noreply ->
         :ok
 
@@ -69,6 +71,12 @@ defmodule SurrealDB.Engine.Mock do
 
     {:ok, conn}
   end
+
+  # A 3-arity responder also gets the whole request, to see its session and txn.
+  defp respond(responder, method, params, request) when is_function(responder, 3),
+    do: responder.(method, params, request)
+
+  defp respond(responder, method, params, _request), do: responder.(method, params)
 
   @impl true
   def handle_transport(conn, {:mock_message, payload}) do

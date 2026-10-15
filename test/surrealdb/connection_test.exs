@@ -141,7 +141,7 @@ defmodule SurrealDB.ConnectionTest do
 
     assert {:ok, %{"access" => "access.jwt"}} = SurrealDB.signin(db, auth)
     assert SurrealDB.info_session(db).token == "access.jwt"
-    assert :sys.get_state(db).refresh_token == "refresh.jwt"
+    assert SurrealDB.info_session(db).refresh_token == "refresh.jwt"
   end
 
   test "over JSON, a table name with a colon is refused rather than read as a record id" do
@@ -410,7 +410,7 @@ defmodule SurrealDB.ConnectionTest do
       [id] = Map.keys(:sys.get_state(db).pending)
       send(db, {:mock_message, Codec.CBOR.encode(%{"id" => id, "result" => nil})})
 
-      assert :sys.get_state(db).vars == %{"x" => 1}
+      assert :sys.get_state(db).sessions[nil].vars == %{"x" => 1}
     end
 
     test "a live query that starts after its call timed out is killed" do

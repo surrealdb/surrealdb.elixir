@@ -168,6 +168,28 @@ defmodule SurrealDB.IntegrationTest do
     end
 
     @tag :capture_log
+    test "a reconnect restores attached sessions with their state" do
+      {proxy, url} = proxied("ws")
+      db = proxied_ws(url, [])
+      other = "#{Process.get(:it_database)}_s"
+
+      {:ok, session} = SurrealDB.new_session(db)
+      {:ok, _} = SurrealDB.signin(session, %SurrealDB.Auth.Root{user: "root", pass: "root"})
+      {:ok, _} = SurrealDB.use(session, namespace: "test", database: other)
+      {:ok, _} = SurrealDB.let(session, "who", "session")
+      :ok = SurrealDB.subscribe_status(db)
+
+      TCPProxy.cut(proxy)
+      assert_receive {:surrealdb, :status, :connected, _}, 5_000
+
+      assert {:ok, [["session", ^other]]} =
+               SurrealDB.query(session, "RETURN [$who, session::db()]")
+
+      assert {:ok, ids} = SurrealDB.sessions(db)
+      assert session.id in ids
+    end
+
+    @tag :capture_log
     test "requests made during an outage are sent after reconnecting" do
       {proxy, url} = proxied("ws")
       db = proxied_ws(url, [])
@@ -395,6 +417,124 @@ defmodule SurrealDB.IntegrationTest do
       assert {:ok, [2]} = SurrealDB.query(db, "RETURN 2")
       Process.sleep(600)
       assert {:ok, [3]} = SurrealDB.query(db, "RETURN 3")
+    end
+  end
+
+  describe "sessions" do
+    test "a new session has its own namespace, database, auth, and parameters" do
+      db = connect()
+      {:ok, _} = SurrealDB.let(db, "who", "default")
+
+      assert {:ok, session} = SurrealDB.new_session(db)
+
+      # A new session starts signed out with nothing selected.
+      assert {:error, %SurrealDB.Error{}} = SurrealDB.query(session, "SELECT * FROM person")
+
+      {:ok, _} = SurrealDB.signin(session, %SurrealDB.Auth.Root{user: "root", pass: "root"})
+      other = "#{Process.get(:it_database)}_other"
+      {:ok, _} = SurrealDB.use(session, namespace: "test", database: other)
+      {:ok, _} = SurrealDB.let(session, "who", "session")
+
+      assert {:ok, [["session", ^other]]} =
+               SurrealDB.query(session, "RETURN [$who, session::db()]")
+
+      database = Process.get(:it_database)
+
+      assert {:ok, [["default", ^database]]} =
+               SurrealDB.query(db, "RETURN [$who, session::db()]")
+
+      assert {:ok, ids} = SurrealDB.sessions(db)
+      assert session.id in ids
+
+      assert {:ok, _} = SurrealDB.close_session(session)
+      assert {:ok, ids} = SurrealDB.sessions(db)
+      refute session.id in ids
+    end
+
+    test "a forked session starts with a copy of the source session" do
+      db = connect()
+      {:ok, _} = SurrealDB.let(db, "who", "default")
+
+      assert {:ok, fork} = SurrealDB.fork_session(db)
+      database = Process.get(:it_database)
+
+      assert {:ok, [["default", ^database]]} =
+               SurrealDB.query(fork, "RETURN [$who, session::db()]")
+
+      {:ok, _} = SurrealDB.let(fork, "who", "fork")
+      assert {:ok, ["default"]} = SurrealDB.query(db, "RETURN $who")
+    end
+
+    test "live queries started in a session are delivered" do
+      db = connect()
+      {:ok, _} = SurrealDB.query(db, "DEFINE TABLE watched")
+      {:ok, session} = SurrealDB.fork_session(db)
+
+      {:ok, live_id} = SurrealDB.live(session, "watched")
+      {:ok, _} = SurrealDB.create(db, "watched", %{"value" => 1})
+      assert_receive {:surrealdb, :live, ^live_id, %{action: :create}}, 2_000
+
+      assert {:ok, _} = SurrealDB.kill(session, live_id)
+    end
+  end
+
+  describe "transactions" do
+    test "writes are visible only after commit" do
+      db = connect()
+      {:ok, _} = SurrealDB.query(db, "DEFINE TABLE account")
+
+      {:ok, txn} = SurrealDB.begin(db)
+      {:ok, _} = SurrealDB.create(txn, SurrealDB.RecordId.new("account", "a"), %{balance: 1})
+
+      assert {:ok, [[%{"balance" => 1}]]} = SurrealDB.query(txn, "SELECT balance FROM account")
+      assert {:ok, [[]]} = SurrealDB.query(db, "SELECT * FROM account")
+
+      assert {:ok, _} = SurrealDB.commit(txn)
+      assert {:ok, [[%{"balance" => 1}]]} = SurrealDB.query(db, "SELECT balance FROM account")
+    end
+
+    test "cancel discards the writes" do
+      db = connect()
+      {:ok, _} = SurrealDB.query(db, "DEFINE TABLE account")
+
+      {:ok, txn} = SurrealDB.begin(db)
+      {:ok, _} = SurrealDB.create(txn, "account", %{balance: 1})
+      assert {:ok, _} = SurrealDB.cancel(txn)
+
+      assert {:ok, [[]]} = SurrealDB.query(db, "SELECT * FROM account")
+      assert {:error, %SurrealDB.Error{}} = SurrealDB.commit(txn)
+    end
+
+    test "transaction/2 commits on success and cancels on error" do
+      db = connect()
+      {:ok, _} = SurrealDB.query(db, "DEFINE TABLE account")
+
+      assert {:ok, :done} =
+               SurrealDB.transaction(db, fn txn ->
+                 {:ok, _} = SurrealDB.create(txn, SurrealDB.RecordId.new("account", "a"), %{})
+                 :done
+               end)
+
+      assert {:error, :nope} =
+               SurrealDB.transaction(db, fn txn ->
+                 {:ok, _} = SurrealDB.create(txn, SurrealDB.RecordId.new("account", "b"), %{})
+                 {:error, :nope}
+               end)
+
+      assert {:ok, [[%{"id" => %SurrealDB.RecordId{id: "a"}}]]} =
+               SurrealDB.query(db, "SELECT id FROM account")
+    end
+
+    test "a transaction in a session runs with that session's selection" do
+      db = connect()
+      {:ok, session} = SurrealDB.fork_session(db)
+      other = "#{Process.get(:it_database)}_txn"
+      {:ok, _} = SurrealDB.use(session, database: other)
+
+      assert {:ok, [^other]} =
+               SurrealDB.transaction(session, fn txn ->
+                 SurrealDB.query(txn, "RETURN session::db()")
+               end)
     end
   end
 

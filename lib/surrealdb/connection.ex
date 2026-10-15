@@ -31,9 +31,16 @@ defmodule SurrealDB.Connection do
     3. the namespace and database,
     4. connection parameters set with `SurrealDB.let/3`. If one cannot be set again, the
        attempt fails and the next one starts after the backoff,
-    5. live queries started with `SurrealDB.live/3`. Each one is started again on the
-       server, and its notifications keep arriving under the live query id the caller
-       already has.
+    5. sessions started with `SurrealDB.new_session/1` or `SurrealDB.fork_session/1`:
+       each is attached again under the same id, then its authentication, namespace and
+       database, and parameters are restored as above. A session the server will not
+       attach again is dropped with a warning, and calls on its handle fail,
+    6. live queries started with `SurrealDB.live/3`, in the session that started them.
+       Each one is started again on the server, and its notifications keep arriving under
+       the live query id the caller already has.
+
+  Transactions are not restored: a transaction open when the connection dropped is gone,
+  and committing it fails.
 
   Requests in flight when the connection dropped fail with a `:connection` error rather
   than being sent twice, since the server may already have run them. Requests made while
@@ -54,6 +61,7 @@ defmodule SurrealDB.Connection do
   require Logger
 
   alias SurrealDB.{Codec, Engine, Error, None, RPC}
+  alias SurrealDB.Connection.Session
 
   defstruct [
     :engine,
@@ -61,12 +69,6 @@ defmodule SurrealDB.Connection do
     :engine_opts,
     :codec,
     :uri,
-    :namespace,
-    :database,
-    :token,
-    :refresh_token,
-    # signin params to sign in again with when the token can no longer be used
-    :credentials,
     :version,
     :timeout,
     :reconnect,
@@ -80,11 +82,12 @@ defmodule SurrealDB.Connection do
     queue: [],
     # results of synchronous setup calls, by request id
     sync: %{},
-    # connection parameters from `let`, replayed after a reconnect
-    vars: %{},
+    # session id (nil for the connection's default session) => Session, in attach order
+    sessions: %{nil => %Session{}},
+    session_order: [],
     # live query id (as the caller knows it) => MapSet of subscriber pids
     live: %{},
-    # live query id => the `live` params, to start it again after a reconnect
+    # live query id => {session id, `live` params}, to start it again after a reconnect
     live_specs: %{},
     # live query id => the id the server currently uses for it
     live_current: %{},
@@ -99,6 +102,12 @@ defmodule SurrealDB.Connection do
   @default_timeout 30_000
 
   @default_reconnect [attempts: 5, delay: 1_000, max_delay: 60_000, multiplier: 2.0, jitter: 0.1]
+
+  # The methods a transaction runs: queries and data methods. The rest change session state
+  # (`use`, `signin`, `let`, ...), start or end live queries, or ask about the connection or
+  # server (`info`, `version`, `ping`), which a transaction has no part in.
+  @txn_methods ~w(query select create insert insert_relation update upsert merge patch delete
+                  relate gql graphql)
 
   @doc "Starts a connection process. See `SurrealDB.start_link/1` for the options."
   @spec start_link(keyword()) :: GenServer.on_start()
@@ -115,11 +124,18 @@ defmodule SurrealDB.Connection do
   `:timeout` given here, in milliseconds or `:infinity`. A timed-out request returns
   `{:error, %SurrealDB.Error{kind: :timeout}}`; the server may still finish it.
   """
-  @spec call(GenServer.server(), String.t(), list(), keyword()) ::
-          {:ok, term()} | {:error, Error.t()}
-  def call(server, method, params, opts \\ []) do
+  @spec call(handle(), String.t(), list(), keyword()) :: {:ok, term()} | {:error, Error.t()}
+  def call(handle, method, params, opts \\ [])
+
+  def call(%SurrealDB.Transaction{}, method, _params, _opts) when method not in @txn_methods,
+    do: {:error, Error.new(:unsupported, "#{method} cannot run in a transaction")}
+
+  def call(handle, method, params, opts) do
+    {server, session, txn} = target(handle)
     meta = Keyword.get(opts, :meta, %{})
     meta = if opts[:timeout], do: Map.put(meta, :timeout, opts[:timeout]), else: meta
+    meta = if session, do: Map.put(meta, :session, session), else: meta
+    meta = if txn, do: Map.put(meta, :txn, txn), else: meta
     # The timeout runs from now, even if the connection is busy (say, reconnecting) when the
     # call reaches it.
     meta = Map.put(meta, :sent_at, System.monotonic_time(:millisecond))
@@ -131,29 +147,54 @@ defmodule SurrealDB.Connection do
     GenServer.call(server, {:rpc, method, params, meta}, :infinity)
   end
 
+  @typedoc "A connection, or a session or transaction on one."
+  @type handle :: GenServer.server() | SurrealDB.Session.t() | SurrealDB.Transaction.t()
+
+  @doc false
+  # The connection process, session id, and transaction id a handle refers to.
+  @spec target(handle()) :: {GenServer.server(), String.t() | nil, String.t() | nil}
+  def target(%SurrealDB.Session{conn: conn, id: id}), do: {conn, to_string(id), nil}
+
+  def target(%SurrealDB.Transaction{conn: conn, id: id, session: session}),
+    do: {conn, session && to_string(session), to_string(id)}
+
+  def target(server), do: {server, nil, nil}
+
+  @doc false
+  @spec server(handle()) :: GenServer.server()
+  def server(handle), do: elem(target(handle), 0)
+
   @doc "Adds `pid` to the subscribers of a live query id."
   @spec subscribe_live(GenServer.server(), term(), pid()) :: :ok
-  def subscribe_live(server, live_id, pid) do
-    GenServer.call(server, {:subscribe_live, live_id, pid})
+  def subscribe_live(handle, live_id, pid) do
+    GenServer.call(server(handle), {:subscribe_live, live_id, pid})
   end
 
   @doc "Removes `pid` from the subscribers of a live query id."
   @spec unsubscribe_live(GenServer.server(), term(), pid()) :: :ok
-  def unsubscribe_live(server, live_id, pid) do
-    GenServer.call(server, {:unsubscribe_live, live_id, pid})
+  def unsubscribe_live(handle, live_id, pid) do
+    GenServer.call(server(handle), {:unsubscribe_live, live_id, pid})
   end
 
   @doc "Sends connection status events to `pid` (see the module docs)."
   @spec subscribe_status(GenServer.server(), pid()) :: :ok
-  def subscribe_status(server, pid), do: GenServer.call(server, {:subscribe_status, pid})
+  def subscribe_status(handle, pid), do: GenServer.call(server(handle), {:subscribe_status, pid})
 
   @doc "Stops sending connection status events to `pid`."
   @spec unsubscribe_status(GenServer.server(), pid()) :: :ok
-  def unsubscribe_status(server, pid), do: GenServer.call(server, {:unsubscribe_status, pid})
+  def unsubscribe_status(handle, pid),
+    do: GenServer.call(server(handle), {:unsubscribe_status, pid})
 
-  @doc "Returns the active session info: namespace, database, whether a token is set, engine."
-  @spec session_info(GenServer.server()) :: map()
-  def session_info(server), do: GenServer.call(server, :session_info)
+  @doc """
+  Returns what the connection knows about the handle's session (the default session for a
+  connection): namespace, database, token, parameters, plus the server version, engine,
+  and status.
+  """
+  @spec session_info(handle()) :: map()
+  def session_info(handle) do
+    {server, session, _txn} = target(handle)
+    GenServer.call(server, {:session_info, session})
+  end
 
   # ── GenServer callbacks ─────────────────────────────────────────────────
 
@@ -174,9 +215,13 @@ defmodule SurrealDB.Connection do
         engine_opts: engine_opts,
         codec: codec,
         uri: uri,
-        namespace: Keyword.get(opts, :namespace),
-        database: Keyword.get(opts, :database),
-        credentials: auth && SurrealDB.Auth.to_params(auth),
+        sessions: %{
+          nil => %Session{
+            namespace: Keyword.get(opts, :namespace),
+            database: Keyword.get(opts, :database),
+            credentials: auth && SurrealDB.Auth.to_params(auth)
+          }
+        },
         timeout: Keyword.get(opts, :timeout, @default_timeout),
         version_check: Keyword.get(opts, :version_check, true),
         connect_timeout: Keyword.get(opts, :connect_timeout, 15_000),
@@ -196,7 +241,7 @@ defmodule SurrealDB.Connection do
   defp setup(state) do
     with {:ok, state} <- check_version(state),
          {:ok, state} <- connect_signin(state),
-         {:ok, state} <- restore_use(state) do
+         {:ok, state} <- restore_use(state, nil) do
       {:ok, state}
     else
       {:error, reason, _state} -> {:stop, reason}
@@ -205,8 +250,15 @@ defmodule SurrealDB.Connection do
 
   @impl true
   def handle_call({:rpc, method, params, meta}, from, state) do
-    case json_ambiguous_table(state, params) do
-      nil ->
+    cond do
+      needs_sessions?(method, meta) and not state.engine.supports_live?() ->
+        message = "sessions and transactions need a WebSocket connection"
+        {:reply, {:error, Error.new(:unsupported, message)}, state}
+
+      error = json_ambiguous_table(state, params) ->
+        {:reply, {:error, error}, state}
+
+      true ->
         meta = local_sent_at(meta, from)
         timeout = Map.get(meta, :timeout, state.timeout)
 
@@ -218,9 +270,6 @@ defmodule SurrealDB.Connection do
           {id, state} = next_id(state)
           dispatch(state, id, from, method, params, start_timer(meta, id, timeout))
         end
-
-      error ->
-        {:reply, {:error, error}, state}
     end
   end
 
@@ -243,12 +292,19 @@ defmodule SurrealDB.Connection do
     {:reply, :ok, %{state | status_subscribers: subscribers}}
   end
 
-  def handle_call(:session_info, _from, state) do
+  def handle_call({:session_info, sid}, _from, state) do
+    session = Map.get(state.sessions, sid, %Session{})
+
     info = %{
-      namespace: state.namespace,
-      database: state.database,
-      token: state.token,
-      authenticated: not is_nil(state.token),
+      session: sid && SurrealDB.Uuid.new(sid),
+      # false for a session that was closed, or dropped after a reconnect
+      attached: Map.has_key?(state.sessions, sid),
+      namespace: session.namespace,
+      database: session.database,
+      token: session.token,
+      refresh_token: session.refresh_token,
+      vars: session.vars,
+      authenticated: not is_nil(session.token),
       version: state.version,
       status: state.status,
       uri: state.uri,
@@ -344,18 +400,25 @@ defmodule SurrealDB.Connection do
   # A timed-out request on an engine that cannot cancel it (a WebSocket) may still run on
   # the server. If it changes session state, keep it pending with no caller, so its late
   # reply still updates the namespace, database, and auth the connection reports and sends.
-  # A late `live` reply starts a query nobody listens to, so it is killed. Any other request
-  # is forgotten: its late reply carries an id, so it is never read as a notification.
+  # A late `live` reply starts a query nobody listens to, so it is killed; a late `attach`
+  # or `begin` opens a session or transaction nobody holds, so it is detached or cancelled.
+  # Any other request is forgotten: its late reply carries an id, so it is never read as a
+  # notification.
   defp await_late_reply(state, pending, id, method, params, meta) do
     cond do
       function_exported?(state.engine, :cancel, 2) ->
         pending
 
       method == "live" ->
-        Map.put(pending, id, {nil, method, params, %{late_live: true}})
+        meta = meta |> Map.take([:session]) |> Map.put(:late_live, true)
+        Map.put(pending, id, {nil, method, params, meta})
 
       method in @session_methods ->
         Map.put(pending, id, {nil, method, params, Map.delete(meta, :timer)})
+
+      method in ["attach", "begin"] ->
+        meta = meta |> Map.take([:session]) |> Map.put(:late, true)
+        Map.put(pending, id, {nil, method, params, meta})
 
       true ->
         pending
@@ -453,9 +516,8 @@ defmodule SurrealDB.Connection do
   # is retried; an unsupported server is not.
   defp restore(state) do
     with {:ok, state} <- check_version(state),
-         {:ok, state} <- restore_auth(state),
-         {:ok, state} <- restore_use(state),
-         {:ok, state} <- restore_vars(state),
+         {:ok, state} <- restore_session(state, nil),
+         {:ok, state} <- restore_attached(state),
          {:ok, state} <- restore_live(state) do
       {:ok, state}
     else
@@ -578,29 +640,84 @@ defmodule SurrealDB.Connection do
     end
   end
 
-  defp connect_signin(%{credentials: nil} = state), do: {:ok, state}
-
   defp connect_signin(state) do
-    case rpc_sync(state, "signin", [state.credentials]) do
-      {:ok, _result, state} -> {:ok, state}
-      {:error, reason, state} -> {:error, reason, state}
+    case session(state, nil).credentials do
+      nil ->
+        {:ok, state}
+
+      credentials ->
+        case rpc_sync(state, "signin", [credentials]) do
+          {:ok, _result, state} -> {:ok, state}
+          {:error, reason, state} -> {:error, reason, state}
+        end
     end
   end
+
+  defp restore_session(state, sid) do
+    with {:ok, state} <- restore_auth(state, sid),
+         {:ok, state} <- restore_use(state, sid) do
+      restore_vars(state, sid)
+    end
+  end
+
+  # Sessions live on one connection, so after a reconnect each attached session is
+  # attached again under its id before its state is restored.
+  defp restore_attached(state) do
+    Enum.reduce_while(state.session_order, {:ok, state}, fn sid, {:ok, state} ->
+      result =
+        case rpc_sync(state, "attach", [], sid) do
+          {:ok, _result, state} -> restore_session(state, sid) |> detach_on_error(sid)
+          {:error, error, state} -> {:error, error, state}
+        end
+
+      case result do
+        {:ok, state} ->
+          {:cont, {:ok, state}}
+
+        # A slow server is not a refusal; the reconnect attempt is tried again.
+        {:error, %Error{kind: kind} = error, state} when kind in [:connection, :timeout] ->
+          {:halt, {:error, error, state}}
+
+        {:error, error, state} ->
+          Logger.warning("SurrealDB could not restore session #{sid}: #{error.message}")
+          {:cont, {:ok, forget_session(state, sid)}}
+      end
+    end)
+  end
+
+  # A session that was attached again but could not be restored is dropped. Detach it
+  # (without waiting) so it does not stay attached on the server, out of reach.
+  defp detach_on_error({:error, %Error{kind: kind} = error, state}, sid)
+       when kind not in [:connection, :timeout] do
+    {id, state} = next_id(state)
+
+    case send_request(state, id, nil, "detach", [], %{session: sid}) do
+      {:ok, state} -> {:error, error, state}
+      {:error, _error, state} -> {:error, error, state}
+    end
+  end
+
+  defp detach_on_error(result, _sid), do: result
 
   # Use the token if the server still accepts it, otherwise sign in again with the stored
   # credentials. A refused token with no credentials to fall back on, or a failed sign-in,
   # fails the attempt: serving queued requests signed out would run them with the wrong
   # permissions.
-  defp restore_auth(%{token: nil, credentials: nil} = state), do: {:ok, state}
+  defp restore_auth(state, sid) do
+    case session(state, sid) do
+      %Session{token: nil, credentials: nil} -> {:ok, state}
+      %Session{token: nil} -> restore_signin(state, sid)
+      %Session{} = session -> restore_token(state, sid, session)
+    end
+  end
 
-  defp restore_auth(%{token: nil} = state), do: restore_signin(state)
+  defp restore_token(state, sid, %Session{token: token} = session) do
+    %Session{refresh_token: refresh, credentials: credentials} = session
 
-  defp restore_auth(state) do
-    %{token: token, refresh_token: refresh, credentials: credentials} = state
-
-    case rpc_sync(state, "authenticate", [token]) do
+    case rpc_sync(state, "authenticate", [token], sid) do
       {:ok, _result, state} ->
-        {:ok, %{state | refresh_token: refresh, credentials: credentials}}
+        {:ok,
+         update_session(state, sid, &%{&1 | refresh_token: refresh, credentials: credentials})}
 
       {:error, %Error{kind: kind} = error, state} when kind in [:connection, :timeout] ->
         {:error, error, state}
@@ -609,35 +726,43 @@ defmodule SurrealDB.Connection do
         {:error, refused, state}
 
       {:error, _unusable, state} ->
-        restore_signin(%{state | token: nil, refresh_token: nil, credentials: credentials})
+        state =
+          update_session(
+            state,
+            sid,
+            &%{&1 | token: nil, refresh_token: nil, credentials: credentials}
+          )
+
+        restore_signin(state, sid)
     end
   end
 
-  defp restore_signin(state) do
-    case rpc_sync(state, "signin", [state.credentials]) do
-      {:ok, _result, state} ->
+  # The attempt fails and the next one tries again.
+  defp restore_signin(state, sid) do
+    case rpc_sync(state, "signin", [session(state, sid).credentials], sid) do
+      {:ok, _result, state} -> {:ok, state}
+      {:error, error, state} -> {:error, error, state}
+    end
+  end
+
+  defp restore_use(state, sid) do
+    case session(state, sid) do
+      %Session{namespace: nil, database: nil} ->
         {:ok, state}
 
-      # The attempt fails and the next one tries again.
-      {:error, error, state} ->
-        {:error, error, state}
+      %Session{namespace: namespace, database: database} ->
+        params = [namespace || None.none(), database || None.none()]
+
+        case rpc_sync(state, "use", params, sid) do
+          {:ok, _result, state} -> {:ok, state}
+          {:error, reason, state} -> {:error, reason, state}
+        end
     end
   end
 
-  defp restore_use(%{namespace: nil, database: nil} = state), do: {:ok, state}
-
-  defp restore_use(state) do
-    params = [state.namespace || None.none(), state.database || None.none()]
-
-    case rpc_sync(state, "use", params) do
-      {:ok, _result, state} -> {:ok, state}
-      {:error, reason, state} -> {:error, reason, state}
-    end
-  end
-
-  defp restore_vars(state) do
-    Enum.reduce_while(state.vars, {:ok, state}, fn {name, value}, {:ok, state} ->
-      case rpc_sync(state, "let", [name, value]) do
+  defp restore_vars(state, sid) do
+    Enum.reduce_while(session(state, sid).vars, {:ok, state}, fn {name, value}, {:ok, state} ->
+      case rpc_sync(state, "let", [name, value], sid) do
         {:ok, _result, state} -> {:cont, {:ok, state}}
         # Carrying on would serve requests that expect the parameter without it.
         {:error, error, state} -> {:halt, {:error, error, state}}
@@ -651,8 +776,8 @@ defmodule SurrealDB.Connection do
   defp restore_live(state) do
     state = %{state | live_ids: %{}}
 
-    Enum.reduce_while(state.live_specs, {:ok, state}, fn {id, params}, {:ok, state} ->
-      case rpc_sync(state, "live", params, %{restore_live: id}) do
+    Enum.reduce_while(state.live_specs, {:ok, state}, fn {id, {sid, params}}, {:ok, state} ->
+      case rpc_sync(state, "live", params, sid, %{restore_live: id}) do
         {:ok, _server_id, state} ->
           {:cont, {:ok, state}}
 
@@ -675,10 +800,10 @@ defmodule SurrealDB.Connection do
   # replay. The reply goes through the normal routing (so notifications and other replies
   # keep flowing), and any message that is not for the transport, such as a caller's
   # `GenServer.call`, is put back in the mailbox afterwards rather than lost.
-  defp rpc_sync(state, method, params, meta \\ %{}) do
+  defp rpc_sync(state, method, params, sid \\ nil, meta \\ %{}) do
     {id, state} = next_id(state)
 
-    case send_request(state, id, :sync, method, params, meta) do
+    case send_request(state, id, :sync, method, params, Map.put(meta, :session, sid)) do
       {:ok, state} ->
         deadline = System.monotonic_time(:millisecond) + state.connect_timeout
         await_sync(state, id, method, deadline, [])
@@ -765,14 +890,14 @@ defmodule SurrealDB.Connection do
   # Calls the connection answers from its own state need no server, so a slow restore does
   # not make their callers wait (and exit on GenServer's default call timeout).
   defp absorb(%{status: :reconnecting} = state, {:"$gen_call", from, call})
-       when call == :session_info or
-              (is_tuple(call) and
-                 elem(call, 0) in [
-                   :subscribe_live,
-                   :unsubscribe_live,
-                   :subscribe_status,
-                   :unsubscribe_status
-                 ]) do
+       when is_tuple(call) and
+              elem(call, 0) in [
+                :session_info,
+                :subscribe_live,
+                :unsubscribe_live,
+                :subscribe_status,
+                :unsubscribe_status
+              ] do
     {:reply, reply, state} = handle_call(call, from, state)
     GenServer.reply(from, reply)
     {:ok, state}
@@ -842,10 +967,15 @@ defmodule SurrealDB.Connection do
       {nil, _pending} ->
         state
 
+      {{nil, method, _params, %{late: true} = meta}, pending} ->
+        undo_late(%{state | pending: pending}, method, Map.get(meta, :session), result)
+
       {{from, method, params, meta}, pending} ->
         cancel_timer(meta)
         state = %{state | pending: pending}
-        state = apply_side_effects(state, method, params, result)
+        sid = Map.get(meta, :session)
+        state = apply_effects(state, sid, method, params, result)
+        state = copy_auth(state, sid, method, meta, result)
         state = register_live(state, method, params, meta, result)
         reply(state, from, id, public_reply(method, meta, result))
     end
@@ -895,16 +1025,16 @@ defmodule SurrealDB.Connection do
     |> Enum.each(&send(&1, {:surrealdb, :live, public_id, message}))
   end
 
-  defp register_live(state, "live", _params, %{late_live: true}, {:ok, server_id}),
-    do: kill_orphan(state, normalize_id(server_id))
+  defp register_live(state, "live", _params, %{late_live: true} = meta, {:ok, server_id}),
+    do: kill_orphan(state, normalize_id(server_id), Map.get(meta, :session))
 
-  defp register_live(state, "live", params, %{subscriber: pid}, {:ok, server_id})
+  defp register_live(state, "live", params, %{subscriber: pid} = meta, {:ok, server_id})
        when is_pid(pid) do
     id = normalize_id(server_id)
 
     state = %{
       state
-      | live_specs: Map.put(state.live_specs, id, params),
+      | live_specs: Map.put(state.live_specs, id, {Map.get(meta, :session), params}),
         live_current: Map.put(state.live_current, id, id),
         live_ids: Map.put(state.live_ids, id, id)
     }
@@ -992,7 +1122,8 @@ defmodule SurrealDB.Connection do
 
         if MapSet.size(remaining) == 0 do
           server_id = Map.get(state.live_current, id, id)
-          state |> drop_live(id) |> kill_orphan(server_id)
+          {sid, _params} = Map.get(state.live_specs, id, {nil, nil})
+          state |> drop_live(id) |> kill_orphan(server_id, sid)
         else
           %{state | live: Map.put(state.live, id, remaining)}
         end
@@ -1002,12 +1133,22 @@ defmodule SurrealDB.Connection do
     end)
   end
 
-  defp kill_orphan(%{status: :reconnecting} = state, _server_id), do: state
+  # The live query belongs to a session, and only that session can kill it.
+  defp kill_orphan(state, server_id, sid),
+    do: send_orphan(state, "kill", [SurrealDB.Uuid.new(server_id)], sid)
 
-  defp kill_orphan(state, server_id) do
+  # A session or transaction that opened after its caller gave up is closed again.
+  defp undo_late(state, "attach", sid, {:ok, _result}), do: send_orphan(state, "detach", [], sid)
+  defp undo_late(state, "begin", sid, {:ok, txn}), do: send_orphan(state, "cancel", [txn], sid)
+  defp undo_late(state, _method, _sid, _result), do: state
+
+  # Best-effort cleanup that nobody waits for. A reconnect discards the server's state anyway.
+  defp send_orphan(%{status: :reconnecting} = state, _method, _params, _sid), do: state
+
+  defp send_orphan(state, method, params, sid) do
     {id, state} = next_id(state)
 
-    case send_request(state, id, nil, "kill", [SurrealDB.Uuid.new(server_id)], %{}) do
+    case send_request(state, id, nil, method, params, %{session: sid}) do
       {:ok, state} -> state
       {:error, _error, state} -> state
     end
@@ -1053,65 +1194,125 @@ defmodule SurrealDB.Connection do
 
   # ── State mutation from method side effects ─────────────────────────────────
 
-  defp apply_side_effects(state, _method, _params, {:error, _error}), do: state
+  # A fork authenticates with its source's token and takes the source's refresh token and
+  # credentials in the same step, so it can sign in again on its own if a reconnect comes
+  # straight after.
+  defp copy_auth(state, sid, "authenticate", %{copy_auth_from: from_sid}, {:ok, _result}) do
+    source = session(state, from_sid)
 
-  defp apply_side_effects(state, "use", [namespace, database], {:ok, _result}) do
-    # The server drops the database when the namespace is cleared (sent as NULL).
-    database = if is_nil(namespace), do: nil, else: use_value(database, state.database)
-    namespace = use_value(namespace, state.namespace)
-    %{state | namespace: namespace, database: database}
+    update_session(
+      state,
+      sid,
+      &%{&1 | refresh_token: source.refresh_token, credentials: source.credentials}
+    )
   end
 
-  defp apply_side_effects(state, method, [credentials | _], {:ok, token})
-       when method in ["signin", "signup"] and is_binary(token) do
-    %{state | token: token, refresh_token: nil, credentials: credentials}
-  end
+  defp copy_auth(state, _sid, _method, _meta, _result), do: state
 
-  # A record access method defined `WITH REFRESH` returns an access and refresh token pair.
-  defp apply_side_effects(state, method, [credentials | _], {:ok, %{"access" => access} = tokens})
-       when method in ["signin", "signup"] and is_binary(access) do
-    %{state | token: access, refresh_token: tokens["refresh"], credentials: credentials}
-  end
+  defp apply_effects(state, _sid, _method, _params, {:error, _error}), do: state
 
-  defp apply_side_effects(state, "authenticate", [token | _], {:ok, _result}) do
-    %{state | token: token, refresh_token: nil, credentials: nil}
-  end
+  # A session attached again after a reconnect keeps the state being restored into it.
+  defp apply_effects(state, sid, "attach", _params, {:ok, _result})
+       when is_map_key(state.sessions, sid),
+       do: state
 
-  defp apply_side_effects(state, method, [name, %None{}], {:ok, _result})
-       when method in ["let", "set"],
-       do: %{state | vars: Map.delete(state.vars, name)}
-
-  defp apply_side_effects(state, method, [name, value], {:ok, _result})
-       when method in ["let", "set"],
-       do: %{state | vars: Map.put(state.vars, name, value)}
-
-  defp apply_side_effects(state, "unset", [name], {:ok, _result}),
-    do: %{state | vars: Map.delete(state.vars, name)}
-
-  # `reset` clears the session: auth, namespace, database, and variables. The server also
-  # kills the session's live queries.
-  defp apply_side_effects(state, "reset", _params, {:ok, _result}) do
-    state = Enum.reduce(Map.keys(state.live), state, &drop_live(&2, &1))
-
+  defp apply_effects(state, sid, "attach", _params, {:ok, _result}) do
     %{
       state
-      | namespace: nil,
-        database: nil,
-        token: nil,
-        refresh_token: nil,
-        credentials: nil,
-        vars: %{}
+      | sessions: Map.put(state.sessions, sid, %Session{}),
+        session_order: state.session_order ++ [sid]
     }
   end
 
-  defp apply_side_effects(state, "invalidate", _params, {:ok, _result}) do
-    %{state | token: nil, refresh_token: nil, credentials: nil}
+  defp apply_effects(state, sid, "detach", _params, {:ok, _result}),
+    do: forget_session(state, sid)
+
+  # `reset` clears the session: auth, namespace, database, and variables. The server also
+  # kills the session's live queries.
+  defp apply_effects(state, sid, "reset", _params, {:ok, _result}) do
+    state = drop_session_lives(state, sid)
+    update_session(state, sid, fn _session -> %Session{} end)
   end
 
-  defp apply_side_effects(state, _method, _params, _result), do: state
+  defp apply_effects(state, sid, method, params, result) do
+    update_session(state, sid, &session_effects(&1, method, params, result))
+  end
+
+  defp session_effects(session, "use", [namespace, database], {:ok, _result}) do
+    # The server drops the database when the namespace is cleared (sent as NULL).
+    database = if is_nil(namespace), do: nil, else: use_value(database, session.database)
+    namespace = use_value(namespace, session.namespace)
+    %{session | namespace: namespace, database: database}
+  end
+
+  defp session_effects(session, method, [credentials | _], {:ok, token})
+       when method in ["signin", "signup"] and is_binary(token) do
+    %{session | token: token, refresh_token: nil, credentials: credentials}
+  end
+
+  # A record access method defined `WITH REFRESH` returns an access and refresh token pair.
+  defp session_effects(session, method, [credentials | _], {:ok, %{"access" => access} = tokens})
+       when method in ["signin", "signup"] and is_binary(access) do
+    %{session | token: access, refresh_token: tokens["refresh"], credentials: credentials}
+  end
+
+  defp session_effects(session, "authenticate", [token | _], {:ok, _result}) do
+    %{session | token: token, refresh_token: nil, credentials: nil}
+  end
+
+  defp session_effects(session, method, [name, %None{}], {:ok, _result})
+       when method in ["let", "set"],
+       do: %{session | vars: Map.delete(session.vars, name)}
+
+  defp session_effects(session, method, [name, value], {:ok, _result})
+       when method in ["let", "set"],
+       do: %{session | vars: Map.put(session.vars, name, value)}
+
+  defp session_effects(session, "unset", [name], {:ok, _result}),
+    do: %{session | vars: Map.delete(session.vars, name)}
+
+  defp session_effects(session, "invalidate", _params, {:ok, _result}) do
+    %{session | token: nil, refresh_token: nil, credentials: nil}
+  end
+
+  defp session_effects(session, _method, _params, _result), do: session
 
   defp use_value(%None{}, current), do: current
   defp use_value(value, _current), do: value
+
+  defp session(state, sid), do: Map.get(state.sessions, sid, %Session{})
+
+  defp update_session(state, sid, fun) do
+    case Map.fetch(state.sessions, sid) do
+      {:ok, session} -> %{state | sessions: Map.put(state.sessions, sid, fun.(session))}
+      :error -> state
+    end
+  end
+
+  defp forget_session(state, nil), do: state
+
+  defp forget_session(state, sid) do
+    state = drop_session_lives(state, sid)
+
+    %{
+      state
+      | sessions: Map.delete(state.sessions, sid),
+        session_order: List.delete(state.session_order, sid)
+    }
+  end
+
+  defp drop_session_lives(state, sid) do
+    state.live_specs
+    |> Enum.filter(fn {_id, {live_sid, _params}} -> live_sid == sid end)
+    |> Enum.reduce(state, fn {id, _spec}, state -> drop_live(state, id) end)
+  end
+
+  # Sessions and transactions are state the server keeps for one connection, so they only
+  # work over a persistent (WebSocket) connection, the same as live queries.
+  defp needs_sessions?(method, meta) do
+    method in ["attach", "detach", "sessions", "begin", "commit", "cancel"] or
+      Map.has_key?(meta, :session) or Map.has_key?(meta, :txn)
+  end
 
   # ── Low level helpers ────────────────────────────────────────────────────
 
@@ -1119,9 +1320,10 @@ defmodule SurrealDB.Connection do
   # to, `:sync` for `rpc_sync/3`, or `nil` when nobody waits for the reply.
   defp send_request(state, id, from, method, params, meta) do
     {params, meta} = server_params(state, method, params, meta)
-    payload = encode_request(state, id, method, params)
+    sid = Map.get(meta, :session)
+    payload = encode_request(state, id, method, params, sid, Map.get(meta, :txn))
 
-    case state.engine.request(state.engine_state, id, payload, session(state)) do
+    case state.engine.request(state.engine_state, id, payload, headers_for(state, sid)) do
       {:ok, engine_state} ->
         pending = Map.put(state.pending, id, {from, method, params, meta})
         {:ok, %{state | engine_state: engine_state, pending: pending}}
@@ -1176,16 +1378,18 @@ defmodule SurrealDB.Connection do
 
   defp next_id(state), do: {state.next_id, %{state | next_id: state.next_id + 1}}
 
-  defp encode_request(state, id, method, params) do
-    state.codec.encode(RPC.request(id, method, wire_params(state, method, params)))
+  defp encode_request(state, id, method, params, sid, txn) do
+    state.codec.encode(RPC.request(id, method, wire_params(state, sid, method, params), sid, txn))
   end
 
   # JSON has no NONE, so a "leave unchanged" `use` parameter would arrive as NULL and clear
   # the selection. Send the current selection in its place.
-  defp wire_params(%{codec: SurrealDB.Codec.JSON} = state, "use", [namespace, database]),
-    do: [use_value(namespace, state.namespace), use_value(database, state.database)]
+  defp wire_params(%{codec: SurrealDB.Codec.JSON} = state, sid, "use", [namespace, database]) do
+    session = session(state, sid)
+    [use_value(namespace, session.namespace), use_value(database, session.database)]
+  end
 
-  defp wire_params(_state, _method, params), do: params
+  defp wire_params(_state, _sid, _method, params), do: params
 
   # JSON has no table type: the server reads a string such as "user:1234" as a record id,
   # so a table name with a colon would silently target a record. Refuse it rather than act
@@ -1210,8 +1414,9 @@ defmodule SurrealDB.Connection do
 
   defp decode(state, binary), do: state.codec.decode(binary)
 
-  defp session(state) do
-    %{namespace: state.namespace, database: state.database, token: state.token}
+  defp headers_for(state, sid) do
+    session = session(state, sid)
+    %{namespace: session.namespace, database: session.database, token: session.token}
   end
 
   defp normalize_id(%SurrealDB.Uuid{value: value}), do: value
