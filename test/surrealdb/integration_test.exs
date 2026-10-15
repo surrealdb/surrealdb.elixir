@@ -396,13 +396,9 @@ defmodule SurrealDB.IntegrationTest do
       other = "#{Process.get(:it_database)}_import"
       {:ok, _} = SurrealDB.query(db, "DEFINE DATABASE #{other}")
 
-      target =
-        start_supervised!(
-          {SurrealDB.Connection,
-           url: @url,
-           namespace: "test",
-           database: other,
-           auth: %SurrealDB.Auth.Root{user: "root", pass: "root"}}, id: :target)
+      auth = %SurrealDB.Auth.Root{user: "root", pass: "root"}
+      opts = [url: @url, namespace: "test", database: other, auth: auth]
+      target = start_supervised!({SurrealDB.Connection, opts}, id: :target)
 
       assert {:ok, :imported} = SurrealDB.import(target, script)
 
