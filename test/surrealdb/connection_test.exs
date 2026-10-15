@@ -127,6 +127,13 @@ defmodule SurrealDB.ConnectionTest do
     assert :sys.get_state(db).refresh_token == "refresh.jwt"
   end
 
+  test "over JSON, a table name with a colon is refused rather than read as a record id" do
+    db = start(codec: :json)
+
+    assert {:error, %SurrealDB.Error{kind: :unsupported}} = SurrealDB.select(db, "user:1234")
+    assert {:ok, _} = SurrealDB.select(db, "user")
+  end
+
   test "create normalises a bare table name to a Table" do
     db = start()
     {:ok, [record]} = SurrealDB.create(db, "person", %{"name" => "Tobie"})
