@@ -426,7 +426,10 @@ defmodule SurrealDB.Connection do
   # A timed-out request on an engine that cannot cancel it (a WebSocket) may still run on
   # the server. If it changes session state, keep it pending with no caller, so its late
   # reply still updates the namespace, database, and auth the connection reports and sends.
-  # A late `live` reply starts a query nobody listens to, so it is killed.
+  # A late `live` reply starts a query nobody listens to, so it is killed; a late `attach`
+  # or `begin` opens a session or transaction nobody holds, so it is detached or cancelled.
+  # Any other request keeps a tombstone, so its late reply is dropped instead of being read
+  # as a notification.
   defp await_late_reply(state, pending, id, method, params, meta) do
     cond do
       function_exported?(state.engine, :cancel, 2) ->
@@ -439,8 +442,12 @@ defmodule SurrealDB.Connection do
       method in @session_methods ->
         Map.put(pending, id, {nil, method, params, Map.delete(meta, :timer)})
 
+      method in ["attach", "begin"] ->
+        meta = meta |> Map.take([:session]) |> Map.put(:late, true)
+        Map.put(pending, id, {nil, method, params, meta})
+
       true ->
-        pending
+        Map.put(pending, id, {nil, method, params, %{discard: true}})
     end
   end
 
@@ -1002,6 +1009,12 @@ defmodule SurrealDB.Connection do
       {nil, _pending} ->
         state
 
+      {{nil, _method, _params, %{discard: true}}, pending} ->
+        %{state | pending: pending}
+
+      {{nil, method, _params, %{late: true} = meta}, pending} ->
+        undo_late(%{state | pending: pending}, method, Map.get(meta, :session), result)
+
       {{from, method, params, meta}, pending} ->
         cancel_timer(meta)
         state = %{state | pending: pending}
@@ -1032,7 +1045,8 @@ defmodule SurrealDB.Connection do
   # A reply carries the id of a pending request. Anything else whose result looks like a
   # notification is one: SurrealDB 2.x put the notification fields at the top level, 3.x
   # sends them under `result` with no top-level id. Checking for a pending id first means a
-  # reply whose result happens to have an `action` field is still delivered as a reply.
+  # reply whose result happens to have an `action` field is still delivered as a reply, and
+  # a message with an id nobody is waiting for is never read as a 3.x notification.
   defp notification(decoded, state) do
     cond do
       Map.has_key?(state.pending, decoded["id"]) ->
@@ -1041,7 +1055,8 @@ defmodule SurrealDB.Connection do
       Map.has_key?(decoded, "action") ->
         {:notification, decoded["id"], decoded}
 
-      is_map(decoded["result"]) and Map.has_key?(decoded["result"], "action") ->
+      is_nil(decoded["id"]) and is_map(decoded["result"]) and
+          Map.has_key?(decoded["result"], "action") ->
         {:notification, decoded["result"]["id"], decoded["result"]}
 
       true ->
@@ -1179,14 +1194,22 @@ defmodule SurrealDB.Connection do
     end)
   end
 
-  defp kill_orphan(%{status: :reconnecting} = state, _server_id, _sid), do: state
-
   # The live query belongs to a session, and only that session can kill it.
-  defp kill_orphan(state, server_id, sid) do
-    {id, state} = next_id(state)
-    params = [SurrealDB.Uuid.new(server_id)]
+  defp kill_orphan(state, server_id, sid),
+    do: send_orphan(state, "kill", [SurrealDB.Uuid.new(server_id)], sid)
 
-    case send_request(state, id, nil, "kill", params, %{session: sid}) do
+  # A session or transaction that opened after its caller gave up is closed again.
+  defp undo_late(state, "attach", sid, {:ok, _result}), do: send_orphan(state, "detach", [], sid)
+  defp undo_late(state, "begin", sid, {:ok, txn}), do: send_orphan(state, "cancel", [txn], sid)
+  defp undo_late(state, _method, _sid, _result), do: state
+
+  # Best-effort cleanup that nobody waits for. A reconnect discards the server's state anyway.
+  defp send_orphan(%{status: :reconnecting} = state, _method, _params, _sid), do: state
+
+  defp send_orphan(state, method, params, sid) do
+    {id, state} = next_id(state)
+
+    case send_request(state, id, nil, method, params, %{session: sid}) do
       {:ok, state} -> state
       {:error, _error, state} -> state
     end
@@ -1222,6 +1245,11 @@ defmodule SurrealDB.Connection do
 
   defp public_reply("query", _meta, {:ok, statements}) when is_list(statements),
     do: RPC.parse_query(statements)
+
+  # Over JSON the server sends a live query id as a string. Return it as the `Uuid` the
+  # notifications carry, so a caller can match one against the other.
+  defp public_reply("live", _meta, {:ok, id}) when is_binary(id),
+    do: {:ok, SurrealDB.Uuid.new(id)}
 
   defp public_reply(_method, _meta, {:ok, value}), do: {:ok, value}
 

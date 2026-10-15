@@ -283,8 +283,45 @@ defmodule SurrealDB.ConnectionTest do
 
       assert {:error, %SurrealDB.Error{kind: :timeout}} = result
       assert micros < 1_000_000
-      assert :sys.get_state(db).pending == %{}
+      assert [{nil, "hang", [], %{discard: true}}] = Map.values(:sys.get_state(db).pending)
       assert {:ok, _} = SurrealDB.Connection.call(db, "ping", [])
+    end
+
+    test "a late reply to a timed-out request is dropped, not read as a notification" do
+      responder = fn
+        "select", _params -> :noreply
+        "live", _params -> {:ok, Uuid.new(@live_uuid)}
+        "version", _params -> {:ok, "surrealdb-3.3.4"}
+        _method, params -> {:ok, params}
+      end
+
+      db = start(responder: responder, timeout: 50)
+      {:ok, live_id} = SurrealDB.live(db, "person")
+
+      assert {:error, %SurrealDB.Error{kind: :timeout}} = SurrealDB.select(db, "audit")
+
+      [id] = Map.keys(:sys.get_state(db).pending)
+      row = %{"id" => Uuid.new(@live_uuid), "action" => "CREATE", "result" => %{}}
+      send(db, {:mock_message, Codec.CBOR.encode(%{"id" => id, "result" => row})})
+
+      refute_receive {:surrealdb, :live, ^live_id, _}, 100
+      assert :sys.get_state(db).pending == %{}
+    end
+
+    test "a message whose id nobody is waiting for is not a notification" do
+      responder = fn
+        "live", _params -> {:ok, Uuid.new(@live_uuid)}
+        "version", _params -> {:ok, "surrealdb-3.3.4"}
+        _method, params -> {:ok, params}
+      end
+
+      db = start(responder: responder)
+      {:ok, live_id} = SurrealDB.live(db, "person")
+
+      row = %{"id" => Uuid.new(@live_uuid), "action" => "CREATE", "result" => %{}}
+      send(db, {:mock_message, Codec.CBOR.encode(%{"id" => 999_999, "result" => row})})
+
+      refute_receive {:surrealdb, :live, ^live_id, _}, 100
     end
 
     test "a timed-out use still updates the session when its reply arrives late" do
@@ -457,6 +494,23 @@ defmodule SurrealDB.ConnectionTest do
       send(db, {:mock_message, Codec.CBOR.encode(notification)})
 
       assert_receive {:relayed, {:surrealdb, :live, _id, %{action: :update}}}, 1_000
+    end
+
+    test "over JSON, live returns the same Uuid its notifications carry" do
+      responder = fn
+        "live", _params -> {:ok, String.upcase(@live_uuid)}
+        "version", _params -> {:ok, "surrealdb-3.3.4"}
+        _method, params -> {:ok, params}
+      end
+
+      db = start(codec: :json, responder: responder)
+      {:ok, live_id} = SurrealDB.live(db, "person")
+      assert live_id == Uuid.new(@live_uuid)
+
+      notification = %{"result" => %{"id" => @live_uuid, "action" => "CREATE", "result" => %{}}}
+      send(db, {:mock_message, Codec.JSON.encode(notification)})
+
+      assert_receive {:surrealdb, :live, ^live_id, %{action: :create}}, 1_000
     end
   end
 

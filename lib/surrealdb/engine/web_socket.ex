@@ -39,14 +39,17 @@ defmodule SurrealDB.Engine.WebSocket do
 
     upgrade_headers = [{"sec-websocket-protocol", subprotocol}]
 
-    with {:ok, mint} <- Mint.HTTP.connect(http_scheme, host, port, connect_opts),
-         {:ok, mint, ref} <- Mint.WebSocket.upgrade(ws_scheme, mint, path, upgrade_headers),
-         {:ok, mint, websocket} <- finish_upgrade(mint, ref),
-         {:ok, mint} <- Mint.HTTP.set_mode(mint, :active) do
-      {:ok, %__MODULE__{mint: mint, websocket: websocket, ref: ref, frame_type: frame_type}}
-    else
-      {:error, reason} -> {:error, reason}
-      {:error, _mint, reason} -> {:error, reason}
+    with {:ok, mint} <- Mint.HTTP.connect(http_scheme, host, port, connect_opts) do
+      # Once the TCP/TLS connection is open, any failure closes it so the socket is not leaked.
+      with {:ok, mint, ref} <- Mint.WebSocket.upgrade(ws_scheme, mint, path, upgrade_headers),
+           {:ok, mint, websocket} <- finish_upgrade(mint, ref),
+           {:ok, mint} <- set_active(mint) do
+        {:ok, %__MODULE__{mint: mint, websocket: websocket, ref: ref, frame_type: frame_type}}
+      else
+        {:error, mint, reason} ->
+          Mint.HTTP.close(mint)
+          {:error, reason}
+      end
     end
   end
 
@@ -95,6 +98,13 @@ defmodule SurrealDB.Engine.WebSocket do
     :ok
   end
 
+  defp set_active(mint) do
+    case Mint.HTTP.set_mode(mint, :active) do
+      {:ok, mint} -> {:ok, mint}
+      {:error, reason} -> {:error, mint, reason}
+    end
+  end
+
   defp finish_upgrade(mint, ref) do
     case recv_upgrade(mint, ref, nil, nil) do
       {:ok, mint, status, headers} -> Mint.WebSocket.new(mint, ref, status, headers)
@@ -108,12 +118,11 @@ defmodule SurrealDB.Engine.WebSocket do
         case scan_upgrade(responses, ref, status, headers) do
           {:done, status, headers} -> {:ok, mint, status, headers}
           {:cont, status, headers} -> recv_upgrade(mint, ref, status, headers)
-          {:error, reason} -> {:error, reason}
+          {:error, reason} -> {:error, mint, reason}
         end
 
       {:error, mint, reason, _responses} ->
-        Mint.HTTP.close(mint)
-        {:error, reason}
+        {:error, mint, reason}
     end
   end
 
