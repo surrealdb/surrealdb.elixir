@@ -76,7 +76,7 @@ defmodule SurrealDB.Connection do
     version_check: true,
     connect_timeout: 15_000,
     renew_access: true,
-    # session id => timer that renews the session's access token before it expires
+    # session id => {timer, tag} that renews the session's access token before it expires
     renewals: %{},
     # streaming query ref => request id
     streams: %{},
@@ -149,7 +149,9 @@ defmodule SurrealDB.Connection do
     meta = Map.put(meta, :sent_at, System.monotonic_time(:millisecond))
 
     # The connection enforces the timeout and always replies, so this only waits forever
-    # if the connection process itself is stuck, and the call exits if it dies.
+    # if the connection process itself is stuck, and the call exits if it dies. A request
+    # write the peer stops reading fails after the connection's timeout (the transport's
+    # send timeout), so it cannot hold the connection process either.
     GenServer.call(server, {:rpc, method, params, meta}, :infinity)
   end
 
@@ -454,15 +456,27 @@ defmodule SurrealDB.Connection do
 
   def handle_info({:reassert_failed, _error}, state), do: {:noreply, state}
 
-  def handle_info({:renew_access, sid, token}, state) do
-    state = %{state | renewals: Map.delete(state.renewals, sid)}
+  # A timer that was cancelled may already have sent its message, after a newer timer took
+  # its place; the tag tells them apart, so a stale message neither renews nor forgets the
+  # newer timer.
+  def handle_info({:renew_access, sid, token, tag}, state) do
+    case Map.get(state.renewals, sid) do
+      {_timer, ^tag} ->
+        state = %{state | renewals: Map.delete(state.renewals, sid)}
+        session = session(state, sid)
 
-    # Skip a renewal the token has since been replaced for. While reconnecting, restoring
-    # the session authenticates again and schedules the next renewal.
-    if state.status == :connected and session(state, sid).token == token do
-      {:noreply, renew(state, sid)}
-    else
-      {:noreply, state}
+        # Skip a renewal the token has since been replaced for, or one with nothing left to
+        # renew with. While reconnecting, restoring the session authenticates again and
+        # schedules the next renewal.
+        if state.status == :connected and session.token == token and
+             (session.refresh_token || session.credentials) do
+          {:noreply, renew(state, sid)}
+        else
+          {:noreply, state}
+        end
+
+      _stale ->
+        {:noreply, state}
     end
   end
 
@@ -1012,7 +1026,7 @@ defmodule SurrealDB.Connection do
   # While a reconnect restores the session, calls join the queue at once (so their timers
   # start) and queued calls time out on time, rather than waiting in the stash.
   defp absorb(%{status: :reconnecting} = state, {:"$gen_call", from, call})
-       when elem(call, 0) in [:rpc, :stream] do
+       when elem(call, 0) in [:rpc, :stream, :cancel_stream] do
     case handle_call(call, from, state) do
       {:noreply, state} ->
         {:ok, state}
@@ -1021,6 +1035,22 @@ defmodule SurrealDB.Connection do
         GenServer.reply(from, reply)
         {:ok, state}
     end
+  end
+
+  # Calls the connection answers from its own state need no server, so a slow restore does
+  # not make their callers wait (and exit on GenServer's default call timeout).
+  defp absorb(%{status: :reconnecting} = state, {:"$gen_call", from, call})
+       when is_tuple(call) and
+              elem(call, 0) in [
+                :session_info,
+                :subscribe_live,
+                :unsubscribe_live,
+                :subscribe_status,
+                :unsubscribe_status
+              ] do
+    {:reply, reply, state} = handle_call(call, from, state)
+    GenServer.reply(from, reply)
+    {:ok, state}
   end
 
   defp absorb(%{status: :reconnecting} = state, {:request_timeout, id}) do
@@ -1552,19 +1582,25 @@ defmodule SurrealDB.Connection do
     state = cancel_renewal(state, sid)
     failures = Map.get(state.renewal_failures, sid, 0)
     delay = min(1_000 * Integer.pow(2, min(failures, 6)), 60_000)
-    timer = Process.send_after(self(), {:renew_access, sid, session(state, sid).token}, delay)
+    state = start_renewal_timer(state, sid, session(state, sid).token, delay)
+    %{state | renewal_failures: Map.put(state.renewal_failures, sid, failures + 1)}
+  end
 
-    %{
-      state
-      | renewals: Map.put(state.renewals, sid, timer),
-        renewal_failures: Map.put(state.renewal_failures, sid, failures + 1)
-    }
+  defp start_renewal_timer(state, sid, token, delay) do
+    tag = make_ref()
+    timer = Process.send_after(self(), {:renew_access, sid, token, tag}, delay)
+    %{state | renewals: Map.put(state.renewals, sid, {timer, tag})}
   end
 
   defp cancel_renewal(state, sid) do
-    {timer, renewals} = Map.pop(state.renewals, sid)
-    if timer, do: Process.cancel_timer(timer)
-    %{state | renewals: renewals}
+    case Map.pop(state.renewals, sid) do
+      {{timer, _tag}, renewals} ->
+        Process.cancel_timer(timer)
+        %{state | renewals: renewals}
+
+      {nil, _renewals} ->
+        state
+    end
   end
 
   # Every change of a session's authentication gets a new generation. A renewal records the
@@ -1637,13 +1673,8 @@ defmodule SurrealDB.Connection do
          %Session{token: token} when is_binary(token) <- session,
          true <- not is_nil(session.refresh_token) or not is_nil(session.credentials),
          {:ok, delay} <- renewal_delay(token) do
-      timer = Process.send_after(self(), {:renew_access, sid, token}, delay)
-
-      %{
-        state
-        | renewals: Map.put(state.renewals, sid, timer),
-          renewal_failures: Map.delete(state.renewal_failures, sid)
-      }
+      state = start_renewal_timer(state, sid, token, delay)
+      %{state | renewal_failures: Map.delete(state.renewal_failures, sid)}
     else
       _ -> state
     end
@@ -1853,6 +1884,9 @@ defmodule SurrealDB.Connection do
     end
   end
 
+  defp send_timeout(timeout) when is_integer(timeout), do: timeout
+  defp send_timeout(_infinity), do: nil
+
   defp engine_opts(codec, opts) do
     frame_type = if codec.subprotocol() == "json", do: :text, else: :binary
 
@@ -1863,6 +1897,7 @@ defmodule SurrealDB.Connection do
       codec: codec
     ]
     |> maybe_put(:transport_opts, Keyword.get(opts, :transport_opts))
+    |> maybe_put(:send_timeout, send_timeout(Keyword.get(opts, :timeout, @default_timeout)))
     |> maybe_put(:responder, Keyword.get(opts, :responder))
   end
 
