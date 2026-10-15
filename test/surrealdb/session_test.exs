@@ -274,6 +274,38 @@ defmodule SurrealDB.SessionTest do
     end
   end
 
+  # Answers the one request still pending, as a server would after its caller timed out.
+  defp late_reply(db, method, result) do
+    [id] = for {id, {nil, ^method, _, _}} <- :sys.get_state(db).pending, do: id
+    payload = SurrealDB.Codec.CBOR.encode(%{"id" => id, "result" => result})
+    send(db, {:mock_message, payload})
+  end
+
+  describe "late replies" do
+    test "a session that attaches after its call timed out is detached again" do
+      db = start(responder: responder(self(), %{"attach" => :noreply}), timeout: 50)
+      drain()
+
+      assert {:error, %Error{kind: :timeout}} = SurrealDB.new_session(db)
+      assert_received {:rpc, "attach", [], sid, nil}
+
+      late_reply(db, "attach", nil)
+
+      assert_receive {:rpc, "detach", [], ^sid, nil}
+      assert Map.keys(:sys.get_state(db).sessions) == [nil]
+    end
+
+    test "a transaction that begins after its call timed out is cancelled" do
+      db = start(responder: responder(self(), %{"begin" => :noreply}), timeout: 50)
+      drain()
+
+      assert {:error, %Error{kind: :timeout}} = SurrealDB.begin(db)
+      late_reply(db, "begin", Uuid.new(@txn))
+
+      assert_receive {:rpc, "cancel", [%Uuid{value: @txn}], nil, nil}
+    end
+  end
+
   describe "transactions" do
     test "calls in a transaction carry its id; commit names it in the params" do
       db = start()
@@ -321,6 +353,18 @@ defmodule SurrealDB.SessionTest do
       assert {:error, :nope} = SurrealDB.transaction(db, fn _txn -> {:error, :nope} end)
       assert_received {:rpc, "cancel", _, _, _}
       refute_received {:rpc, "commit", _, _, _}
+    end
+
+    test "transaction/2 returns the function's error when the cancel cannot be sent" do
+      db = start()
+
+      result =
+        SurrealDB.transaction(db, fn _txn ->
+          stop_supervised!(Connection)
+          {:error, :nope}
+        end)
+
+      assert result == {:error, :nope}
     end
 
     test "transaction/2 cancels and re-raises when the function raises" do

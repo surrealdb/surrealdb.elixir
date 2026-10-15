@@ -392,8 +392,10 @@ defmodule SurrealDB.Connection do
   # A timed-out request on an engine that cannot cancel it (a WebSocket) may still run on
   # the server. If it changes session state, keep it pending with no caller, so its late
   # reply still updates the namespace, database, and auth the connection reports and sends.
-  # A late `live` reply starts a query nobody listens to, so it is killed. Any other request
-  # keeps a tombstone, so its late reply is dropped instead of being read as a notification.
+  # A late `live` reply starts a query nobody listens to, so it is killed; a late `attach`
+  # or `begin` opens a session or transaction nobody holds, so it is detached or cancelled.
+  # Any other request keeps a tombstone, so its late reply is dropped instead of being read
+  # as a notification.
   defp await_late_reply(state, pending, id, method, params, meta) do
     cond do
       function_exported?(state.engine, :cancel, 2) ->
@@ -405,6 +407,10 @@ defmodule SurrealDB.Connection do
 
       method in @session_methods ->
         Map.put(pending, id, {nil, method, params, Map.delete(meta, :timer)})
+
+      method in ["attach", "begin"] ->
+        meta = meta |> Map.take([:session]) |> Map.put(:late, true)
+        Map.put(pending, id, {nil, method, params, meta})
 
       true ->
         Map.put(pending, id, {nil, method, params, %{discard: true}})
@@ -941,6 +947,12 @@ defmodule SurrealDB.Connection do
       {nil, _pending} ->
         state
 
+      {{nil, _method, _params, %{discard: true}}, pending} ->
+        %{state | pending: pending}
+
+      {{nil, method, _params, %{late: true} = meta}, pending} ->
+        undo_late(%{state | pending: pending}, method, Map.get(meta, :session), result)
+
       {{from, method, params, meta}, pending} ->
         cancel_timer(meta)
         state = %{state | pending: pending}
@@ -1104,14 +1116,22 @@ defmodule SurrealDB.Connection do
     end)
   end
 
-  defp kill_orphan(%{status: :reconnecting} = state, _server_id, _sid), do: state
-
   # The live query belongs to a session, and only that session can kill it.
-  defp kill_orphan(state, server_id, sid) do
-    {id, state} = next_id(state)
-    params = [SurrealDB.Uuid.new(server_id)]
+  defp kill_orphan(state, server_id, sid),
+    do: send_orphan(state, "kill", [SurrealDB.Uuid.new(server_id)], sid)
 
-    case send_request(state, id, nil, "kill", params, %{session: sid}) do
+  # A session or transaction that opened after its caller gave up is closed again.
+  defp undo_late(state, "attach", sid, {:ok, _result}), do: send_orphan(state, "detach", [], sid)
+  defp undo_late(state, "begin", sid, {:ok, txn}), do: send_orphan(state, "cancel", [txn], sid)
+  defp undo_late(state, _method, _sid, _result), do: state
+
+  # Best-effort cleanup that nobody waits for. A reconnect discards the server's state anyway.
+  defp send_orphan(%{status: :reconnecting} = state, _method, _params, _sid), do: state
+
+  defp send_orphan(state, method, params, sid) do
+    {id, state} = next_id(state)
+
+    case send_request(state, id, nil, method, params, %{session: sid}) do
       {:ok, state} -> state
       {:error, _error, state} -> state
     end
