@@ -16,9 +16,9 @@ It aims for feature parity with the official JavaScript SDKs (`surrealdb` and
 - **Native value types**: `RecordId`, `Table`, `Uuid`, `Duration`, `Datetime`, `Decimal`,
   `Geometry`, `Range`, `Bytes`, and `None`.
 - **Full RPC surface**: `use`, `signin`, `signup`, `authenticate`, `refresh`, `revoke`,
-  `invalidate`, `reset`, `let`,
-  `unset`, `query`, `select`, `create`, `insert`, `insert_relation`, `update`, `upsert`,
-  `merge`, `patch`, `delete`, `relate`, `run`, `info`, `version`, plus `export`/`import`.
+  `invalidate`, `reset`, `let`, `unset`, `query`, `select`, `create`, `insert`,
+  `insert_relation`, `update`, `upsert`, `merge`, `patch`, `delete`, `relate`, `run`,
+  `info`, `version`, plus `export`/`import`.
 - **Sessions and interactive transactions** with handles you pass in place of the
   connection.
 - **Live queries** delivered to any process as messages.
