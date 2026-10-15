@@ -34,6 +34,7 @@ defmodule SurrealDB.Connection do
     :namespace,
     :database,
     :token,
+    :refresh_token,
     next_id: 1,
     pending: %{},
     live: %{}
@@ -415,15 +416,21 @@ defmodule SurrealDB.Connection do
 
   defp apply_side_effects(state, method, _params, {:ok, token})
        when method in ["signin", "signup"] and is_binary(token) do
-    %{state | token: token}
+    %{state | token: token, refresh_token: nil}
+  end
+
+  # A record access method defined `WITH REFRESH` returns an access and refresh token pair.
+  defp apply_side_effects(state, method, _params, {:ok, %{"access" => access} = tokens})
+       when method in ["signin", "signup"] and is_binary(access) do
+    %{state | token: access, refresh_token: tokens["refresh"]}
   end
 
   defp apply_side_effects(state, "authenticate", params, {:ok, _result}) do
-    %{state | token: Enum.at(params, 0)}
+    %{state | token: Enum.at(params, 0), refresh_token: nil}
   end
 
   defp apply_side_effects(state, "invalidate", _params, {:ok, _result}) do
-    %{state | token: nil}
+    %{state | token: nil, refresh_token: nil}
   end
 
   defp apply_side_effects(state, _method, _params, _result), do: state

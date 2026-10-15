@@ -94,6 +94,20 @@ defmodule SurrealDB.ConnectionTest do
     end
   end
 
+  test "keeps the access token from a signin that returns a token pair" do
+    responder = fn
+      "signin", _params -> {:ok, %{"access" => "access.jwt", "refresh" => "refresh.jwt"}}
+      _method, _params -> {:ok, nil}
+    end
+
+    db = start(responder: responder)
+    auth = %SurrealDB.Auth.Record{namespace: "n", database: "d", access: "account"}
+
+    assert {:ok, %{"access" => "access.jwt"}} = SurrealDB.signin(db, auth)
+    assert SurrealDB.info_session(db).token == "access.jwt"
+    assert :sys.get_state(db).refresh_token == "refresh.jwt"
+  end
+
   test "create normalises a bare table name to a Table" do
     db = start()
     {:ok, [record]} = SurrealDB.create(db, "person", %{"name" => "Tobie"})

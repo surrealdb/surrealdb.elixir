@@ -149,6 +149,47 @@ defmodule SurrealDB.IntegrationTest do
     assert micros < 5_000_000
   end
 
+  describe "record access with refresh tokens" do
+    defp define_record_access do
+      db = connect()
+
+      {:ok, _} =
+        SurrealDB.query(db, """
+        DEFINE TABLE user SCHEMALESS PERMISSIONS FOR select WHERE id = $auth.id;
+        DEFINE ACCESS account ON DATABASE TYPE RECORD
+          SIGNUP (CREATE user SET email = $email, pass = crypto::argon2::generate($pass))
+          SIGNIN (SELECT * FROM user WHERE email = $email AND crypto::argon2::compare(pass, $pass))
+          WITH REFRESH
+          DURATION FOR TOKEN 1h, FOR SESSION 1d;
+        """)
+
+      %SurrealDB.Auth.Record{
+        namespace: "test",
+        database: Process.get(:it_database),
+        access: "account",
+        variables: %{email: "a@example.com", pass: "secret"}
+      }
+    end
+
+    for scheme <- ["ws", "http"] do
+      test "signup and signin keep the access token over #{scheme}" do
+        auth = define_record_access()
+        url = String.replace(@url, ~r/^ws/, unquote(scheme))
+
+        db = start_supervised!({SurrealDB.Connection, url: url}, id: :record_user)
+
+        assert {:ok, %{"access" => access, "refresh" => refresh}} = SurrealDB.signup(db, auth)
+        assert is_binary(access) and is_binary(refresh)
+        assert SurrealDB.info_session(db).token == access
+        assert {:ok, %{"email" => "a@example.com"}} = SurrealDB.info(db)
+
+        assert {:ok, %{"access" => access}} = SurrealDB.signin(db, auth)
+        assert SurrealDB.info_session(db).token == access
+        assert {:ok, %{"email" => "a@example.com"}} = SurrealDB.info(db)
+      end
+    end
+  end
+
   test "works over the HTTP engine too" do
     http_url = String.replace(@url, ~r/^ws/, "http")
     db = connect(url: http_url)
