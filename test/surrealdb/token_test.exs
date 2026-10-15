@@ -332,4 +332,61 @@ defmodule SurrealDB.TokenTest do
     assert_receive {:surrealdb, :status, :connected, _}, 2_000
     assert %{token: "newer.token"} = SurrealDB.info_session(db)
   end
+
+  test "a reassertion that times out drops the connection to restore it" do
+    db =
+      start(
+        %{
+          "signin" => [{:ok, jwt(2)}, {:delay, 400, jwt(3600, "old")}],
+          "authenticate" => [{:ok, nil}, :noreply, {:ok, nil}]
+        },
+        timeout: 1_000
+      )
+
+    {:ok, _} = SurrealDB.signin(db, %SurrealDB.Auth.Root{user: "root", pass: "root"})
+    :ok = SurrealDB.subscribe_status(db)
+    assert_receive {:rpc, "signin", _}
+    assert_receive {:rpc, "signin", _}, 3_000
+    {:ok, _} = SurrealDB.authenticate(db, "newer.token")
+
+    assert_receive {:surrealdb, :status, :reconnecting, _}, 3_000
+    assert_receive {:surrealdb, :status, :connected, _}, 2_000
+    assert %{token: "newer.token"} = SurrealDB.info_session(db)
+  end
+
+  test "auth that changes while a reassertion is in flight is put back again" do
+    db =
+      start(%{
+        "signin" => [{:ok, jwt(2)}, {:delay, 400, jwt(3600, "old")}],
+        "authenticate" => [{:ok, nil}, {:delay, 300, nil}, {:ok, nil}]
+      })
+
+    {:ok, _} = SurrealDB.signin(db, %SurrealDB.Auth.Root{user: "root", pass: "root"})
+    assert_receive {:rpc, "signin", _}
+    assert_receive {:rpc, "signin", _}, 3_000
+    {:ok, _} = SurrealDB.authenticate(db, "newer.token")
+    assert_received {:rpc, "authenticate", ["newer.token"]}
+
+    # The reassertion goes out, and the auth changes before it is answered.
+    assert_receive {:rpc, "authenticate", ["newer.token"]}, 1_000
+    {:ok, _} = SurrealDB.authenticate(db, "newest.token")
+    assert_received {:rpc, "authenticate", ["newest.token"]}
+
+    assert_receive {:rpc, "authenticate", ["newest.token"]}, 1_000
+    assert %{token: "newest.token"} = SurrealDB.info_session(db)
+  end
+
+  test "a stale renewal for a detached session is not reasserted" do
+    db = start(%{"signin" => [{:ok, jwt(2)}, {:delay, 400, jwt(3600, "old")}]})
+    {:ok, session} = SurrealDB.new_session(db)
+
+    {:ok, _} = SurrealDB.signin(session, %SurrealDB.Auth.Root{user: "root", pass: "root"})
+    assert_receive {:rpc, "signin", _}
+    assert_receive {:rpc, "signin", _}, 3_000
+    {:ok, _} = SurrealDB.close_session(session)
+
+    refute_receive {:rpc, "invalidate", _}, 800
+    refute_received {:rpc, "authenticate", _}
+    assert Map.keys(:sys.get_state(db).sessions) == [nil]
+  end
 end

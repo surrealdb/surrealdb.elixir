@@ -342,9 +342,16 @@ defmodule SurrealDB.Connection do
         }
 
         state =
-          if stale_renewal?(state, sid, meta),
-            do: state,
-            else: after_renewal(state, sid, method, meta, timeout_error(method))
+          cond do
+            Map.get(meta, :reassert) ->
+              reassert_result(state, sid, meta, timeout_error(method))
+
+            stale_renewal?(state, sid, meta) ->
+              state
+
+            true ->
+              after_renewal(state, sid, method, meta, timeout_error(method))
+          end
 
         cancel_in_engine(state, id)
 
@@ -1024,7 +1031,7 @@ defmodule SurrealDB.Connection do
           # Putting the session back on its current auth changes nothing the connection
           # tracks (and `authenticate` would drop the stored refresh token).
           Map.get(meta, :reassert) ->
-            reassert_result(state, result)
+            reassert_result(state, sid, meta, result)
 
           stale_renewal?(state, sid, meta) ->
             drop_stale_renewal(state, sid, result)
@@ -1450,32 +1457,46 @@ defmodule SurrealDB.Connection do
 
   # The server may have run the stale renewal after the newer sign-in, which would leave its
   # session on the old credentials. Put it back on the current ones.
-  defp drop_stale_renewal(state, sid, {:ok, _result}) do
+  defp drop_stale_renewal(state, sid, {:ok, _result}), do: reassert(state, sid)
+  defp drop_stale_renewal(state, _sid, _result), do: state
+
+  # A detached session is gone from the server, so there is nothing to put back.
+  defp reassert(state, sid) when not is_map_key(state.sessions, sid), do: state
+
+  defp reassert(state, sid) do
+    session = session(state, sid)
+
     {method, params} =
-      case session(state, sid).token do
+      case session.token do
         nil -> {"invalidate", []}
         token -> {"authenticate", [token]}
       end
 
     {id, state} = next_id(state)
+    meta = %{session: sid, reassert: true, auth_gen: session.auth_gen}
+    meta = start_timer(meta, id, state.timeout)
 
-    case send_request(state, id, nil, method, params, %{session: sid, reassert: true}) do
+    case send_request(state, id, nil, method, params, meta) do
       {:ok, state} -> state
       {:error, _error, state} -> state
     end
   end
 
-  defp drop_stale_renewal(state, _sid, _result), do: state
-
-  # If the server would not take the newer auth back, it may still hold the old one. The
-  # connection cannot tell, so it drops the socket: a reconnect restores every session from
-  # what the connection knows. (Over HTTP the server keeps no session to fix.)
-  defp reassert_result(state, {:error, error}) do
+  # If the server would not take the newer auth back, or did not answer, it may still hold
+  # the old one. The connection cannot tell, so it drops the socket: a reconnect restores
+  # every session from what the connection knows. (Over HTTP the server keeps no session to
+  # fix.) If the auth changed while the reassertion was in flight, the server may have run
+  # it after the change, so it is sent again with the current auth.
+  defp reassert_result(state, _sid, _meta, {:error, error}) do
     if state.engine.supports_live?(), do: send(self(), {:reassert_failed, error})
     state
   end
 
-  defp reassert_result(state, _result), do: state
+  defp reassert_result(state, sid, %{auth_gen: gen}, _result) do
+    if is_map_key(state.sessions, sid) and session(state, sid).auth_gen != gen,
+      do: reassert(state, sid),
+      else: state
+  end
 
   @auth_methods ~w(signin signup authenticate refresh invalidate reset revoke detach)
 
