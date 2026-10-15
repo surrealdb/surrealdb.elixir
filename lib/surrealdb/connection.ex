@@ -206,7 +206,8 @@ defmodule SurrealDB.Connection do
   # A timed-out request on an engine that cannot cancel it (a WebSocket) may still run on
   # the server. If it changes session state, keep it pending with no caller, so its late
   # reply still updates the namespace, database, and auth the connection reports and sends.
-  # A late `live` reply starts a query nobody listens to, so it is killed.
+  # A late `live` reply starts a query nobody listens to, so it is killed. Any other request
+  # keeps a tombstone, so its late reply is dropped instead of being read as a notification.
   defp await_late_reply(state, pending, id, method, params, meta) do
     cond do
       function_exported?(state.engine, :cancel, 2) ->
@@ -219,7 +220,7 @@ defmodule SurrealDB.Connection do
         Map.put(pending, id, {nil, method, params, Map.delete(meta, :timer)})
 
       true ->
-        pending
+        Map.put(pending, id, {nil, method, params, %{discard: true}})
     end
   end
 
@@ -475,7 +476,8 @@ defmodule SurrealDB.Connection do
   # A reply carries the id of a pending request. Anything else whose result looks like a
   # notification is one: SurrealDB 2.x put the notification fields at the top level, 3.x
   # sends them under `result` with no top-level id. Checking for a pending id first means a
-  # reply whose result happens to have an `action` field is still delivered as a reply.
+  # reply whose result happens to have an `action` field is still delivered as a reply, and
+  # a message with an id nobody is waiting for is never read as a 3.x notification.
   defp notification(decoded, state) do
     cond do
       Map.has_key?(state.pending, decoded["id"]) ->
@@ -484,7 +486,8 @@ defmodule SurrealDB.Connection do
       Map.has_key?(decoded, "action") ->
         {:notification, decoded["id"], decoded}
 
-      is_map(decoded["result"]) and Map.has_key?(decoded["result"], "action") ->
+      is_nil(decoded["id"]) and is_map(decoded["result"]) and
+          Map.has_key?(decoded["result"], "action") ->
         {:notification, decoded["result"]["id"], decoded["result"]}
 
       true ->
