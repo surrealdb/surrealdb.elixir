@@ -19,7 +19,8 @@ It aims for feature parity with the official JavaScript SDKs (`surrealdb` and
 - **Full RPC surface**: `use`, `signin`, `signup`, `authenticate`, `refresh`, `revoke`,
   `invalidate`, `reset`, `let`, `unset`, `query`, `select`, `create`, `insert`,
   `insert_relation`, `update`, `upsert`, `merge`, `patch`, `delete`, `relate`, `run`,
-  `info`, `version`, plus `export`/`import`.
+  `info`, `version`, `gql`, plus `export`/`import`.
+- **Streaming queries** as Elixir streams, and calls to `DEFINE API` endpoints.
 - **Sessions and interactive transactions** with handles you pass in place of the
   connection.
 - **Live queries** delivered to any process as messages.
@@ -144,6 +145,33 @@ article = SurrealDB.RecordId.new("article", "surreal")
 
 # Functions
 {:ok, uuid} = SurrealDB.run(db, "rand::uuid")
+```
+
+### Streaming results
+
+`query_stream/4` returns an Elixir `Stream` of frames as the server produces them, so large
+results are not buffered in one reply. Stopping early cancels the query on the server.
+
+```elixir
+db
+|> SurrealDB.query_stream("SELECT * FROM event")
+|> Stream.flat_map(fn
+  {:rows, 0, rows} -> rows
+  _frame -> []
+end)
+|> Enum.take(1_000)
+```
+
+Rows are provisional until their statement's `{:finished, index, %{error: nil}}` frame.
+`stream_query/4` sends the same frames to a process as messages instead.
+
+### GQL and API endpoints
+
+```elixir
+{:ok, [names]} = SurrealDB.gql(db, "MATCH (a:person)-[:knows]->(b:person) RETURN b.name")
+
+# Call an endpoint defined with DEFINE API
+{:ok, %{status: 201, body: body}} = SurrealDB.api(db, "/users", method: :post, body: %{name: "Tobie"})
 ```
 
 A "thing" passed to `select/2`, `create/3`, and friends can be:
