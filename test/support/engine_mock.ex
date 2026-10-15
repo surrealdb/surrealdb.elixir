@@ -10,7 +10,8 @@ defmodule SurrealDB.Engine.Mock do
   `{:mock_message, encoded_payload}` message; `handle_transport/2` forwards it like any
   other engine message. Send `:mock_closed` to simulate a dead transport, or
   `{:mock_reset, reason}` to simulate lost in-flight requests. A responder that returns
-  `:noreply` leaves the request unanswered. A responder of arity 3 also gets the decoded
+  `:noreply` leaves the request unanswered, and `{:frames, results}` answers it with one
+  response per result, as a streaming query is answered. A responder of arity 3 also gets the decoded
   request, to check its `"session"` and `"txn"` fields.
   """
 
@@ -47,6 +48,11 @@ defmodule SurrealDB.Engine.Mock do
 
       {:ok, result} ->
         send(self(), {:mock_message, codec.encode(%{"id" => id, "result" => result})})
+
+      {:frames, results} ->
+        for result <- results do
+          send(self(), {:mock_message, codec.encode(%{"id" => id, "result" => result})})
+        end
 
       {:error, error} ->
         send(self(), {:mock_message, codec.encode(%{"id" => id, "error" => error})})
