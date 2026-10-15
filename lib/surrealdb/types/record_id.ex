@@ -45,9 +45,9 @@ defmodule SurrealDB.RecordId do
   """
   @spec parse(String.t()) :: {:ok, t()} | {:error, String.t()}
   def parse(string) when is_binary(string) do
-    with {:ok, table, rest, _quoted} <- part(string),
+    with {:ok, table, rest, _quoted} <- part(string, :table),
          {:ok, rest} <- colon(rest, string),
-         {:ok, key, "", quoted} <- part(rest) do
+         {:ok, key, "", quoted} <- part(rest, :key) do
       {:ok, %__MODULE__{table: table, id: key_value(key, quoted)}}
     else
       {:ok, _key, _rest, _quoted} ->
@@ -72,11 +72,15 @@ defmodule SurrealDB.RecordId do
   defp colon(_rest, string),
     do: {:error, "expected `:` after the table name in #{inspect(string)}"}
 
-  defp part("`" <> rest), do: quoted(rest, "`", [])
-  defp part("⟨" <> rest), do: quoted(rest, "⟩", [])
+  defp part("`" <> rest, _kind), do: quoted(rest, "`", [])
+  defp part("⟨" <> rest, _kind), do: quoted(rest, "⟩", [])
 
-  defp part(string) do
-    case Regex.run(~r/^-?[a-zA-Z0-9_]+/, string) do
+  # An unquoted table name is an identifier: it cannot start with a digit or a minus sign.
+  # An unquoted key can also be an integer.
+  defp part(string, kind) do
+    pattern = if kind == :table, do: ~r/^[a-zA-Z_][a-zA-Z0-9_]*/, else: ~r/^-?[a-zA-Z0-9_]+/
+
+    case Regex.run(pattern, string) do
       [ident] ->
         size = byte_size(ident)
         {:ok, ident, binary_part(string, size, byte_size(string) - size), false}

@@ -202,6 +202,112 @@ defmodule SurrealDB.ReconnectTest do
     assert_receive {:DOWN, ^ref, :process, ^db, {:shutdown, {:connection_lost, _}}}
   end
 
+  # Answers `method` with `fun.(n, params)`, where `n` counts its earlier calls, so a test
+  # can change how the session restore goes. `fun` returns a responder result, or
+  # `:default` for the usual one.
+  defp on_reconnect(parent, method, fun) do
+    base = responder(parent)
+
+    fn
+      ^method, params ->
+        n = Process.put({:calls, method}, (Process.get({:calls, method}) || 0) + 1) || 0
+
+        case fun.(n, params) do
+          :default -> base.(method, params)
+          result -> tap(result, fn _ -> send(parent, {:rpc, method, params}) end)
+        end
+
+      other, params ->
+        base.(other, params)
+    end
+  end
+
+  test "a call made while the session is being restored still times out" do
+    responder =
+      on_reconnect(self(), "version", fn
+        0, _params -> :default
+        _n, _params -> {:delay, 800, "surrealdb-3.3.4"}
+      end)
+
+    db = start(responder: responder, reconnect: [delay: 10])
+    :ok = SurrealDB.subscribe_status(db)
+    drain()
+    send(db, :mock_closed)
+    assert_receive {:rpc, "version", []}, 1_000
+
+    started = System.monotonic_time(:millisecond)
+
+    assert {:error, %SurrealDB.Error{kind: :timeout}} =
+             Connection.call(db, "ping", [], timeout: 50)
+
+    assert System.monotonic_time(:millisecond) - started < 600
+    assert_receive {:surrealdb, :status, :connected, _}, 2_000
+    refute_received {:rpc, "ping", _}
+  end
+
+  test "a held call whose timeout passes during the restore is not sent" do
+    responder =
+      on_reconnect(self(), "version", fn
+        0, _params -> :default
+        _n, _params -> {:delay, 800, "surrealdb-3.3.4"}
+      end)
+
+    db = start(responder: responder, reconnect: [delay: 50])
+    :ok = SurrealDB.subscribe_status(db)
+    send(db, :mock_closed)
+    assert_receive {:surrealdb, :status, :reconnecting, _}
+
+    task = Task.async(fn -> Connection.call(db, "ping", [], timeout: 200) end)
+    assert {:error, %SurrealDB.Error{kind: :timeout}} = Task.await(task)
+    assert_receive {:surrealdb, :status, :connected, _}, 2_000
+    refute_receive {:rpc, "ping", _}, 50
+  end
+
+  test "a parameter that cannot be restored fails the reconnect attempt" do
+    error = %{"code" => -32_000, "message" => "Not allowed", "kind" => "NotAllowed"}
+
+    responder =
+      on_reconnect(self(), "let", fn
+        1, _params -> {:error, error}
+        _n, _params -> :default
+      end)
+
+    db = start(responder: responder)
+    {:ok, _} = SurrealDB.let(db, "x", 1)
+    :ok = SurrealDB.subscribe_status(db)
+    send(db, :mock_closed)
+
+    assert_receive {:surrealdb, :status, :reconnecting, %{attempt: 2, error: %{kind: :rpc}}}
+    assert_receive {:surrealdb, :status, :connected, %{attempt: 2}}
+  end
+
+  test "a notification in the same batch as the restarted live reply reaches subscribers" do
+    notification = %{
+      "result" => %{"id" => Uuid.new(@second_live), "action" => "CREATE", "result" => %{}}
+    }
+
+    responder =
+      on_reconnect(self(), "live", fn
+        0, _params -> {:ok, Uuid.new(@first_live)}
+        _n, _params -> {:batch, Uuid.new(@second_live), [notification]}
+      end)
+
+    db = start(responder: responder)
+    {:ok, live_id} = SurrealDB.live(db, "person")
+    :ok = SurrealDB.subscribe_status(db)
+    send(db, :mock_closed)
+
+    assert_receive {:surrealdb, :status, :connected, _}
+    assert_receive {:surrealdb, :live, ^live_id, %{action: :create}}
+  end
+
+  test "backoff stops growing at the cap, however many attempts" do
+    config = [delay: 1_000, max_delay: 60_000, multiplier: 2.0, jitter: 0.0]
+    assert Connection.backoff(config, 5_000) == 60_000
+    assert Connection.backoff(Keyword.put(config, :jitter, 0.1), 1_000_000) in 54_000..60_000
+    assert Connection.backoff(Keyword.put(config, :multiplier, 1.0), 1_000_000) == 1_000
+  end
+
   test "backoff grows by the multiplier up to the cap" do
     config = [delay: 100, max_delay: 1_000, multiplier: 2.0, jitter: 0.0]
     assert Enum.map(1..6, &Connection.backoff(config, &1)) == [100, 200, 400, 800, 1_000, 1_000]

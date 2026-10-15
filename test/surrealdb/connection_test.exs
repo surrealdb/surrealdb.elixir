@@ -8,6 +8,7 @@ defmodule SurrealDB.ConnectionTest do
   defp responder do
     fn
       "use", _params -> {:ok, nil}
+      "version", _params -> {:ok, "surrealdb-3.0.0"}
       "signin", _params -> {:ok, "jwt.token"}
       "create", [thing, data] -> {:ok, [Map.put(data, "thing", inspect(thing))]}
       "select", [thing] -> {:ok, %{"selected" => inspect(thing)}}
@@ -23,7 +24,23 @@ defmodule SurrealDB.ConnectionTest do
 
   defp start(opts \\ []) do
     base = [url: "ws://mock/rpc", engine: SurrealDB.Engine.Mock, responder: responder()]
-    start_supervised!({SurrealDB.Connection, Keyword.merge(base, opts)})
+    opts = Keyword.merge(base, opts)
+    start_supervised!({SurrealDB.Connection, Keyword.update!(opts, :responder, &with_version/1)})
+  end
+
+  # Most responders here answer methods they do not care about with nil; give the version
+  # check a version to accept.
+  defp with_version(responder) do
+    fn
+      "version", params ->
+        case responder.("version", params) do
+          {:ok, nil} -> {:ok, "surrealdb-3.0.0"}
+          other -> other
+        end
+
+      method, params ->
+        responder.(method, params)
+    end
   end
 
   test "connects and authenticates on setup" do
@@ -88,6 +105,25 @@ defmodule SurrealDB.ConnectionTest do
                {nil, nil}
     end
 
+    test "selecting only a database keeps it when no namespace is set" do
+      db = recording_start([])
+      assert {:ok, _} = SurrealDB.use(db, database: "app")
+      assert_receive {:use, [%SurrealDB.None{}, "app"]}
+      assert SurrealDB.info_session(db).database == "app"
+    end
+
+    test "over JSON, an unchanged selection is sent as its current value, not NULL" do
+      db = recording_start(codec: :json, namespace: "test", database: "app")
+      assert_receive {:use, ["test", "app"]}
+
+      assert {:ok, _} = SurrealDB.use(db, database: "other")
+      assert_receive {:use, ["test", "other"]}
+
+      assert {:ok, _} = SurrealDB.use(db, database: :unset)
+      assert_receive {:use, ["test", nil]}
+      assert SurrealDB.info_session(db).namespace == "test"
+    end
+
     test "connecting with only a namespace leaves the database unchanged" do
       _db = recording_start(namespace: "test")
       assert_receive {:use, ["test", %SurrealDB.None{}]}
@@ -106,6 +142,13 @@ defmodule SurrealDB.ConnectionTest do
     assert {:ok, %{"access" => "access.jwt"}} = SurrealDB.signin(db, auth)
     assert SurrealDB.info_session(db).token == "access.jwt"
     assert SurrealDB.info_session(db).refresh_token == "refresh.jwt"
+  end
+
+  test "over JSON, a table name with a colon is refused rather than read as a record id" do
+    db = start(codec: :json)
+
+    assert {:error, %SurrealDB.Error{kind: :unsupported}} = SurrealDB.select(db, "user:1234")
+    assert {:ok, _} = SurrealDB.select(db, "user")
   end
 
   test "create normalises a bare table name to a Table" do
@@ -178,6 +221,27 @@ defmodule SurrealDB.ConnectionTest do
                )
     end
 
+    test "refuses a version reply that is not a string" do
+      Process.flag(:trap_exit, true)
+
+      for reply <- [nil, %{"v" => 1}] do
+        assert {:error, %SurrealDB.Error{kind: :unsupported}} =
+                 SurrealDB.Connection.start_link(
+                   url: "ws://mock/rpc",
+                   engine: SurrealDB.Engine.Mock,
+                   responder: version_responder(reply)
+                 )
+      end
+
+      db = start(responder: version_responder(%{"v" => 1}), version_check: false)
+      assert SurrealDB.info_session(db).version == nil
+    end
+
+    test "keeps the transport options for one-off HTTP requests" do
+      db = start(transport_opts: [verify: :verify_none])
+      assert SurrealDB.info_session(db).transport_opts == [verify: :verify_none]
+    end
+
     test "starts against an unsupported server when the check is off" do
       db = start(responder: version_responder("surrealdb-5.0.0"), version_check: false)
       assert SurrealDB.info_session(db).version == "surrealdb-5.0.0"
@@ -247,6 +311,40 @@ defmodule SurrealDB.ConnectionTest do
       assert_receive {:DOWN, ^ref, :process, ^db, {:shutdown, {:connection_lost, _}}}
     end
 
+    @tag :capture_log
+    test "an internal kill still in flight does not stop the callers being told" do
+      Process.flag(:trap_exit, true)
+      base = responder()
+
+      responder = fn
+        "kill", _params -> :noreply
+        method, params -> base.(method, params)
+      end
+
+      {:ok, db} =
+        SurrealDB.Connection.start_link(
+          url: "ws://mock/rpc",
+          engine: SurrealDB.Engine.Mock,
+          responder: responder,
+          reconnect: false
+        )
+
+      subscriber = spawn(fn -> Process.sleep(:infinity) end)
+      {:ok, _live_id} = SurrealDB.live(db, "person", to: subscriber)
+
+      # The last subscriber exits, so the connection sends a kill nobody waits for.
+      Process.exit(subscriber, :kill)
+      wait_for_pending(db)
+
+      task = Task.async(fn -> SurrealDB.Connection.call(db, "hang", []) end)
+      wait_for_pending(db, 2)
+      ref = Process.monitor(db)
+      send(db, :mock_closed)
+
+      assert {:error, %SurrealDB.Error{kind: :connection}} = Task.await(task)
+      assert_receive {:DOWN, ^ref, :process, ^db, {:shutdown, {:connection_lost, _}}}
+    end
+
     test "a reset fails the calls in flight and keeps the process" do
       db = start()
       task = Task.async(fn -> SurrealDB.Connection.call(db, "hang", []) end)
@@ -260,10 +358,10 @@ defmodule SurrealDB.ConnectionTest do
     end
   end
 
-  defp wait_for_pending(db) do
-    if map_size(:sys.get_state(db).pending) == 0 do
+  defp wait_for_pending(db, count \\ 1) do
+    if map_size(:sys.get_state(db).pending) < count do
       Process.sleep(5)
-      wait_for_pending(db)
+      wait_for_pending(db, count)
     end
   end
 
