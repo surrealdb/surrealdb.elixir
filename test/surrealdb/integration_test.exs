@@ -144,7 +144,7 @@ defmodule SurrealDB.IntegrationTest do
 
   test "an HTTP error status fails the call at once instead of timing out" do
     http_url = @url |> String.replace(~r/^ws/, "http") |> String.replace(~r{/rpc$}, "/missing")
-    db = start_supervised!({SurrealDB.Connection, url: http_url})
+    db = start_supervised!({SurrealDB.Connection, url: http_url, version_check: false})
 
     {micros, result} = :timer.tc(fn -> SurrealDB.version(db) end)
     assert {:error, %SurrealDB.Error{kind: :http, code: 404}} = result
@@ -285,6 +285,48 @@ defmodule SurrealDB.IntegrationTest do
 
       assert {:error, %SurrealDB.Error{server_kind: :not_allowed}} =
                SurrealDB.signin(db, %SurrealDB.Auth.Root{user: "root", pass: "wrong"})
+    end
+  end
+
+  describe "version, health, reset, and timeouts" do
+    test "the version check accepts the server and records its version" do
+      db = connect()
+      assert "surrealdb-" <> _ = SurrealDB.info_session(db).version
+    end
+
+    test "health is ok over both engines" do
+      assert :ok = SurrealDB.health(connect())
+
+      http = String.replace(@url, ~r/^ws/, "http")
+
+      assert :ok =
+               SurrealDB.health(start_supervised!({SurrealDB.Connection, url: http}, id: :http))
+    end
+
+    test "reset clears the namespace, database, and auth on the server" do
+      db = connect()
+      assert {:ok, _} = SurrealDB.reset(db)
+
+      # Signed out: the server refuses anonymous queries.
+      assert {:error, %SurrealDB.Error{server_kind: :not_allowed}} =
+               SurrealDB.query(db, "RETURN 1")
+
+      # Signed back in, the namespace and database are gone too.
+      {:ok, _} = SurrealDB.signin(db, %SurrealDB.Auth.Root{user: "root", pass: "root"})
+      assert {:ok, [[ns, db_name]]} = SurrealDB.query(db, "RETURN [session::ns(), session::db()]")
+      assert ns in [nil, %SurrealDB.None{}]
+      assert db_name in [nil, %SurrealDB.None{}]
+    end
+
+    test "a query times out without breaking the connection" do
+      db = connect()
+
+      assert {:error, %SurrealDB.Error{kind: :timeout}} =
+               SurrealDB.query(db, "SLEEP 500ms; RETURN 1", %{}, timeout: 50)
+
+      assert {:ok, [2]} = SurrealDB.query(db, "RETURN 2")
+      Process.sleep(600)
+      assert {:ok, [3]} = SurrealDB.query(db, "RETURN 3")
     end
   end
 

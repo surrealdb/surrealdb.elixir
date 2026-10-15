@@ -8,7 +8,7 @@ defmodule SurrealDB.Engine.HTTPTest do
     {:ok, bypass: bypass, url: "http://localhost:#{bypass.port}/rpc"}
   end
 
-  defp start(url), do: start_supervised!({SurrealDB.Connection, url: url})
+  defp start(url), do: start_supervised!({SurrealDB.Connection, url: url, version_check: false})
 
   defp reply(conn, status, content_type, body) do
     conn
@@ -119,5 +119,73 @@ defmodule SurrealDB.Engine.HTTPTest do
 
     db = start(url)
     assert {:ok, "surrealdb-3.0.0"} = timed(fn -> SurrealDB.version(db) end)
+  end
+
+  # Bypass fails a test whose handler is killed by a client disconnect, which is what this
+  # test causes, so it uses a bare TCP server: requests whose body mentions "hang" get no
+  # answer, every other request is answered with its method name.
+  defp hanging_server do
+    {:ok, listen} = :gen_tcp.listen(0, [:binary, active: false, reuseaddr: true])
+    {:ok, port} = :inet.port(listen)
+    spawn_link(fn -> accept_loop(listen) end)
+    "http://localhost:#{port}/rpc"
+  end
+
+  defp accept_loop(listen) do
+    {:ok, socket} = :gen_tcp.accept(listen)
+    pid = spawn(fn -> serve(socket) end)
+    :gen_tcp.controlling_process(socket, pid)
+    accept_loop(listen)
+  end
+
+  defp serve(socket) do
+    with {:ok, data} <- :gen_tcp.recv(socket, 0) do
+      [_head, body] = String.split(data, "\r\n\r\n", parts: 2)
+      {:ok, %{"id" => id, "method" => method}} = CBOR.decode(body)
+
+      unless method == "hang" do
+        reply = CBOR.encode(%{"id" => id, "result" => method})
+
+        :gen_tcp.send(socket, [
+          "HTTP/1.1 200 OK\r\ncontent-type: application/cbor\r\ncontent-length: ",
+          Integer.to_string(byte_size(reply)),
+          "\r\n\r\n",
+          reply
+        ])
+      end
+
+      serve(socket)
+    end
+  end
+
+  test "a timed-out request does not hold up the requests after it" do
+    db = start(hanging_server())
+
+    assert {:error, %SurrealDB.Error{kind: :timeout}} =
+             SurrealDB.Connection.call(db, "hang", [], timeout: 100)
+
+    assert {:ok, "version"} = timed(fn -> SurrealDB.version(db) end)
+  end
+
+  test "a request the server stops reading fails after the send timeout" do
+    {:ok, listen} = :gen_tcp.listen(0, [:binary, active: false, reuseaddr: true])
+    {:ok, port} = :inet.port(listen)
+
+    spawn_link(fn ->
+      {:ok, _socket} = :gen_tcp.accept(listen)
+      Process.sleep(:infinity)
+    end)
+
+    uri = URI.parse("http://127.0.0.1:#{port}/rpc")
+    {:ok, conn} = SurrealDB.Engine.HTTP.connect(uri, send_timeout: 200)
+
+    # The runtime queues one large write without blocking; the next write then blocks
+    # until the queue drains, which it never does.
+    body = :binary.copy("x", 64 * 1024 * 1024)
+    {:ok, conn} = SurrealDB.Engine.HTTP.request(conn, 1, body, %{})
+
+    {micros, result} = :timer.tc(fn -> SurrealDB.Engine.HTTP.request(conn, 2, "{}", %{}) end)
+    assert {:error, _reason} = result
+    assert micros < 5_000_000
   end
 end

@@ -59,7 +59,13 @@ Options:
 - `:auth` - a `SurrealDB.Auth` struct to sign in with on connect.
 - `:codec` - `:cbor` (default) or `:json`.
 - `:name` - register the process under a name.
+- `:timeout` - request timeout in milliseconds, or `:infinity` (default 30000).
+  `SurrealDB.query/4` takes a per-request `timeout:` too.
+- `:version_check` - refuse servers outside `>= 2.1.0` and `< 5.0.0` (default `true`).
 - `:transport_opts` - extra transport options, for example TLS settings.
+
+`SurrealDB.health/1` checks the server's `/health` endpoint, `SurrealDB.version/1` returns
+its version, and `SurrealDB.reset/1` signs out and clears the session.
 
 ### In a supervision tree
 

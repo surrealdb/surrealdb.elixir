@@ -8,6 +8,7 @@ defmodule SurrealDB.ConnectionTest do
   defp responder do
     fn
       "use", _params -> {:ok, nil}
+      "version", _params -> {:ok, "surrealdb-3.0.0"}
       "signin", _params -> {:ok, "jwt.token"}
       "create", [thing, data] -> {:ok, [Map.put(data, "thing", inspect(thing))]}
       "select", [thing] -> {:ok, %{"selected" => inspect(thing)}}
@@ -23,7 +24,23 @@ defmodule SurrealDB.ConnectionTest do
 
   defp start(opts \\ []) do
     base = [url: "ws://mock/rpc", engine: SurrealDB.Engine.Mock, responder: responder()]
-    start_supervised!({SurrealDB.Connection, Keyword.merge(base, opts)})
+    opts = Keyword.merge(base, opts)
+    start_supervised!({SurrealDB.Connection, Keyword.update!(opts, :responder, &with_version/1)})
+  end
+
+  # Most responders here answer methods they do not care about with nil; give the version
+  # check a version to accept.
+  defp with_version(responder) do
+    fn
+      "version", params ->
+        case responder.("version", params) do
+          {:ok, nil} -> {:ok, "surrealdb-3.0.0"}
+          other -> other
+        end
+
+      method, params ->
+        responder.(method, params)
+    end
   end
 
   test "connects and authenticates on setup" do
@@ -183,6 +200,256 @@ defmodule SurrealDB.ConnectionTest do
     db = start()
     assert {:ok, _} = SurrealDB.let(db, "x", 1)
     assert {:ok, _} = SurrealDB.unset(db, "x")
+  end
+
+  describe "version check" do
+    # Sends replies to a request nobody made until the connection process exits.
+    defp chatter(conn) do
+      if Process.alive?(conn) do
+        reply = Codec.CBOR.encode(%{"id" => 999_999, "result" => nil})
+        send(conn, {:mock_message, reply})
+        Process.sleep(20)
+        chatter(conn)
+      end
+    end
+
+    defp version_responder(version) do
+      fn
+        "version", _params -> {:ok, version}
+        _method, _params -> {:ok, nil}
+      end
+    end
+
+    test "refuses to start against an unsupported server" do
+      Process.flag(:trap_exit, true)
+
+      assert {:error, %SurrealDB.Error{kind: :unsupported}} =
+               SurrealDB.Connection.start_link(
+                 url: "ws://mock/rpc",
+                 engine: SurrealDB.Engine.Mock,
+                 responder: version_responder("surrealdb-5.0.0")
+               )
+    end
+
+    test "refuses a version reply that is not a string" do
+      Process.flag(:trap_exit, true)
+
+      for reply <- [nil, %{"v" => 1}] do
+        assert {:error, %SurrealDB.Error{kind: :unsupported}} =
+                 SurrealDB.Connection.start_link(
+                   url: "ws://mock/rpc",
+                   engine: SurrealDB.Engine.Mock,
+                   responder: version_responder(reply)
+                 )
+      end
+
+      db = start(responder: version_responder(%{"v" => 1}), version_check: false)
+      assert SurrealDB.info_session(db).version == nil
+    end
+
+    test "keeps the transport options for one-off HTTP requests" do
+      db = start(transport_opts: [verify: :verify_none])
+      assert SurrealDB.info_session(db).transport_opts == [verify: :verify_none]
+    end
+
+    test "a close that arrives with the version reply fails startup" do
+      Process.flag(:trap_exit, true)
+
+      responder = fn
+        "version", _params -> {:closing, "surrealdb-3.3.4"}
+        _method, _params -> {:ok, nil}
+      end
+
+      assert {:error, %SurrealDB.Error{kind: :connection}} =
+               SurrealDB.Connection.start_link(
+                 url: "ws://mock/rpc",
+                 engine: SurrealDB.Engine.Mock,
+                 responder: responder
+               )
+    end
+
+    test "unrelated transport traffic does not push back the setup deadline" do
+      Process.flag(:trap_exit, true)
+
+      responder = fn
+        "version", _params ->
+          conn = self()
+          spawn(fn -> chatter(conn) end)
+          :noreply
+
+        _method, _params ->
+          {:ok, nil}
+      end
+
+      {micros, result} =
+        :timer.tc(fn ->
+          SurrealDB.Connection.start_link(
+            url: "ws://mock/rpc",
+            engine: SurrealDB.Engine.Mock,
+            responder: responder,
+            connect_timeout: 200
+          )
+        end)
+
+      assert {:error, %SurrealDB.Error{kind: :timeout}} = result
+      assert micros < 1_000_000
+    end
+
+    test "a transport that closes during the version call fails startup, check or not" do
+      Process.flag(:trap_exit, true)
+
+      responder = fn
+        "version", _params ->
+          send(self(), :mock_closed)
+          :noreply
+
+        _method, _params ->
+          {:ok, nil}
+      end
+
+      assert {:error, %SurrealDB.Error{kind: :connection}} =
+               SurrealDB.Connection.start_link(
+                 url: "ws://mock/rpc",
+                 engine: SurrealDB.Engine.Mock,
+                 responder: responder,
+                 version_check: false
+               )
+    end
+
+    test "starts against an unsupported server when the check is off" do
+      db = start(responder: version_responder("surrealdb-5.0.0"), version_check: false)
+      assert SurrealDB.info_session(db).version == "surrealdb-5.0.0"
+    end
+
+    test "records the server version" do
+      db = start(responder: version_responder("surrealdb-3.3.4"))
+      assert SurrealDB.info_session(db).version == "surrealdb-3.3.4"
+    end
+  end
+
+  describe "timeouts" do
+    test "a request times out after the given timeout and the connection carries on" do
+      db = start()
+
+      {micros, result} =
+        :timer.tc(fn -> SurrealDB.Connection.call(db, "hang", [], timeout: 50) end)
+
+      assert {:error, %SurrealDB.Error{kind: :timeout}} = result
+      assert micros < 1_000_000
+      assert :sys.get_state(db).pending == %{}
+      assert {:ok, _} = SurrealDB.Connection.call(db, "ping", [])
+    end
+
+    test "a late reply to a timed-out request is dropped, not read as a notification" do
+      responder = fn
+        "select", _params -> :noreply
+        "live", _params -> {:ok, Uuid.new(@live_uuid)}
+        "version", _params -> {:ok, "surrealdb-3.3.4"}
+        _method, params -> {:ok, params}
+      end
+
+      db = start(responder: responder, timeout: 50)
+      {:ok, live_id} = SurrealDB.live(db, "person")
+
+      assert {:error, %SurrealDB.Error{kind: :timeout}} = SurrealDB.select(db, "audit")
+
+      id = :sys.get_state(db).next_id - 1
+      row = %{"id" => Uuid.new(@live_uuid), "action" => "CREATE", "result" => %{}}
+      send(db, {:mock_message, Codec.CBOR.encode(%{"id" => id, "result" => row})})
+
+      refute_receive {:surrealdb, :live, ^live_id, _}, 100
+      assert :sys.get_state(db).pending == %{}
+    end
+
+    test "a message whose id nobody is waiting for is not a notification" do
+      responder = fn
+        "live", _params -> {:ok, Uuid.new(@live_uuid)}
+        "version", _params -> {:ok, "surrealdb-3.3.4"}
+        _method, params -> {:ok, params}
+      end
+
+      db = start(responder: responder)
+      {:ok, live_id} = SurrealDB.live(db, "person")
+
+      row = %{"id" => Uuid.new(@live_uuid), "action" => "CREATE", "result" => %{}}
+      send(db, {:mock_message, Codec.CBOR.encode(%{"id" => 999_999, "result" => row})})
+
+      refute_receive {:surrealdb, :live, ^live_id, _}, 100
+    end
+
+    test "a timed-out use still updates the session when its reply arrives late" do
+      responder = fn
+        "use", _params -> :noreply
+        "version", _params -> {:ok, "surrealdb-3.3.4"}
+        _method, params -> {:ok, params}
+      end
+
+      db = start(responder: responder, timeout: 50)
+
+      assert {:error, %SurrealDB.Error{kind: :timeout}} =
+               SurrealDB.use(db, namespace: "ns", database: "db")
+
+      [id] = Map.keys(:sys.get_state(db).pending)
+      send(db, {:mock_message, Codec.CBOR.encode(%{"id" => id, "result" => nil})})
+
+      info = SurrealDB.info_session(db)
+      assert {info.namespace, info.database} == {"ns", "db"}
+      assert :sys.get_state(db).pending == %{}
+    end
+
+    test "a timed-out let is forgotten, since its reply changes nothing tracked" do
+      responder = fn
+        "let", _params -> :noreply
+        "version", _params -> {:ok, "surrealdb-3.3.4"}
+        _method, params -> {:ok, params}
+      end
+
+      db = start(responder: responder, timeout: 50)
+      assert {:error, %SurrealDB.Error{kind: :timeout}} = SurrealDB.let(db, "x", 1)
+      assert :sys.get_state(db).pending == %{}
+    end
+
+    test "a live query that starts after its call timed out is killed" do
+      parent = self()
+
+      responder = fn
+        "live", _params -> :noreply
+        "kill", params -> tap({:ok, nil}, fn _ -> send(parent, {:kill, params}) end)
+        "version", _params -> {:ok, "surrealdb-3.3.4"}
+        _method, params -> {:ok, params}
+      end
+
+      db = start(responder: responder, timeout: 50)
+      assert {:error, %SurrealDB.Error{kind: :timeout}} = SurrealDB.live(db, "person")
+
+      [id] = Map.keys(:sys.get_state(db).pending)
+      late = %{"id" => id, "result" => Uuid.new(@live_uuid)}
+      send(db, {:mock_message, Codec.CBOR.encode(late)})
+
+      assert_receive {:kill, [%Uuid{value: @live_uuid}]}
+      assert :sys.get_state(db).live == %{}
+    end
+
+    test "the connection-wide timeout applies by default" do
+      db = start(timeout: 50)
+
+      assert {:error, %SurrealDB.Error{kind: :timeout}} =
+               SurrealDB.Connection.call(db, "hang", [])
+    end
+  end
+
+  test "reset clears the session state" do
+    db =
+      start(
+        namespace: "test",
+        database: "app",
+        auth: %SurrealDB.Auth.Root{user: "root", pass: "root"}
+      )
+
+    assert {:ok, _} = SurrealDB.reset(db)
+
+    info = SurrealDB.info_session(db)
+    assert {info.namespace, info.database, info.token} == {nil, nil, nil}
   end
 
   describe "connection loss" do
