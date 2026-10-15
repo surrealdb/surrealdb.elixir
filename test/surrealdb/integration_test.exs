@@ -93,6 +93,53 @@ defmodule SurrealDB.IntegrationTest do
     assert db_name in [nil, %SurrealDB.None{}]
   end
 
+  describe "losing the connection" do
+    alias SurrealDB.Test.TCPProxy
+
+    defp proxied(scheme) do
+      %URI{host: host, port: port} = URI.parse(@url)
+      proxy = start_supervised!({TCPProxy, upstream: {String.to_charlist(host), port}})
+      {proxy, "#{scheme}://127.0.0.1:#{TCPProxy.port(proxy)}/rpc"}
+    end
+
+    @tag :capture_log
+    test "a dropped WebSocket stops the connection instead of leaving it dead" do
+      Process.flag(:trap_exit, true)
+      {proxy, url} = proxied("ws")
+
+      {:ok, db} =
+        SurrealDB.Connection.start_link(
+          url: url,
+          namespace: "test",
+          database: Process.get(:it_database),
+          auth: %SurrealDB.Auth.Root{user: "root", pass: "root"}
+        )
+
+      ref = Process.monitor(db)
+      assert {:ok, _} = SurrealDB.version(db)
+
+      task = Task.async(fn -> SurrealDB.query(db, "SLEEP 2s; RETURN 1") end)
+      Process.sleep(100)
+      TCPProxy.cut(proxy)
+
+      assert {:error, %SurrealDB.Error{kind: :connection}} = Task.await(task, 1_000)
+      assert_receive {:DOWN, ^ref, :process, ^db, {:shutdown, {:connection_lost, _}}}, 1_000
+    end
+
+    test "HTTP reconnects after the keep-alive connection closes" do
+      {proxy, url} = proxied("http")
+      db = connect(url: url)
+      assert {:ok, _} = SurrealDB.version(db)
+
+      TCPProxy.cut(proxy)
+      Process.sleep(50)
+
+      assert {:ok, [2]} = SurrealDB.query(db, "RETURN 1 + 1")
+      assert {:ok, [3]} = SurrealDB.query(db, "RETURN 1 + 2")
+      assert TCPProxy.accepted(proxy) == 2
+    end
+  end
+
   test "works over the HTTP engine too" do
     http_url = String.replace(@url, ~r/^ws/, "http")
     db = connect(url: http_url)

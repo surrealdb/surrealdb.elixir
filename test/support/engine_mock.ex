@@ -8,7 +8,9 @@ defmodule SurrealDB.Engine.Mock do
 
   Live notifications can be injected in a test by sending the connection process a
   `{:mock_message, encoded_payload}` message; `handle_transport/2` forwards it like any
-  other engine message.
+  other engine message. Send `:mock_closed` to simulate a dead transport, or
+  `{:mock_reset, reason}` to simulate lost in-flight requests. A responder that returns
+  `:noreply` leaves the request unanswered.
   """
 
   @behaviour SurrealDB.Engine
@@ -29,13 +31,17 @@ defmodule SurrealDB.Engine.Mock do
     method = request["method"]
     params = request["params"] || []
 
-    response =
-      case responder.(method, params) do
-        {:ok, result} -> %{"id" => id, "result" => result}
-        {:error, error} -> %{"id" => id, "error" => error}
-      end
+    case responder.(method, params) do
+      :noreply ->
+        :ok
 
-    send(self(), {:mock_message, codec.encode(response)})
+      {:ok, result} ->
+        send(self(), {:mock_message, codec.encode(%{"id" => id, "result" => result})})
+
+      {:error, error} ->
+        send(self(), {:mock_message, codec.encode(%{"id" => id, "error" => error})})
+    end
+
     {:ok, conn}
   end
 
@@ -44,6 +50,8 @@ defmodule SurrealDB.Engine.Mock do
     {:ok, [{:message, IO.iodata_to_binary(payload)}], conn}
   end
 
+  def handle_transport(conn, :mock_closed), do: {:ok, [:closed], conn}
+  def handle_transport(conn, {:mock_reset, reason}), do: {:ok, [{:reset, reason}], conn}
   def handle_transport(_conn, _message), do: :unknown
 
   @impl true

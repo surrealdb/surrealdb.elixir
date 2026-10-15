@@ -35,8 +35,17 @@ defmodule SurrealDB.Engine do
           optional(:token) => String.t() | nil
         }
 
-  @typedoc "An event produced from a transport message."
-  @type event :: {:message, binary()} | :closed
+  @typedoc """
+  An event produced from a transport message.
+
+    * `{:message, binary}` - one complete, still-encoded RPC response or notification.
+    * `:closed` - the transport is gone and cannot be used again. The connection fails
+      every pending request and stops.
+    * `{:reset, reason}` - the requests in flight were lost, but the engine can carry on
+      (the HTTP engine reconnects on the next request). The connection fails the pending
+      requests and stays up.
+  """
+  @type event :: {:message, binary()} | :closed | {:reset, term()}
 
   @doc "Establishes the transport for the given URI. Runs inside the connection process."
   @callback connect(uri :: URI.t(), opts :: keyword()) :: {:ok, conn()} | {:error, term()}

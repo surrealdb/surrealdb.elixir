@@ -124,6 +124,8 @@ defmodule SurrealDB.Connection do
         pending = Map.put(state.pending, id, {from, method, params, meta})
         {:noreply, %{state | engine_state: engine_state, pending: pending}}
 
+      # A dead WebSocket also reports the close as a transport message, which stops the
+      # connection, so failing just this request is enough here.
       {:error, reason} ->
         {:reply, {:error, conn_error(reason)}, state}
     end
@@ -155,13 +157,24 @@ defmodule SurrealDB.Connection do
         {:noreply, state}
 
       {:ok, events, engine_state} ->
-        state = Enum.reduce(events, %{state | engine_state: engine_state}, &process_event/2)
-        {:noreply, state}
+        state = %{state | engine_state: engine_state}
+
+        case Enum.reduce_while(events, {:ok, state}, &process_event/2) do
+          {:ok, state} -> {:noreply, state}
+          {:closed, state} -> connection_lost(state, "connection closed")
+        end
 
       {:error, reason, engine_state} ->
-        Logger.warning("SurrealDB transport error: #{inspect(reason)}")
-        {:noreply, fail_pending(%{state | engine_state: engine_state}, reason)}
+        connection_lost(%{state | engine_state: engine_state}, reason)
     end
+  end
+
+  # The transport is gone for good. Fail every caller and stop, so a supervisor can start a
+  # fresh connection instead of this process lingering with a dead socket.
+  defp connection_lost(state, reason) do
+    error = conn_error(reason)
+    Logger.warning("SurrealDB connection lost: #{Exception.message(error)}")
+    {:stop, {:shutdown, {:connection_lost, error}}, fail_pending(state, error)}
   end
 
   @impl true
@@ -250,18 +263,25 @@ defmodule SurrealDB.Connection do
     {:found, {:error, Error.new(:connection, "connection closed")}, state}
   end
 
+  defp scan_for_reply([{:reset, reason} | _rest], state, _id) do
+    {:found, {:error, conn_error(reason)}, state}
+  end
+
   # ── Event processing (async path) ─────────────────────────────────────────
 
-  defp process_event(:closed, state), do: fail_pending(state, "connection closed")
+  defp process_event(:closed, {:ok, state}), do: {:halt, {:closed, state}}
 
-  defp process_event({:message, binary}, state) do
+  defp process_event({:reset, reason}, {:ok, state}),
+    do: {:cont, {:ok, fail_pending(state, reason)}}
+
+  defp process_event({:message, binary}, {:ok, state}) do
     case decode(state, binary) do
       {:ok, decoded} ->
-        route(decoded, state)
+        {:cont, {:ok, route(decoded, state)}}
 
       {:error, reason} ->
         Logger.warning("SurrealDB could not decode message: #{inspect(reason)}")
-        state
+        {:cont, {:ok, state}}
     end
   end
 
@@ -406,6 +426,7 @@ defmodule SurrealDB.Connection do
   defp normalize_id(id), do: to_string(id)
 
   defp conn_error(%Error{} = error), do: error
+  defp conn_error(reason) when is_binary(reason), do: Error.new(:connection, reason)
   defp conn_error(reason), do: Error.new(:connection, inspect(reason), details: reason)
 
   defp resolve_engine(opts, uri) do
