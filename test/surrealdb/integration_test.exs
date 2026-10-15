@@ -322,6 +322,58 @@ defmodule SurrealDB.IntegrationTest do
     end
   end
 
+  describe "value types" do
+    test "a record id range selects the records in it, and decodes from the server" do
+      db = connect()
+      {:ok, _} = SurrealDB.query(db, "CREATE t:1, t:2, t:3, t:4")
+
+      range = SurrealDB.RecordIdRange.new("t", {:incl, 2}, {:excl, 4})
+      assert {:ok, rows} = SurrealDB.select(db, range)
+      assert Enum.map(rows, & &1["id"].id) == [2, 3]
+
+      assert {:ok, [%SurrealDB.RecordIdRange{table: "t", begin: {:incl, 1}, end: {:incl, 5}}]} =
+               SurrealDB.query(db, "RETURN t:1..=5")
+
+      assert {:ok, _} = SurrealDB.delete(db, SurrealDB.RecordIdRange.new("t", nil, {:incl, 2}))
+
+      assert {:ok, [[%{"id" => %SurrealDB.RecordId{id: 3}}, _]]} =
+               SurrealDB.query(db, "SELECT id FROM t")
+    end
+
+    test "sets round-trip as MapSets" do
+      db = connect()
+      set = MapSet.new([3, 1, "a"])
+
+      assert {:ok, [^set, "set", deduped]} =
+               SurrealDB.query(db, "RETURN $s; RETURN type::of($s); RETURN <set> [2, 1, 1]", %{
+                 s: set
+               })
+
+      assert deduped == MapSet.new([1, 2])
+    end
+
+    test "file references round-trip" do
+      db = connect()
+      file = SurrealDB.FileRef.new("avatars", "/tobie.png")
+
+      assert {:ok, [^file, "file"]} =
+               SurrealDB.query(db, "RETURN $f; RETURN type::of($f)", %{f: file})
+    end
+
+    test "generated UUIDs are accepted as UUIDs" do
+      db = connect()
+
+      for uuid <- [SurrealDB.Uuid.v4(), SurrealDB.Uuid.v7()] do
+        assert {:ok, [^uuid, "uuid", true]} =
+                 SurrealDB.query(
+                   db,
+                   "RETURN $u; RETURN type::of($u); RETURN $u = <uuid> $text",
+                   %{u: uuid, text: uuid.value}
+                 )
+      end
+    end
+  end
+
   test "strings are never turned into record ids" do
     db = connect()
     {:ok, _} = SurrealDB.create(db, SurrealDB.RecordId.new("user", 1234), %{"n" => 1})

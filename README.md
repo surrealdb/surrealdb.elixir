@@ -13,8 +13,9 @@ It aims for feature parity with the official JavaScript SDKs (`surrealdb` and
 - **Two transport engines**, chosen automatically from the connection URL scheme:
   WebSocket (`ws`/`wss`) and HTTP (`http`/`https`).
 - **Two protocols**: CBOR (default, full type fidelity) and JSON.
-- **Native value types**: `RecordId`, `Table`, `Uuid`, `Duration`, `Datetime`, `Decimal`,
-  `Geometry`, `Range`, `Bytes`, and `None`.
+- **Native value types**: `RecordId`, `RecordIdRange`, `Table`, `Uuid`, `Duration`,
+  `Datetime`, `Decimal`, `Geometry`, `Range`, `FileRef`, `Bytes`, `None`, and sets as
+  `MapSet`.
 - **Full RPC surface**: `use`, `signin`, `signup`, `authenticate`, `refresh`, `revoke`,
   `invalidate`, `reset`, `let`, `unset`, `query`, `select`, `create`, `insert`,
   `insert_relation`, `update`, `upsert`, `merge`, `patch`, `delete`, `relate`, `run`,
@@ -151,7 +152,7 @@ A "thing" passed to `select/2`, `create/3`, and friends can be:
   table name, even when it contains a colon.
 - a `SurrealDB.RecordId` - one record. Parse text with `SurrealDB.RecordId.parse!/1`, or
   wrap it in a `SurrealDB.StringRecordId` to have the server parse it.
-- a `SurrealDB.Range` - a record id range.
+- a `SurrealDB.RecordIdRange` - the records in a range of ids.
 
 The SDK never guesses that a string is a record id, so a value like `"user:1234"` from user
 input stays a string.
@@ -159,7 +160,7 @@ input stays a string.
 ## Value types
 
 ```elixir
-alias SurrealDB.{RecordId, Duration, Datetime, Geometry, Range}
+alias SurrealDB.{RecordId, RecordIdRange, Duration, Datetime, Geometry, Uuid}
 
 SurrealDB.create(db, "event", %{
   at: Datetime.from_datetime(DateTime.utc_now()),
@@ -168,8 +169,11 @@ SurrealDB.create(db, "event", %{
   author: RecordId.new("person", "tobie")
 })
 
-# Record id ranges
-SurrealDB.select(db, Range.new({:incl, RecordId.new("temperature", 1)}, {:excl, RecordId.new("temperature", 100)}))
+# Record id ranges: temperature:1..100
+SurrealDB.select(db, RecordIdRange.new("temperature", {:incl, 1}, {:excl, 100}))
+
+# Sets are MapSets, and UUIDs can be generated client side
+SurrealDB.create(db, "tag", %{names: MapSet.new(["a", "b"]), ref: Uuid.v7()})
 ```
 
 With the CBOR protocol these types round-trip with full fidelity. With JSON they are

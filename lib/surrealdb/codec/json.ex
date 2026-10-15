@@ -13,8 +13,8 @@ defmodule SurrealDB.Codec.JSON do
 
   @behaviour SurrealDB.Codec
 
-  alias SurrealDB.{Bytes, Datetime, Duration, Geometry, None, Range, RecordId, StringRecordId}
-  alias SurrealDB.{Table, Uuid}
+  alias SurrealDB.{Bytes, Datetime, Duration, FileRef, Geometry, None, Range, RecordId}
+  alias SurrealDB.{RecordIdRange, StringRecordId, Table, Uuid}
 
   @impl true
   def content_type, do: "application/json"
@@ -53,6 +53,13 @@ defmodule SurrealDB.Codec.JSON do
   defp prepare(%Range{begin: begin_bound, end: end_bound}) do
     %{"begin" => prepare_bound(begin_bound), "end" => prepare_bound(end_bound)}
   end
+
+  defp prepare(%RecordIdRange{table: table, begin: begin_bound, end: end_bound}) do
+    %{"table" => table, "begin" => prepare_bound(begin_bound), "end" => prepare_bound(end_bound)}
+  end
+
+  defp prepare(%FileRef{} = file), do: FileRef.to_string(file)
+  defp prepare(%MapSet{} = set), do: set |> MapSet.to_list() |> prepare()
 
   defp prepare(list) when is_list(list), do: Enum.map(list, &prepare/1)
 

@@ -17,6 +17,10 @@ defmodule SurrealDB.Codec.CBOR do
   | 14  | `Duration` pair | 92  | Geometry multi-line  |
   | 15  | `Future`        | 93  | Geometry multi-poly  |
   | 37  | `Uuid` (binary) | 94  | Geometry collection  |
+  | 55  | `FileRef`       | 56  | Set (`MapSet`)       |
+
+  A record id whose key is a range (tag 8 holding tag 49) decodes to a
+  `SurrealDB.RecordIdRange`.
 
   The implementation is a focused CBOR encoder and decoder covering the major types the
   protocol uses, rather than a general purpose CBOR library, so the custom tags are handled
@@ -30,12 +34,14 @@ defmodule SurrealDB.Codec.CBOR do
   alias SurrealDB.{
     Bytes,
     Datetime,
+    FileRef,
     Duration,
     Future,
     Geometry,
     None,
     Range,
     RecordId,
+    RecordIdRange,
     StringRecordId,
     Table,
     Uuid
@@ -70,6 +76,13 @@ defmodule SurrealDB.Codec.CBOR do
   defp enc(%Table{name: name}), do: [head(6, 7), enc(name)]
   defp enc(%RecordId{table: table, id: id}), do: [head(6, 8), enc([table, id])]
   defp enc(%StringRecordId{id: id}), do: [head(6, 8), enc(id)]
+
+  defp enc(%RecordIdRange{table: table, begin: begin_bound, end: end_bound}),
+    do: [head(6, 8), head(4, 2), enc(table), enc(Range.new(begin_bound, end_bound))]
+
+  defp enc(%FileRef{bucket: bucket, key: key}), do: [head(6, 55), enc([bucket, key])]
+
+  defp enc(%MapSet{} = set), do: [head(6, 56), enc(MapSet.to_list(set))]
 
   defp enc(%Uuid{} = uuid) do
     [head(6, 37), enc(Bytes.new(Uuid.to_binary(uuid)))]
@@ -254,6 +267,10 @@ defmodule SurrealDB.Codec.CBOR do
 
   defp apply_tag(6, _value), do: None.none()
   defp apply_tag(7, name), do: %Table{name: name}
+
+  defp apply_tag(8, [table, %Range{begin: begin_bound, end: end_bound}]),
+    do: %RecordIdRange{table: table, begin: begin_bound, end: end_bound}
+
   defp apply_tag(8, [table, id]), do: %RecordId{table: table, id: id}
   defp apply_tag(9, value), do: Uuid.new(value)
   defp apply_tag(10, value), do: Decimal.new(value)
@@ -270,6 +287,8 @@ defmodule SurrealDB.Codec.CBOR do
 
   defp apply_tag(50, value), do: {:incl, value}
   defp apply_tag(51, value), do: {:excl, value}
+  defp apply_tag(55, [bucket, key]), do: %FileRef{bucket: bucket, key: key}
+  defp apply_tag(56, values) when is_list(values), do: MapSet.new(values)
   defp apply_tag(88, coordinates), do: %Geometry{type: :point, coordinates: coordinates}
   defp apply_tag(89, coordinates), do: %Geometry{type: :line, coordinates: coordinates}
   defp apply_tag(90, coordinates), do: %Geometry{type: :polygon, coordinates: coordinates}

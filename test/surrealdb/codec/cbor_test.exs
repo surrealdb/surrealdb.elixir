@@ -7,11 +7,13 @@ defmodule SurrealDB.Codec.CBORTest do
     Bytes,
     Datetime,
     Duration,
+    FileRef,
     Future,
     Geometry,
     None,
     Range,
     RecordId,
+    RecordIdRange,
     Table,
     Uuid
   }
@@ -92,6 +94,30 @@ defmodule SurrealDB.Codec.CBORTest do
       range = Range.new({:incl, 1}, {:excl, 10})
       assert roundtrip(range) == range
       assert roundtrip(Range.new(nil, {:incl, 5})) == Range.new(nil, {:incl, 5})
+    end
+
+    test "RecordIdRange is a record id whose key is a range" do
+      range = RecordIdRange.new("person", {:incl, 1}, {:excl, 100})
+      assert roundtrip(range) == range
+      assert roundtrip(RecordIdRange.new("person", nil, {:incl, "m"})).end == {:incl, "m"}
+
+      # tag 8, [ "person", tag 49 [ tag 50 1, tag 51 100 ] ]
+      assert CBOR.encode(range) ==
+               <<0xC8, 0x82, 0x66, "person", 0xD8, 49, 0x82, 0xD8, 50, 0x01, 0xD8, 51, 0x18, 100>>
+    end
+
+    test "FileRef is tag 55 with the bucket and key" do
+      file = FileRef.new("avatars", "tobie.png")
+      assert file.key == "/tobie.png"
+      assert roundtrip(file) == file
+      assert <<0xD8, 55, 0x82, _::binary>> = CBOR.encode(file)
+    end
+
+    test "a MapSet is a set, tag 56 with its elements" do
+      set = MapSet.new([1, "a", RecordId.new("t", 1)])
+      assert roundtrip(set) == set
+      assert <<0xD8, 56, 0x83, _::binary>> = CBOR.encode(set)
+      assert roundtrip(MapSet.new()) == MapSet.new()
     end
 
     test "Bytes are distinguished from text" do
