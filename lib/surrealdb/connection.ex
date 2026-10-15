@@ -72,7 +72,9 @@ defmodule SurrealDB.Connection do
     meta = if opts[:timeout], do: Map.put(meta, :timeout, opts[:timeout]), else: meta
 
     # The connection enforces the timeout and always replies, so this only waits forever
-    # if the connection process itself is stuck, and the call exits if it dies.
+    # if the connection process itself is stuck, and the call exits if it dies. A request
+    # write the peer stops reading fails after the connection's timeout (the transport's
+    # send timeout), so it cannot hold the connection process either.
     GenServer.call(server, {:rpc, method, params, meta}, :infinity)
   end
 
@@ -201,7 +203,7 @@ defmodule SurrealDB.Connection do
   def handle_info(message, state), do: handle_transport(message, state)
 
   # Methods whose reply changes what the connection tracks about the session.
-  @session_methods ~w(use signin signup authenticate invalidate reset let set unset)
+  @session_methods ~w(use signin signup authenticate invalidate reset)
 
   # A timed-out request on an engine that cannot cancel it (a WebSocket) may still run on
   # the server. If it changes session state, keep it pending with no caller, so its late
@@ -353,6 +355,9 @@ defmodule SurrealDB.Connection do
 
             case scan_for_reply(events, state, id) do
               {:found, result, state} ->
+                # A close in the same batch as the reply leaves a dead socket behind.
+                result = if :closed in events, do: closed_error(), else: result
+
                 state = apply_side_effects(state, method, params, result)
 
                 case result do
@@ -379,6 +384,8 @@ defmodule SurrealDB.Connection do
   defp remaining(:infinity), do: :infinity
   defp remaining(deadline), do: max(deadline - System.monotonic_time(:millisecond), 0)
 
+  defp closed_error, do: {:error, Error.new(:connection, "connection closed")}
+
   defp scan_for_reply([], state, _id), do: {:not_found, state}
 
   defp scan_for_reply([{:message, binary} | rest], state, id) do
@@ -388,9 +395,7 @@ defmodule SurrealDB.Connection do
     end
   end
 
-  defp scan_for_reply([:closed | _rest], state, _id) do
-    {:found, {:error, Error.new(:connection, "connection closed")}, state}
-  end
+  defp scan_for_reply([:closed | _rest], state, _id), do: {:found, closed_error(), state}
 
   defp scan_for_reply([{:reply, reply_id, binary} | rest], state, id) do
     case decode(state, binary) do
@@ -766,6 +771,9 @@ defmodule SurrealDB.Connection do
     end
   end
 
+  defp send_timeout(timeout) when is_integer(timeout), do: timeout
+  defp send_timeout(_infinity), do: nil
+
   defp engine_opts(codec, opts) do
     frame_type = if codec.subprotocol() == "json", do: :text, else: :binary
 
@@ -776,6 +784,7 @@ defmodule SurrealDB.Connection do
       codec: codec
     ]
     |> maybe_put(:transport_opts, Keyword.get(opts, :transport_opts))
+    |> maybe_put(:send_timeout, send_timeout(Keyword.get(opts, :timeout, @default_timeout)))
     |> maybe_put(:responder, Keyword.get(opts, :responder))
   end
 
