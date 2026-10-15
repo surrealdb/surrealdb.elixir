@@ -119,7 +119,7 @@ defmodule SurrealDB.Connection do
     {id, state} = next_id(state)
     payload = encode_request(state, id, method, params)
 
-    case state.engine.request(state.engine_state, payload, session(state)) do
+    case state.engine.request(state.engine_state, id, payload, session(state)) do
       {:ok, engine_state} ->
         pending = Map.put(state.pending, id, {from, method, params, meta})
         {:noreply, %{state | engine_state: engine_state, pending: pending}}
@@ -210,7 +210,7 @@ defmodule SurrealDB.Connection do
     {id, state} = next_id(state)
     payload = encode_request(state, id, method, params)
 
-    case state.engine.request(state.engine_state, payload, session(state)) do
+    case state.engine.request(state.engine_state, id, payload, session(state)) do
       {:ok, engine_state} ->
         await_reply(%{state | engine_state: engine_state}, id, method, params, timeout)
 
@@ -263,6 +263,33 @@ defmodule SurrealDB.Connection do
     {:found, {:error, Error.new(:connection, "connection closed")}, state}
   end
 
+  defp scan_for_reply([{:reply, reply_id, binary} | rest], state, id) do
+    case decode(state, binary) do
+      {:ok, %{} = decoded} ->
+        scan_for_reply([{:decoded, Map.put_new(decoded, "id", reply_id)} | rest], state, id)
+
+      _other when reply_id == id ->
+        {:found, {:error, Error.new(:decode, "could not decode the reply", details: binary)},
+         state}
+
+      _other ->
+        scan_for_reply(rest, state, id)
+    end
+  end
+
+  defp scan_for_reply([{:decoded, %{"id" => id} = decoded} | _rest], state, id),
+    do: {:found, to_result(decoded), state}
+
+  defp scan_for_reply([{:decoded, _decoded} | rest], state, id),
+    do: scan_for_reply(rest, state, id)
+
+  defp scan_for_reply([{:failed, id, error} | _rest], state, id) do
+    {:found, {:error, error}, state}
+  end
+
+  defp scan_for_reply([{:failed, _other, _error} | rest], state, id),
+    do: scan_for_reply(rest, state, id)
+
   defp scan_for_reply([{:reset, reason} | _rest], state, _id) do
     {:found, {:error, conn_error(reason)}, state}
   end
@@ -273,6 +300,20 @@ defmodule SurrealDB.Connection do
 
   defp process_event({:reset, reason}, {:ok, state}),
     do: {:cont, {:ok, fail_pending(state, reason)}}
+
+  defp process_event({:reply, id, binary}, {:ok, state}) do
+    case decode(state, binary) do
+      {:ok, %{} = decoded} ->
+        {:cont, {:ok, route(Map.put_new(decoded, "id", id), state)}}
+
+      _other ->
+        error = Error.new(:decode, "could not decode the reply to request #{id}", details: binary)
+        {:cont, {:ok, deliver_result(id, {:error, error}, state)}}
+    end
+  end
+
+  defp process_event({:failed, id, error}, {:ok, state}),
+    do: {:cont, {:ok, deliver_result(id, {:error, error}, state)}}
 
   defp process_event({:message, binary}, {:ok, state}) do
     case decode(state, binary) do
@@ -296,15 +337,14 @@ defmodule SurrealDB.Connection do
     end
   end
 
-  defp deliver_reply(decoded, state) do
-    id = decoded["id"]
+  defp deliver_reply(decoded, state), do: deliver_result(decoded["id"], to_result(decoded), state)
 
+  defp deliver_result(id, result, state) do
     case Map.pop(state.pending, id) do
       {nil, _pending} ->
         state
 
       {{from, method, params, meta}, pending} ->
-        result = to_result(decoded)
         state = %{state | pending: pending}
         state = apply_side_effects(state, method, params, result)
         state = register_live(state, method, meta, result)
