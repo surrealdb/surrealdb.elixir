@@ -23,4 +23,11 @@ defmodule SurrealDB.VersionTest do
     assert message =~ ">= 2.1.0 and < 5.0.0"
     assert {:error, %SurrealDB.Error{kind: :unsupported}} = Version.check("nonsense")
   end
+
+  test "only a whole version reply counts, not a version somewhere inside other text" do
+    assert Version.parse("3.3.4") == {:ok, {3, 3, 4}}
+    assert Version.parse("proxy error for backend 3.0.0") == :error
+    assert Version.parse("surrealdb-3.0.0 (proxy)") == :error
+    refute Version.supported?("proxy error for backend 3.0.0")
+  end
 end

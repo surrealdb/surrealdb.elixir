@@ -16,6 +16,9 @@ defmodule SurrealDB.Version do
       false
   """
 
+  # `surrealdb-` (optional), then major.minor.patch, an optional pre-release and build.
+  @format ~r/^(?:surrealdb-)?([0-9]+)\.([0-9]+)\.([0-9]+)(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/
+
   @minimum {2, 1, 0}
   @maximum {5, 0, 0}
 
@@ -34,7 +37,7 @@ defmodule SurrealDB.Version do
   @spec parse(String.t()) ::
           {:ok, {non_neg_integer(), non_neg_integer(), non_neg_integer()}} | :error
   def parse(string) when is_binary(string) do
-    case Regex.run(~r/(\d+)\.(\d+)\.(\d+)/, string) do
+    case Regex.run(@format, string) do
       [_, major, minor, patch] ->
         {:ok, {String.to_integer(major), String.to_integer(minor), String.to_integer(patch)}}
 
