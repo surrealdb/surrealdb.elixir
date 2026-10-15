@@ -242,7 +242,7 @@ defmodule SurrealDB.IntegrationTest do
   end
 
   describe "record access with refresh tokens" do
-    defp define_record_access do
+    defp define_record_access(token_duration \\ "1h") do
       db = connect()
 
       {:ok, _} =
@@ -252,7 +252,7 @@ defmodule SurrealDB.IntegrationTest do
           SIGNUP (CREATE user SET email = $email, pass = crypto::argon2::generate($pass))
           SIGNIN (SELECT * FROM user WHERE email = $email AND crypto::argon2::compare(pass, $pass))
           WITH REFRESH
-          DURATION FOR TOKEN 1h, FOR SESSION 1d;
+          DURATION FOR TOKEN #{token_duration}, FOR SESSION 1d;
         """)
 
       %SurrealDB.Auth.Record{
@@ -279,6 +279,46 @@ defmodule SurrealDB.IntegrationTest do
         assert SurrealDB.info_session(db).token == access
         assert {:ok, %{"email" => "a@example.com"}} = SurrealDB.info(db)
       end
+    end
+
+    test "refresh swaps the pair, and the old refresh token is spent" do
+      auth = define_record_access()
+      db = start_supervised!({SurrealDB.Connection, url: @url}, id: :record_user)
+
+      {:ok, old_pair} = SurrealDB.signup(db, auth)
+      assert {:ok, %{"access" => access, "refresh" => refresh} = new_pair} = SurrealDB.refresh(db)
+      refute new_pair == old_pair
+      assert %{token: ^access, refresh_token: ^refresh} = SurrealDB.info_session(db)
+      assert {:ok, %{"email" => "a@example.com"}} = SurrealDB.info(db)
+
+      assert {:error, %SurrealDB.Error{}} = SurrealDB.refresh(db, old_pair)
+    end
+
+    test "a token pair can authenticate another connection, and revoke ends refreshing" do
+      auth = define_record_access()
+      db = start_supervised!({SurrealDB.Connection, url: @url}, id: :record_user)
+      {:ok, pair} = SurrealDB.signup(db, auth)
+
+      other = start_supervised!({SurrealDB.Connection, url: @url}, id: :other_user)
+      assert {:ok, _} = SurrealDB.authenticate(other, pair)
+      assert {:ok, %{"email" => "a@example.com"}} = SurrealDB.info(other)
+
+      assert {:ok, _} = SurrealDB.revoke(other)
+      assert SurrealDB.info_session(other).refresh_token == nil
+      assert {:error, %SurrealDB.Error{}} = SurrealDB.refresh(db)
+    end
+
+    @tag :capture_log
+    test "the access token is renewed before it expires" do
+      auth = define_record_access("4s")
+      db = start_supervised!({SurrealDB.Connection, url: @url}, id: :record_user)
+
+      {:ok, %{"access" => first}} = SurrealDB.signup(db, auth)
+
+      # Renewed halfway through the 4 second lifetime, so still signed in after it.
+      Process.sleep(5_000)
+      refute SurrealDB.info_session(db).token == first
+      assert {:ok, %{"email" => "a@example.com"}} = SurrealDB.info(db)
     end
   end
 

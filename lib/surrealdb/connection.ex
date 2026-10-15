@@ -25,8 +25,9 @@ defmodule SurrealDB.Connection do
   and restores the session before it serves requests again, in this order:
 
     1. the version check,
-    2. authentication: the access token, or signing in again with the credentials the
-       session last signed in with,
+    2. authentication: the access token, or if the server refuses it, a new token pair
+       from the refresh token, or signing in again with the credentials the session last
+       signed in with,
     3. the namespace and database,
     4. connection parameters set with `SurrealDB.let/3`,
     5. sessions started with `SurrealDB.new_session/1` or `SurrealDB.fork_session/1`:
@@ -72,6 +73,9 @@ defmodule SurrealDB.Connection do
     :reconnect,
     version_check: true,
     connect_timeout: 15_000,
+    renew_access: true,
+    # session id => timer that renews the session's access token before it expires
+    renewals: %{},
     status: :connected,
     attempt: 0,
     next_id: 1,
@@ -216,7 +220,8 @@ defmodule SurrealDB.Connection do
         timeout: Keyword.get(opts, :timeout, @default_timeout),
         version_check: Keyword.get(opts, :version_check, true),
         connect_timeout: Keyword.get(opts, :connect_timeout, 15_000),
-        reconnect: reconnect_config(engine, Keyword.get(opts, :reconnect, true))
+        reconnect: reconnect_config(engine, Keyword.get(opts, :reconnect, true)),
+        renew_access: Keyword.get(opts, :renew_access, true)
       }
 
       setup(state)
@@ -350,6 +355,18 @@ defmodule SurrealDB.Connection do
   end
 
   def handle_info({:reconnect, _attempt}, state), do: {:noreply, state}
+
+  def handle_info({:renew_access, sid, token}, state) do
+    state = %{state | renewals: Map.delete(state.renewals, sid)}
+
+    # Skip a renewal the token has since been replaced for. While reconnecting, restoring
+    # the session authenticates again and schedules the next renewal.
+    if state.status == :connected and session(state, sid).token == token do
+      {:noreply, renew(state, sid)}
+    else
+      {:noreply, state}
+    end
+  end
 
   def handle_info(message, %{engine_state: nil} = state) do
     Logger.debug("SurrealDB ignored a message while disconnected: #{inspect(message)}")
@@ -602,8 +619,34 @@ defmodule SurrealDB.Connection do
 
     case rpc_sync(state, "authenticate", [token], sid) do
       {:ok, _result, state} ->
-        {:ok,
-         update_session(state, sid, &%{&1 | refresh_token: refresh, credentials: credentials})}
+        state =
+          update_session(state, sid, &%{&1 | refresh_token: refresh, credentials: credentials})
+
+        {:ok, schedule_renewal(state, sid, "authenticate")}
+
+      {:error, %Error{kind: :connection} = error, state} ->
+        {:error, error, state}
+
+      {:error, _unusable, state} when is_binary(refresh) ->
+        restore_refresh(state, sid, token, refresh, credentials)
+
+      {:error, _unusable, state} ->
+        state =
+          update_session(
+            state,
+            sid,
+            &%{&1 | token: nil, refresh_token: nil, credentials: credentials}
+          )
+
+        restore_signin(state, sid)
+    end
+  end
+
+  # A refused access token can still be exchanged for a new pair with the refresh token.
+  defp restore_refresh(state, sid, token, refresh, credentials) do
+    case rpc_sync(state, "refresh", [%{"access" => token, "refresh" => refresh}], sid) do
+      {:ok, _tokens, state} ->
+        {:ok, update_session(state, sid, &%{&1 | credentials: credentials})}
 
       {:error, %Error{kind: :connection} = error, state} ->
         {:error, error, state}
@@ -820,7 +863,11 @@ defmodule SurrealDB.Connection do
       {{from, method, params, meta}, pending} ->
         cancel_timer(meta)
         state = %{state | pending: pending}
-        state = apply_effects(state, Map.get(meta, :session), method, params, result)
+        sid = Map.get(meta, :session)
+        state = apply_effects(state, sid, method, params, result)
+        state = keep_refresh_token(state, sid, method, meta, result)
+        state = after_renewal(state, sid, method, meta, result)
+        state = schedule_renewal(state, sid, method)
         state = register_live(state, method, params, meta, result)
         reply(state, from, id, public_reply(method, meta, result))
     end
@@ -1053,6 +1100,18 @@ defmodule SurrealDB.Connection do
     %{session | token: access, refresh_token: tokens["refresh"], credentials: credentials}
   end
 
+  defp session_effects(session, "refresh", _params, {:ok, %{"access" => access} = tokens})
+       when is_binary(access) do
+    %{session | token: access, refresh_token: tokens["refresh"]}
+  end
+
+  defp session_effects(session, "refresh", _params, {:ok, access}) when is_binary(access),
+    do: %{session | token: access}
+
+  defp session_effects(session, "revoke", [%{"refresh" => refresh} | _], {:ok, _result})
+       when refresh == session.refresh_token,
+       do: %{session | refresh_token: nil}
+
   defp session_effects(session, "authenticate", [token | _], {:ok, _result}) do
     %{session | token: token, refresh_token: nil, credentials: nil}
   end
@@ -1102,6 +1161,92 @@ defmodule SurrealDB.Connection do
     state.live_specs
     |> Enum.filter(fn {_id, {live_sid, _params}} -> live_sid == sid end)
     |> Enum.reduce(state, fn {id, _spec}, state -> drop_live(state, id) end)
+  end
+
+  # ── Access token renewal ──────────────────────────────────────────────────────
+
+  # `authenticate` takes only the access token; a refresh token given alongside it rides in
+  # the request meta.
+  defp keep_refresh_token(state, sid, "authenticate", %{refresh_token: refresh}, {:ok, _}),
+    do: update_session(state, sid, &%{&1 | refresh_token: refresh})
+
+  defp keep_refresh_token(state, _sid, _method, _meta, _result), do: state
+
+  # A failed refresh falls back to signing in again with the stored credentials.
+  defp after_renewal(state, sid, "refresh", %{renewal: true}, {:error, error}) do
+    Logger.warning("SurrealDB could not refresh the access token: #{Exception.message(error)}")
+    state = update_session(state, sid, &%{&1 | refresh_token: nil})
+    if session(state, sid).credentials, do: renew(state, sid), else: state
+  end
+
+  defp after_renewal(state, _sid, "signin", %{renewal: true}, {:error, error}) do
+    Logger.warning("SurrealDB could not renew the access token: #{Exception.message(error)}")
+    state
+  end
+
+  defp after_renewal(state, _sid, _method, _meta, _result), do: state
+
+  @auth_methods ~w(signin signup authenticate refresh invalidate reset revoke detach)
+
+  defp schedule_renewal(state, sid, method) when method in @auth_methods do
+    {timer, renewals} = Map.pop(state.renewals, sid)
+    if timer, do: Process.cancel_timer(timer)
+    state = %{state | renewals: renewals}
+    session = Map.get(state.sessions, sid)
+
+    with true <- state.renew_access,
+         %Session{token: token} when is_binary(token) <- session,
+         true <- not is_nil(session.refresh_token) or not is_nil(session.credentials),
+         {:ok, delay} <- renewal_delay(token) do
+      timer = Process.send_after(self(), {:renew_access, sid, token}, delay)
+      %{state | renewals: Map.put(renewals, sid, timer)}
+    else
+      _ -> state
+    end
+  end
+
+  defp schedule_renewal(state, _sid, _method), do: state
+
+  # Renew a minute before the token expires, or halfway through a shorter lifetime.
+  @doc false
+  def renewal_delay(token) do
+    with {:ok, claims} <- jwt_claims(token),
+         exp when is_integer(exp) <- claims["exp"] do
+      now = System.system_time(:millisecond)
+      lifetime = if is_integer(claims["iat"]), do: (exp - claims["iat"]) * 1000, else: nil
+      margin = if lifetime, do: min(60_000, div(lifetime, 2)), else: 60_000
+      {:ok, max(exp * 1000 - margin - now, 0)}
+    else
+      _ -> :error
+    end
+  end
+
+  defp jwt_claims(token) do
+    with [_header, payload, _signature] <- String.split(token, "."),
+         {:ok, json} <- Base.url_decode64(payload, padding: false),
+         {:ok, %{} = claims} <- Jason.decode(json) do
+      {:ok, claims}
+    else
+      _ -> :error
+    end
+  end
+
+  # Renew with the refresh token when there is one, otherwise sign in again.
+  defp renew(state, sid) do
+    session = session(state, sid)
+
+    {method, params} =
+      if session.refresh_token,
+        do: {"refresh", [%{"access" => session.token, "refresh" => session.refresh_token}]},
+        else: {"signin", [session.credentials]}
+
+    {id, state} = next_id(state)
+    meta = start_timer(%{session: sid, renewal: true}, id, state.timeout)
+
+    case send_request(state, id, nil, method, params, meta) do
+      {:ok, state} -> state
+      {:error, _error, state} -> state
+    end
   end
 
   # Sessions and transactions are state the server keeps for one connection, so they only
