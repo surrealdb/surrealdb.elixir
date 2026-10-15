@@ -269,12 +269,14 @@ Integration tests run against a real SurrealDB server and are excluded by defaul
 server and include them:
 
 ```sh
-docker run --rm -p 8000:8000 surrealdb/surrealdb:latest start --user root --pass root
+docker run --rm -p 8000:8000 surrealdb/surrealdb:v3 start --user root --pass root memory
 
 mix test --include integration
 ```
 
-Override the server URL with the `SURREALDB_URL` environment variable.
+Override the server URL with the `SURREALDB_URL` environment variable. CI runs the
+integration tests against the latest 3.x release (`surrealdb/surrealdb:v3`) and the nightly
+build (`surrealdb/surrealdb:nightly`).
 
 ## License
 
