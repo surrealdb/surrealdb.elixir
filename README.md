@@ -163,6 +163,24 @@ projected onto their closest JSON representation.
 {:ok, _} = SurrealDB.invalidate(db)
 ```
 
+## Errors
+
+Every function returns `{:error, %SurrealDB.Error{}}` on failure. `kind` says where the
+error came from (`:rpc` for the server, `:connection`, `:timeout`, `:http`, and so on). For
+server errors, `server_kind` is the server's error kind and `details` its structured
+details:
+
+```elixir
+case SurrealDB.select(db, "missing") do
+  {:error, %SurrealDB.Error{server_kind: :not_found} = error} ->
+    SurrealDB.Error.detail_kinds(error)   # ["Table"]
+    SurrealDB.Error.detail_fields(error)  # %{"name" => "missing"}
+end
+
+SurrealDB.Error.token_expired?(error)
+SurrealDB.Error.transaction_conflict?(error)
+```
+
 ## Live queries
 
 Live queries are delivered to a subscriber process as messages. They require a WebSocket

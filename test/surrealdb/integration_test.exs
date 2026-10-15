@@ -258,6 +258,36 @@ defmodule SurrealDB.IntegrationTest do
     end
   end
 
+  describe "structured errors" do
+    test "RPC errors carry the server's kind and details" do
+      db = connect()
+
+      assert {:error, %SurrealDB.Error{kind: :rpc, server_kind: :not_found} = error} =
+               SurrealDB.select(db, "missing_table")
+
+      assert SurrealDB.Error.detail_kinds(error) == ["Table"]
+      assert SurrealDB.Error.detail_fields(error) == %{"name" => "missing_table"}
+    end
+
+    test "statement errors carry the server's kind" do
+      db = connect()
+
+      assert {:ok, [{:error, thrown}, {:error, missing}]} =
+               SurrealDB.query_results(db, "THROW 'x'; SELECT * FROM missing_table")
+
+      assert thrown.server_kind == :thrown
+      assert missing.server_kind == :not_found
+      assert SurrealDB.Error.detail_kinds(missing) == ["Table"]
+    end
+
+    test "a failed signin is not allowed" do
+      db = start_supervised!({SurrealDB.Connection, url: @url})
+
+      assert {:error, %SurrealDB.Error{server_kind: :not_allowed}} =
+               SurrealDB.signin(db, %SurrealDB.Auth.Root{user: "root", pass: "wrong"})
+    end
+  end
+
   test "works over the HTTP engine too" do
     http_url = String.replace(@url, ~r/^ws/, "http")
     db = connect(url: http_url)
