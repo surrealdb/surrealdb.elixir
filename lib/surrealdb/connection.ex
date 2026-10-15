@@ -338,7 +338,7 @@ defmodule SurrealDB.Connection do
   # the server. If it changes session state, keep it pending with no caller, so its late
   # reply still updates the namespace, database, and auth the connection reports and sends.
   # A late `live` reply starts a query nobody listens to, so it is killed. Any other request
-  # keeps a tombstone, so its late reply is dropped instead of being read as a notification.
+  # is forgotten: its late reply carries an id, so it is never read as a notification.
   defp await_late_reply(state, pending, id, method, params, meta) do
     cond do
       function_exported?(state.engine, :cancel, 2) ->
@@ -351,7 +351,7 @@ defmodule SurrealDB.Connection do
         Map.put(pending, id, {nil, method, params, Map.delete(meta, :timer)})
 
       true ->
-        Map.put(pending, id, {nil, method, params, %{discard: true}})
+        pending
     end
   end
 
