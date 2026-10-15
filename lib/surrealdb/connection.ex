@@ -390,6 +390,9 @@ defmodule SurrealDB.Connection do
 
   defp public_reply("query", %{raw: true}, {:ok, statements}), do: {:ok, statements}
 
+  defp public_reply("query", %{statements: true}, {:ok, statements}) when is_list(statements),
+    do: {:ok, RPC.statement_results(statements)}
+
   defp public_reply("query", _meta, {:ok, statements}) when is_list(statements),
     do: RPC.parse_query(statements)
 

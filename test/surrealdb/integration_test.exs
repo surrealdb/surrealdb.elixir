@@ -206,6 +206,20 @@ defmodule SurrealDB.IntegrationTest do
     assert created["ref"] == "user:1234"
   end
 
+  test "a failed statement does not hide the results of the others" do
+    db = connect()
+    sql = "RETURN 1; THROW 'boom'; RETURN 3"
+
+    assert {:error, %SurrealDB.Error{kind: :query, details: %{results: results}}} =
+             SurrealDB.query(db, sql)
+
+    assert [{:ok, 1}, {:error, %SurrealDB.Error{message: message}}, {:ok, 3}] = results
+    assert message =~ "boom"
+
+    assert {:ok, [{:ok, 1}, {:error, _}, {:ok, 3}]} = SurrealDB.query_results(db, sql)
+    assert {:ok, [1, 3]} = SurrealDB.query(db, "RETURN 1; RETURN 3")
+  end
+
   test "works over the HTTP engine too" do
     http_url = String.replace(@url, ~r/^ws/, "http")
     db = connect(url: http_url)
