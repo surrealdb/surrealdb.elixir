@@ -67,7 +67,8 @@ defmodule SurrealDB.Rest do
     port = uri.port || default_port(scheme)
     headers = headers ++ session_headers(session)
 
-    connect_opts = [protocols: [:http1], mode: :passive] ++ tls_opts(scheme)
+    connect_opts =
+      [protocols: [:http1], mode: :passive] ++ tls_opts(scheme, session[:transport_opts])
 
     with {:ok, conn} <- Mint.HTTP.connect(scheme, host, port, connect_opts),
          {:ok, conn, ref} <- Mint.HTTP.request(conn, method, path, headers, body),
@@ -135,8 +136,12 @@ defmodule SurrealDB.Rest do
   defp default_port(:https), do: 443
   defp default_port(:http), do: 80
 
-  defp tls_opts(:https), do: [transport_opts: [cacerts: :public_key.cacerts_get()]]
-  defp tls_opts(:http), do: []
+  # The connection's own transport options (a private CA, a client certificate) apply here
+  # too, so these requests reach the server the connection does.
+  defp tls_opts(:https, nil), do: [transport_opts: [cacerts: :public_key.cacerts_get()]]
+  defp tls_opts(:https, transport_opts), do: [transport_opts: transport_opts]
+  defp tls_opts(:http, nil), do: []
+  defp tls_opts(:http, transport_opts), do: [transport_opts: transport_opts]
 
   defp connection_error(reason), do: Error.new(:connection, inspect(reason), details: reason)
 end
