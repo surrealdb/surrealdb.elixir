@@ -151,6 +151,40 @@ defmodule SurrealDB.TokenTest do
     assert_receive {:rpc, "signin", _}, 2_000
   end
 
+  test "revoking the session's refresh token stops renewal" do
+    pair = %{"access" => jwt(2), "refresh" => "refresh.1"}
+    db = start(%{"signin" => {:ok, pair}})
+
+    {:ok, _} = SurrealDB.signin(db, @record)
+    {:ok, _} = SurrealDB.revoke(db)
+    assert_received {:rpc, "signin", _}
+
+    refute_receive {:rpc, "signin", _}, 2_000
+    refute_received {:rpc, "refresh", _}
+    assert :sys.get_state(db).renewals == %{}
+  end
+
+  test "a refresh that fails for another reason keeps the pair and is tried again" do
+    new_pair = %{"access" => jwt(3600), "refresh" => "refresh.2"}
+    internal = %{"code" => -32_000, "message" => "Internal error", "kind" => "Internal"}
+    db = start(%{"refresh" => [{:error, internal}, {:ok, new_pair}]})
+
+    {:ok, _} = SurrealDB.authenticate(db, %{access: jwt(2), refresh: "refresh.1"})
+    assert_receive {:rpc, "refresh", [%{"refresh" => "refresh.1"}]}, 3_000
+    assert_receive {:rpc, "refresh", [%{"refresh" => "refresh.1"}]}, 3_000
+    Process.sleep(50)
+    assert %{refresh_token: "refresh.2"} = SurrealDB.info_session(db)
+  end
+
+  test "a renewal that cannot be sent is tried again" do
+    db = start(%{"signin" => [{:ok, jwt(1)}, {:send_error, :closed}, {:ok, jwt(3600)}]})
+
+    {:ok, _} = SurrealDB.signin(db, %SurrealDB.Auth.Root{user: "root", pass: "root"})
+    assert_received {:rpc, "signin", _}
+    assert_receive {:rpc, "signin", _}, 2_000
+    assert_receive {:rpc, "signin", _}, 3_000
+  end
+
   test "a renewal that times out is tried again" do
     db = start(%{"signin" => [{:ok, jwt(1)}, :noreply, {:ok, jwt(3600)}]}, timeout: 200)
 
