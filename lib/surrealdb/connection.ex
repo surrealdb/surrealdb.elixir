@@ -1262,9 +1262,11 @@ defmodule SurrealDB.Connection do
   defp session_effects(session, "refresh", _params, {:ok, access}) when is_binary(access),
     do: %{session | token: access}
 
+  # Revoking the session's own refresh token ends renewal: the stored credentials go too,
+  # so the session is not signed in again behind the caller's back.
   defp session_effects(session, "revoke", [%{"refresh" => refresh} | _], {:ok, _result})
        when refresh == session.refresh_token,
-       do: %{session | refresh_token: nil}
+       do: %{session | refresh_token: nil, credentials: nil}
 
   defp session_effects(session, "authenticate", [token | _], {:ok, _result}) do
     %{session | token: token, refresh_token: nil, credentials: nil}
@@ -1327,13 +1329,13 @@ defmodule SurrealDB.Connection do
   defp keep_refresh_token(state, _sid, _method, _meta, _result), do: state
 
   # A refresh token the server refuses is dropped, and renewal falls back to signing in
-  # again with the stored credentials. Any other failure, including a timeout, is tried
-  # again after a backoff.
+  # again with the stored credentials. Any other failure (a timeout, a dropped connection,
+  # a server error) is tried again after a backoff.
   defp after_renewal(state, sid, method, %{renewal: true}, {:error, error})
        when method in ["refresh", "signin"] do
     Logger.warning("SurrealDB could not renew the access token: #{Exception.message(error)}")
 
-    if method == "refresh" and error.kind not in [:timeout, :connection] do
+    if method == "refresh" and refused?(error) do
       state = update_session(state, sid, &%{&1 | refresh_token: nil})
       if session(state, sid).credentials, do: renew(state, sid), else: state
     else
@@ -1342,6 +1344,12 @@ defmodule SurrealDB.Connection do
   end
 
   defp after_renewal(state, _sid, _method, _meta, _result), do: state
+
+  # The server answers a spent or revoked refresh token with a NotAllowed error (an HTTP
+  # 401 or 403 over HTTP).
+  defp refused?(%Error{kind: :auth}), do: true
+  defp refused?(%Error{server_kind: :not_allowed}), do: true
+  defp refused?(_error), do: false
 
   defp retry_renewal(state, sid) do
     state = cancel_renewal(state, sid)
@@ -1460,8 +1468,13 @@ defmodule SurrealDB.Connection do
     meta = start_timer(meta, id, state.timeout)
 
     case send_request(state, id, nil, method, params, meta) do
-      {:ok, state} -> state
-      {:error, _error, state} -> state
+      {:ok, state} ->
+        state
+
+      # The request never went out, so nothing else will retry it.
+      {:error, error, state} ->
+        Logger.warning("SurrealDB could not renew the access token: #{Exception.message(error)}")
+        retry_renewal(state, sid)
     end
   end
 
