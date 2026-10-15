@@ -207,6 +207,39 @@ defmodule SurrealDB.ConnectionTest do
       assert_receive {:DOWN, ^ref, :process, ^db, {:shutdown, {:connection_lost, _}}}
     end
 
+    @tag :capture_log
+    test "an internal kill still in flight does not stop the callers being told" do
+      Process.flag(:trap_exit, true)
+      base = responder()
+
+      responder = fn
+        "kill", _params -> :noreply
+        method, params -> base.(method, params)
+      end
+
+      {:ok, db} =
+        SurrealDB.Connection.start_link(
+          url: "ws://mock/rpc",
+          engine: SurrealDB.Engine.Mock,
+          responder: responder
+        )
+
+      subscriber = spawn(fn -> Process.sleep(:infinity) end)
+      {:ok, _live_id} = SurrealDB.live(db, "person", to: subscriber)
+
+      # The last subscriber exits, so the connection sends a kill nobody waits for.
+      Process.exit(subscriber, :kill)
+      wait_for_pending(db)
+
+      task = Task.async(fn -> SurrealDB.Connection.call(db, "hang", []) end)
+      wait_for_pending(db, 2)
+      ref = Process.monitor(db)
+      send(db, :mock_closed)
+
+      assert {:error, %SurrealDB.Error{kind: :connection}} = Task.await(task)
+      assert_receive {:DOWN, ^ref, :process, ^db, {:shutdown, {:connection_lost, _}}}
+    end
+
     test "a reset fails the calls in flight and keeps the process" do
       db = start()
       task = Task.async(fn -> SurrealDB.Connection.call(db, "hang", []) end)
@@ -220,10 +253,10 @@ defmodule SurrealDB.ConnectionTest do
     end
   end
 
-  defp wait_for_pending(db) do
-    if map_size(:sys.get_state(db).pending) == 0 do
+  defp wait_for_pending(db, count \\ 1) do
+    if map_size(:sys.get_state(db).pending) < count do
       Process.sleep(5)
-      wait_for_pending(db)
+      wait_for_pending(db, count)
     end
   end
 

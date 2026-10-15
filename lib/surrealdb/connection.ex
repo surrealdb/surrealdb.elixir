@@ -549,8 +549,9 @@ defmodule SurrealDB.Connection do
   defp fail_pending(state, reason) do
     error = conn_error(reason)
 
+    # Internal requests (an orphaned live query's `kill`) have no caller to tell.
     Enum.each(state.pending, fn {_id, {from, _method, _params, _meta}} ->
-      GenServer.reply(from, {:error, error})
+      if from, do: GenServer.reply(from, {:error, error})
     end)
 
     %{state | pending: %{}}
