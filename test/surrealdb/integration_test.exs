@@ -60,6 +60,27 @@ defmodule SurrealDB.IntegrationTest do
     assert {:ok, _} = SurrealDB.kill(db, live_id)
   end
 
+  test "RecordId.to_string matches the server's rendering and parses back" do
+    db = connect()
+
+    ids = [
+      SurrealDB.RecordId.new("person", "tobie"),
+      SurrealDB.RecordId.new("person", "complex id"),
+      SurrealDB.RecordId.new("person", "123"),
+      SurrealDB.RecordId.new("person", "a`b\\c"),
+      SurrealDB.RecordId.new("select", 42),
+      SurrealDB.RecordId.new("temp", ["london", 2024, 1.5]),
+      SurrealDB.RecordId.new("temp", %{"city" => "london", "at" => Decimal.new("1.50")}),
+      SurrealDB.RecordId.new("temp", SurrealDB.Uuid.new("0190d6f2-8b1e-7000-8000-000000000000"))
+    ]
+
+    for id <- ids do
+      string = SurrealDB.RecordId.to_string(id)
+      assert {:ok, [^string]} = SurrealDB.query(db, "RETURN <string> $id", %{id: id})
+      assert {:ok, [true]} = SurrealDB.query(db, "RETURN #{string} = $id", %{id: id})
+    end
+  end
+
   test "works over the HTTP engine too" do
     http_url = String.replace(@url, ~r/^ws/, "http")
     db = connect(url: http_url)

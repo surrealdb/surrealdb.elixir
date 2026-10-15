@@ -35,6 +35,30 @@ defmodule SurrealDB.Datetime do
     DateTime.from_unix!(seconds * 1_000_000_000 + nanos, :nanosecond)
   end
 
+  @doc """
+  Formats as an RFC 3339 string in UTC with full nanosecond precision, dropping trailing
+  zeros from the fraction.
+  """
+  @spec to_iso8601(t()) :: String.t()
+  def to_iso8601(%__MODULE__{seconds: seconds, nanos: nanos}) do
+    base = seconds |> DateTime.from_unix!() |> DateTime.to_iso8601() |> String.trim_trailing("Z")
+
+    fraction =
+      case nanos do
+        0 ->
+          ""
+
+        _ ->
+          "." <>
+            (nanos
+             |> Integer.to_string()
+             |> String.pad_leading(9, "0")
+             |> String.trim_trailing("0"))
+      end
+
+    base <> fraction <> "Z"
+  end
+
   defimpl Inspect do
     import Inspect.Algebra
 

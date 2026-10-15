@@ -29,6 +29,18 @@ defmodule SurrealDB.Duration do
     week: 7 * 86_400 * 1_000_000_000
   }
 
+  @format_units [
+    {"y", 365 * 86_400 * 1_000_000_000},
+    {"w", 7 * 86_400 * 1_000_000_000},
+    {"d", 86_400 * 1_000_000_000},
+    {"h", 3_600 * 1_000_000_000},
+    {"m", 60 * 1_000_000_000},
+    {"s", 1_000_000_000},
+    {"ms", 1_000_000},
+    {"µs", 1_000},
+    {"ns", 1}
+  ]
+
   @doc "Builds a duration from an amount and unit (defaults to nanoseconds)."
   @spec new(integer(), unit()) :: t()
   def new(amount, unit \\ :nanosecond) when is_integer(amount) do
@@ -71,11 +83,34 @@ defmodule SurrealDB.Duration do
   defp suffix_to_nanos("d"), do: @units.day
   defp suffix_to_nanos("w"), do: @units.week
 
+  @doc """
+  Formats the duration as SurrealDB does, for example `"1h30m"` or `"0ns"`. A year is 365
+  days.
+  """
+  @spec to_string(t()) :: String.t()
+  def to_string(%__MODULE__{nanoseconds: 0}), do: "0ns"
+
+  def to_string(%__MODULE__{nanoseconds: ns}) do
+    {parts, _rest} =
+      Enum.reduce(@format_units, {[], ns}, fn {suffix, size}, {parts, rest} ->
+        case div(rest, size) do
+          0 -> {parts, rest}
+          count -> {[Integer.to_string(count) <> suffix | parts], rem(rest, size)}
+        end
+      end)
+
+    parts |> Enum.reverse() |> Enum.join()
+  end
+
+  defimpl String.Chars do
+    def to_string(duration), do: SurrealDB.Duration.to_string(duration)
+  end
+
   defimpl Inspect do
     import Inspect.Algebra
 
-    def inspect(%SurrealDB.Duration{nanoseconds: ns}, _opts) do
-      concat(["#SurrealDB.Duration<", Integer.to_string(ns), "ns>"])
+    def inspect(%SurrealDB.Duration{} = duration, _opts) do
+      concat(["#SurrealDB.Duration<", SurrealDB.Duration.to_string(duration), ">"])
     end
   end
 end
