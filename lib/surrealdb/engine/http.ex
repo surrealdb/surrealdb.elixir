@@ -300,14 +300,26 @@ defmodule SurrealDB.Engine.HTTP do
   defp rpc_path(""), do: "/rpc"
   defp rpc_path(path), do: path
 
-  defp transport_opts(:https, opts) do
-    [transport_opts: Keyword.get(opts, :transport_opts, cacerts: :public_key.cacerts_get())]
+  defp transport_opts(scheme, opts) do
+    given =
+      case {scheme, Keyword.get(opts, :transport_opts)} do
+        {:https, nil} -> [cacerts: :public_key.cacerts_get()]
+        {_scheme, nil} -> []
+        {_scheme, given} -> given
+      end
+
+    case Keyword.merge(send_timeout_opts(opts), given) do
+      [] -> []
+      transport_opts -> [transport_opts: transport_opts]
+    end
   end
 
-  defp transport_opts(:http, opts) do
-    case Keyword.get(opts, :transport_opts) do
-      nil -> []
-      transport_opts -> [transport_opts: transport_opts]
+  # A write to a peer that stopped reading fails after the request timeout, instead of
+  # blocking the connection process inside `request/4` for good.
+  defp send_timeout_opts(opts) do
+    case Keyword.get(opts, :send_timeout) do
+      timeout when is_integer(timeout) -> [send_timeout: timeout, send_timeout_close: true]
+      _none -> []
     end
   end
 end
