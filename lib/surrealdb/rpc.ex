@@ -6,11 +6,19 @@ defmodule SurrealDB.RPC do
   the same `id` along with either a `result` or an `error`.
   """
 
-  @doc "Builds an RPC request map."
-  @spec request(term(), String.t(), list()) :: map()
-  def request(id, method, params) when is_list(params) do
+  @doc """
+  Builds an RPC request map. A `session` or `txn` id, when given, runs the request in that
+  session or transaction.
+  """
+  @spec request(term(), String.t(), list(), String.t() | nil, String.t() | nil) :: map()
+  def request(id, method, params, session \\ nil, txn \\ nil) when is_list(params) do
     %{"id" => id, "method" => method, "params" => params}
+    |> put_uuid("session", session)
+    |> put_uuid("txn", txn)
   end
+
+  defp put_uuid(request, _key, nil), do: request
+  defp put_uuid(request, key, id), do: Map.put(request, key, SurrealDB.Uuid.new(id))
 
   @doc """
   Interprets the result of a `query` RPC (a list of per-statement result objects).

@@ -36,9 +36,13 @@ defmodule SurrealDB do
   from user input stays a string.
   """
 
-  alias SurrealDB.{Connection, Error, RecordId, StringRecordId, Table, Uuid}
+  alias SurrealDB.{Connection, Error, RecordId, StringRecordId, Table, Transaction, Uuid}
 
-  @type conn :: GenServer.server()
+  @typedoc """
+  A connection handle, or a `SurrealDB.Session` or `SurrealDB.Transaction` on one. Every
+  call that takes a connection also takes a session or transaction and runs in it.
+  """
+  @type conn :: GenServer.server() | SurrealDB.Session.t() | Transaction.t()
   @type thing ::
           String.t() | Table.t() | RecordId.t() | StringRecordId.t() | SurrealDB.Range.t()
   @type record_ref :: RecordId.t() | StringRecordId.t()
@@ -76,7 +80,7 @@ defmodule SurrealDB do
 
   @doc "Closes the connection and stops its process."
   @spec close(conn()) :: :ok
-  def close(conn), do: GenServer.stop(conn)
+  def close(conn), do: GenServer.stop(Connection.server(conn))
 
   @doc """
   Sends connection status events to `pid` (default: the caller):
@@ -180,6 +184,169 @@ defmodule SurrealDB do
   @doc "Removes a previously defined connection-scoped parameter."
   @spec unset(conn(), String.t()) :: result()
   def unset(conn, name), do: Connection.call(conn, "unset", [name])
+
+  # ── Sessions and transactions ─────────────────────────────────────────────
+
+  @doc """
+  Starts a new session on the connection and returns its handle.
+
+  A session has its own namespace, database, authentication, and parameters, and starts
+  with none of them set. Pass the handle wherever a connection is expected. Sessions are
+  restored after a reconnect, with their state and live queries.
+
+  Needs a WebSocket connection and SurrealDB 3.0 or later.
+  """
+  @spec new_session(conn()) :: {:ok, SurrealDB.Session.t()} | {:error, Error.t()}
+  def new_session(conn) do
+    server = Connection.server(conn)
+    session = %SurrealDB.Session{conn: server, id: Uuid.v4()}
+
+    case Connection.call(session, "attach", []) do
+      {:ok, _} -> {:ok, session}
+      {:error, error} -> {:error, error}
+    end
+  end
+
+  @doc """
+  Starts a new session with a copy of another session's state: namespace, database,
+  authentication, and parameters. Changes to either afterwards do not affect the other.
+  Pass the connection to fork its default session.
+  """
+  @spec fork_session(conn()) :: {:ok, SurrealDB.Session.t()} | {:error, Error.t()}
+  def fork_session(conn) do
+    source = Connection.session_info(conn)
+
+    with {:ok, session} <- new_session(conn),
+         :ok <- copy_session(session, source),
+         :ok <- Connection.copy_auth(conn, session) do
+      {:ok, session}
+    end
+  end
+
+  defp copy_session(session, source) do
+    steps =
+      [
+        source.token && fn -> authenticate(session, source.token) end,
+        (source.namespace || source.database) &&
+          fn ->
+            __MODULE__.use(session, namespace: source.namespace, database: source.database)
+          end
+      ] ++ Enum.map(source.vars, fn {name, value} -> fn -> let(session, name, value) end end)
+
+    steps
+    |> Enum.filter(& &1)
+    |> Enum.reduce_while(:ok, fn step, :ok ->
+      case step.() do
+        {:ok, _} ->
+          {:cont, :ok}
+
+        {:error, error} ->
+          close_session(session)
+          {:halt, {:error, error}}
+      end
+    end)
+  end
+
+  @doc "Lists the ids of the sessions attached to the connection."
+  @spec sessions(conn()) :: {:ok, [Uuid.t()]} | {:error, Error.t()}
+  def sessions(conn), do: Connection.call(Connection.server(conn), "sessions", [])
+
+  @doc """
+  Closes a session. The server kills its live queries and cancels its open transactions.
+  """
+  @spec close_session(SurrealDB.Session.t()) :: result()
+  def close_session(%SurrealDB.Session{} = session), do: Connection.call(session, "detach", [])
+
+  @doc """
+  Begins an interactive transaction and returns its handle. Pass the handle wherever a
+  connection is expected and the call runs inside the transaction, then `commit/1` or
+  `cancel/1` it. `transaction/2` does that for you.
+
+  Begin on a session handle to run the transaction in that session.
+
+  Needs a WebSocket connection and SurrealDB 3.0 or later.
+  """
+  @spec begin(conn()) :: {:ok, Transaction.t()} | {:error, Error.t()}
+  def begin(%Transaction{}),
+    do: {:error, Error.new(:unsupported, "transactions cannot be nested")}
+
+  def begin(conn) do
+    {server, session, _txn} = Connection.target(conn)
+
+    case Connection.call(conn, "begin", []) do
+      {:ok, %Uuid{} = id} ->
+        {:ok, %Transaction{conn: server, id: id, session: session && Uuid.new(session)}}
+
+      {:ok, id} when is_binary(id) ->
+        {:ok, %Transaction{conn: server, id: Uuid.new(id), session: session && Uuid.new(session)}}
+
+      {:error, error} ->
+        {:error, error}
+    end
+  end
+
+  @doc "Commits a transaction."
+  @spec commit(Transaction.t()) :: result()
+  def commit(%Transaction{} = txn), do: Connection.call(txn_session(txn), "commit", [txn.id])
+
+  @doc "Cancels a transaction, discarding its changes."
+  @spec cancel(Transaction.t()) :: result()
+  def cancel(%Transaction{} = txn), do: Connection.call(txn_session(txn), "cancel", [txn.id])
+
+  # `commit` and `cancel` name the transaction in their params and run in its session.
+  defp txn_session(%Transaction{conn: conn, session: nil}), do: conn
+
+  defp txn_session(%Transaction{conn: conn, session: id}),
+    do: %SurrealDB.Session{conn: conn, id: id}
+
+  @doc """
+  Runs `fun` in a transaction, committing it when `fun` succeeds and cancelling it when
+  `fun` fails.
+
+  `fun` receives the transaction handle. When it returns `{:error, reason}` the
+  transaction is cancelled and `{:error, reason}` is returned. When it raises, throws, or
+  exits, the transaction is cancelled and the exception propagates. Otherwise the
+  transaction is committed and the result returned: `{:ok, value}` as is, any other value
+  as `{:ok, value}`. A failed commit returns its error.
+
+      SurrealDB.transaction(db, fn txn ->
+        with {:ok, _} <- SurrealDB.merge(txn, from, %{balance: from_balance - 10}),
+             {:ok, _} <- SurrealDB.merge(txn, to, %{balance: to_balance + 10}) do
+          :transferred
+        end
+      end)
+      #=> {:ok, :transferred}
+
+  A transaction that conflicts with another fails to commit with an error for which
+  `SurrealDB.Error.transaction_conflict?/1` is true, and can be retried.
+  """
+  @spec transaction(conn(), (Transaction.t() -> term())) :: result()
+  def transaction(conn, fun) when is_function(fun, 1) do
+    with {:ok, txn} <- begin(conn) do
+      result =
+        try do
+          fun.(txn)
+        catch
+          kind, reason ->
+            cancel(txn)
+            :erlang.raise(kind, reason, __STACKTRACE__)
+        end
+
+      case result do
+        {:error, _reason} = error ->
+          cancel(txn)
+          error
+
+        result ->
+          with {:ok, _} <- commit(txn) do
+            case result do
+              {:ok, _value} -> result
+              value -> {:ok, value}
+            end
+          end
+      end
+    end
+  end
 
   # ── Queries ──────────────────────────────────────────────────────────────────
 

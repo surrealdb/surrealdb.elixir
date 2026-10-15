@@ -96,4 +96,17 @@ defmodule SurrealDB.Engine.HTTPTest do
     assert {:ok, "surrealdb-3.0.0"} = SurrealDB.version(db)
     assert {:ok, "surrealdb-3.0.0"} = SurrealDB.version(db)
   end
+
+  test "sessions and transactions are unsupported over HTTP", %{bypass: bypass, url: url} do
+    Bypass.stub(bypass, "POST", "/rpc", fn conn ->
+      {id, conn} = rpc_id(conn)
+      body = CBOR.encode(%{"id" => id, "result" => "surrealdb-3.0.0"})
+      reply(conn, 200, "application/cbor", body)
+    end)
+
+    db = start(url)
+    assert {:error, %SurrealDB.Error{kind: :unsupported}} = SurrealDB.new_session(db)
+    assert {:error, %SurrealDB.Error{kind: :unsupported}} = SurrealDB.begin(db)
+    assert {:error, %SurrealDB.Error{kind: :unsupported}} = SurrealDB.sessions(db)
+  end
 end

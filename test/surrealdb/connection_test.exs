@@ -105,7 +105,7 @@ defmodule SurrealDB.ConnectionTest do
 
     assert {:ok, %{"access" => "access.jwt"}} = SurrealDB.signin(db, auth)
     assert SurrealDB.info_session(db).token == "access.jwt"
-    assert :sys.get_state(db).refresh_token == "refresh.jwt"
+    assert SurrealDB.info_session(db).refresh_token == "refresh.jwt"
   end
 
   test "create normalises a bare table name to a Table" do

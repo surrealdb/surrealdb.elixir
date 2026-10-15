@@ -18,6 +18,24 @@ defmodule SurrealDB.Uuid do
   @spec new(String.t()) :: t()
   def new(value) when is_binary(value), do: %__MODULE__{value: String.downcase(value)}
 
+  @doc "Generates a random (version 4) UUID."
+  @spec v4() :: t()
+  def v4 do
+    <<a::48, _::4, b::12, _::2, c::62>> = :crypto.strong_rand_bytes(16)
+    from_binary(<<a::48, 4::4, b::12, 2::2, c::62>>)
+  end
+
+  @doc """
+  Generates a time-ordered (version 7) UUID: the current Unix time in milliseconds followed
+  by random bits, so later UUIDs sort after earlier ones.
+  """
+  @spec v7() :: t()
+  def v7 do
+    millis = System.system_time(:millisecond)
+    <<b::12, _::2, c::62, _::4>> = :crypto.strong_rand_bytes(10)
+    from_binary(<<millis::48, 7::4, b::12, 2::2, c::62>>)
+  end
+
   @doc "Builds a UUID from its 16 raw bytes."
   @spec from_binary(binary()) :: t()
   def from_binary(<<a::32, b::16, c::16, d::16, e::48>>) do
