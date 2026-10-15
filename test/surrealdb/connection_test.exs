@@ -41,6 +41,77 @@ defmodule SurrealDB.ConnectionTest do
     assert info.supports_live?
   end
 
+  describe "use/2" do
+    defp recording_start(opts) do
+      parent = self()
+
+      responder = fn
+        "use", params ->
+          send(parent, {:use, params})
+          {:ok, nil}
+
+        _method, _params ->
+          {:ok, nil}
+      end
+
+      start(Keyword.merge([responder: responder], opts))
+    end
+
+    test "sends NONE for a missing or nil selection so the server keeps it" do
+      db = recording_start(namespace: "test", database: "app")
+      assert_receive {:use, ["test", "app"]}
+
+      assert {:ok, _} = SurrealDB.use(db, database: "other")
+      assert_receive {:use, [%SurrealDB.None{}, "other"]}
+
+      assert {:ok, _} = SurrealDB.use(db, namespace: "test2", database: nil)
+      assert_receive {:use, ["test2", %SurrealDB.None{}]}
+
+      info = SurrealDB.info_session(db)
+      assert {info.namespace, info.database} == {"test2", "other"}
+    end
+
+    test "sends NULL for :unset so the server clears it" do
+      db = recording_start(namespace: "test", database: "app")
+      assert_receive {:use, _}
+
+      assert {:ok, _} = SurrealDB.use(db, database: :unset)
+      assert_receive {:use, [%SurrealDB.None{}, nil]}
+      assert SurrealDB.info_session(db).database == nil
+      assert SurrealDB.info_session(db).namespace == "test"
+
+      assert {:ok, _} = SurrealDB.use(db, database: "app")
+      assert {:ok, _} = SurrealDB.use(db, namespace: :unset)
+
+      assert {SurrealDB.info_session(db).namespace, SurrealDB.info_session(db).database} ==
+               {nil, nil}
+    end
+
+    test "selecting only a database keeps it when no namespace is set" do
+      db = recording_start([])
+      assert {:ok, _} = SurrealDB.use(db, database: "app")
+      assert_receive {:use, [%SurrealDB.None{}, "app"]}
+      assert SurrealDB.info_session(db).database == "app"
+    end
+
+    test "over JSON, an unchanged selection is sent as its current value, not NULL" do
+      db = recording_start(codec: :json, namespace: "test", database: "app")
+      assert_receive {:use, ["test", "app"]}
+
+      assert {:ok, _} = SurrealDB.use(db, database: "other")
+      assert_receive {:use, ["test", "other"]}
+
+      assert {:ok, _} = SurrealDB.use(db, database: :unset)
+      assert_receive {:use, ["test", nil]}
+      assert SurrealDB.info_session(db).namespace == "test"
+    end
+
+    test "connecting with only a namespace leaves the database unchanged" do
+      _db = recording_start(namespace: "test")
+      assert_receive {:use, ["test", %SurrealDB.None{}]}
+    end
+  end
+
   test "create normalises a bare table name to a Table" do
     db = start()
     {:ok, [record]} = SurrealDB.create(db, "person", %{"name" => "Tobie"})

@@ -175,7 +175,9 @@ defmodule SurrealDB.Connection do
   defp maybe_use(state, nil, nil, _timeout), do: {:ok, state}
 
   defp maybe_use(state, namespace, database, timeout) do
-    case rpc_sync(state, "use", [namespace, database], timeout) do
+    params = [namespace || SurrealDB.None.none(), database || SurrealDB.None.none()]
+
+    case rpc_sync(state, "use", params, timeout) do
       {:ok, _result, state} -> {:ok, state}
       {:error, reason, state} -> {:error, reason, state}
     end
@@ -344,15 +346,10 @@ defmodule SurrealDB.Connection do
 
   defp apply_side_effects(state, _method, _params, {:error, _error}), do: state
 
-  defp apply_side_effects(state, "use", params, {:ok, _result}) do
-    namespace = Enum.at(params, 0)
-    database = Enum.at(params, 1)
-
-    %{
-      state
-      | namespace: namespace || state.namespace,
-        database: database || state.database
-    }
+  defp apply_side_effects(state, "use", [namespace, database], {:ok, _result}) do
+    # The server drops the database when the namespace is cleared (sent as NULL).
+    database = if is_nil(namespace), do: nil, else: use_value(database, state.database)
+    %{state | namespace: use_value(namespace, state.namespace), database: database}
   end
 
   defp apply_side_effects(state, method, _params, {:ok, token})
@@ -370,6 +367,9 @@ defmodule SurrealDB.Connection do
 
   defp apply_side_effects(state, _method, _params, _result), do: state
 
+  defp use_value(%SurrealDB.None{}, current), do: current
+  defp use_value(value, _current), do: value
+
   # ── Low level helpers ────────────────────────────────────────────────────
 
   defp fail_pending(state, reason) do
@@ -385,8 +385,15 @@ defmodule SurrealDB.Connection do
   defp next_id(state), do: {state.next_id, %{state | next_id: state.next_id + 1}}
 
   defp encode_request(state, id, method, params) do
-    state.codec.encode(RPC.request(id, method, params))
+    state.codec.encode(RPC.request(id, method, wire_params(state, method, params)))
   end
+
+  # JSON has no NONE, so a "leave unchanged" `use` parameter would arrive as NULL and clear
+  # the selection. Send the current selection in its place.
+  defp wire_params(%{codec: SurrealDB.Codec.JSON} = state, "use", [namespace, database]),
+    do: [use_value(namespace, state.namespace), use_value(database, state.database)]
+
+  defp wire_params(_state, _method, params), do: params
 
   defp decode(state, binary), do: state.codec.decode(binary)
 
