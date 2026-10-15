@@ -439,7 +439,7 @@ defmodule SurrealDB do
 
       case result do
         {:error, _reason} = error ->
-          cancel(txn)
+          cancel_quietly(txn)
           error
 
         result ->
