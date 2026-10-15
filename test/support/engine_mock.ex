@@ -10,10 +10,11 @@ defmodule SurrealDB.Engine.Mock do
   `{:mock_message, encoded_payload}` message; `handle_transport/2` forwards it like any
   other engine message. Send `:mock_closed` to simulate a dead transport, or
   `{:mock_reset, reason}` to simulate lost in-flight requests. A responder that returns
-  `:noreply` leaves the request unanswered, `{:delay, ms, result}` answers after `ms`, and
+  `:noreply` leaves the request unanswered, `{:delay, ms, result}` answers after `ms`,
   `{:batch, result, payloads}` delivers the reply and the extra payloads in one transport
-  message. A responder of arity 3 also gets the decoded request, to check its `"session"`
-  and `"txn"` fields.
+  message, and `{:closing, result}` answers and closes the transport in the same batch. A
+  responder of arity 3 also gets the decoded request, to check its `"session"` and `"txn"`
+  fields.
   """
 
   @behaviour SurrealDB.Engine
@@ -50,6 +51,9 @@ defmodule SurrealDB.Engine.Mock do
       {:ok, result} ->
         send(self(), {:mock_message, codec.encode(%{"id" => id, "result" => result})})
 
+      {:closing, result} ->
+        send(self(), {:mock_closing, codec.encode(%{"id" => id, "result" => result})})
+
       {:error, error} ->
         send(self(), {:mock_message, codec.encode(%{"id" => id, "error" => error})})
 
@@ -82,6 +86,9 @@ defmodule SurrealDB.Engine.Mock do
   def handle_transport(conn, {:mock_batch, payloads}) do
     {:ok, Enum.map(payloads, &{:message, IO.iodata_to_binary(&1)}), conn}
   end
+
+  def handle_transport(conn, {:mock_closing, payload}),
+    do: {:ok, [{:message, IO.iodata_to_binary(payload)}, :closed], conn}
 
   def handle_transport(conn, {:mock_failed, id, error}), do: {:ok, [{:failed, id, error}], conn}
   def handle_transport(conn, :mock_closed), do: {:ok, [:closed], conn}

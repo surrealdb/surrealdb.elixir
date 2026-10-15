@@ -141,7 +141,9 @@ defmodule SurrealDB.Connection do
     meta = Map.put(meta, :sent_at, System.monotonic_time(:millisecond))
 
     # The connection enforces the timeout and always replies, so this only waits forever
-    # if the connection process itself is stuck, and the call exits if it dies.
+    # if the connection process itself is stuck, and the call exits if it dies. A request
+    # write the peer stops reading fails after the connection's timeout (the transport's
+    # send timeout), so it cannot hold the connection process either.
     GenServer.call(server, {:rpc, method, params, meta}, :infinity)
   end
 
@@ -885,6 +887,22 @@ defmodule SurrealDB.Connection do
     end
   end
 
+  # Calls the connection answers from its own state need no server, so a slow restore does
+  # not make their callers wait (and exit on GenServer's default call timeout).
+  defp absorb(%{status: :reconnecting} = state, {:"$gen_call", from, call})
+       when is_tuple(call) and
+              elem(call, 0) in [
+                :session_info,
+                :subscribe_live,
+                :unsubscribe_live,
+                :subscribe_status,
+                :unsubscribe_status
+              ] do
+    {:reply, reply, state} = handle_call(call, from, state)
+    GenServer.reply(from, reply)
+    {:ok, state}
+  end
+
   defp absorb(%{status: :reconnecting} = state, {:request_timeout, id}) do
     case List.keytake(state.queue, id, 0) do
       {{^id, from, method, _params, _meta}, queue} ->
@@ -1416,6 +1434,9 @@ defmodule SurrealDB.Connection do
     end
   end
 
+  defp send_timeout(timeout) when is_integer(timeout), do: timeout
+  defp send_timeout(_infinity), do: nil
+
   defp engine_opts(codec, opts) do
     frame_type = if codec.subprotocol() == "json", do: :text, else: :binary
 
@@ -1426,6 +1447,7 @@ defmodule SurrealDB.Connection do
       codec: codec
     ]
     |> maybe_put(:transport_opts, Keyword.get(opts, :transport_opts))
+    |> maybe_put(:send_timeout, send_timeout(Keyword.get(opts, :timeout, @default_timeout)))
     |> maybe_put(:responder, Keyword.get(opts, :responder))
   end
 

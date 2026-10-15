@@ -179,4 +179,26 @@ defmodule SurrealDB.Engine.HTTPTest do
     assert {:error, %SurrealDB.Error{kind: :unsupported}} = SurrealDB.begin(db)
     assert {:error, %SurrealDB.Error{kind: :unsupported}} = SurrealDB.sessions(db)
   end
+
+  test "a request the server stops reading fails after the send timeout" do
+    {:ok, listen} = :gen_tcp.listen(0, [:binary, active: false, reuseaddr: true])
+    {:ok, port} = :inet.port(listen)
+
+    spawn_link(fn ->
+      {:ok, _socket} = :gen_tcp.accept(listen)
+      Process.sleep(:infinity)
+    end)
+
+    uri = URI.parse("http://127.0.0.1:#{port}/rpc")
+    {:ok, conn} = SurrealDB.Engine.HTTP.connect(uri, send_timeout: 200)
+
+    # The runtime queues one large write without blocking; the next write then blocks
+    # until the queue drains, which it never does.
+    body = :binary.copy("x", 64 * 1024 * 1024)
+    {:ok, conn} = SurrealDB.Engine.HTTP.request(conn, 1, body, %{})
+
+    {micros, result} = :timer.tc(fn -> SurrealDB.Engine.HTTP.request(conn, 2, "{}", %{}) end)
+    assert {:error, _reason} = result
+    assert micros < 5_000_000
+  end
 end
