@@ -151,6 +151,18 @@ defmodule SurrealDB.ConnectionTest do
     assert {:ok, _} = SurrealDB.select(db, "user")
   end
 
+  test "over JSON, a record id range is refused rather than sent as a plain object" do
+    db = start(codec: :json)
+    range = SurrealDB.RecordIdRange.new("t", {:incl, 1}, {:incl, 5})
+
+    assert {:error, %SurrealDB.Error{kind: :unsupported}} = SurrealDB.select(db, range)
+
+    assert {:error, %SurrealDB.Error{kind: :unsupported}} =
+             SurrealDB.query(db, "SELECT * FROM $r", %{"r" => range})
+
+    assert {:ok, _} = SurrealDB.select(db, "t")
+  end
+
   test "create normalises a bare table name to a Table" do
     db = start()
     {:ok, [record]} = SurrealDB.create(db, "person", %{"name" => "Tobie"})

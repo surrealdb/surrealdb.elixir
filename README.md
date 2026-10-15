@@ -153,7 +153,8 @@ A "thing" passed to `select/2`, `create/3`, and friends can be:
   id, so over the JSON codec a table name with a colon returns an `:unsupported` error.)
 - a `SurrealDB.RecordId` - one record. Parse text with `SurrealDB.RecordId.parse!/1`, or
   wrap it in a `SurrealDB.StringRecordId` to have the server parse it.
-- a `SurrealDB.RecordIdRange` - the records in a range of ids.
+- a `SurrealDB.RecordIdRange` - the records in a range of ids. (CBOR only: over JSON it
+  returns an `:unsupported` error.)
 
 The SDK never guesses that a string is a record id, so a value like `"user:1234"` from user
 input stays a string.

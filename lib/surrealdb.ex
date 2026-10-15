@@ -32,7 +32,8 @@ defmodule SurrealDB do
       `SurrealDB.RecordId.new/2`, or parse text with `SurrealDB.RecordId.parse!/1`.
     * a `SurrealDB.StringRecordId` targets a single record whose id the server parses.
     * a `SurrealDB.RecordIdRange` targets the records in a range of ids, for example
-      `SurrealDB.RecordIdRange.new("person", {:incl, 1}, {:excl, 100})`.
+      `SurrealDB.RecordIdRange.new("person", {:incl, 1}, {:excl, 100})`. JSON has no
+      way to send one, so over the JSON codec it returns an `:unsupported` error.
 
   The SDK never guesses that a string is a record id: a value such as `"user:1234"` read
   from user input stays a string.
