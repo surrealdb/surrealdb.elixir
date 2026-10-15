@@ -366,6 +366,14 @@ defmodule SurrealDB.Connection do
 
   def handle_info({:reconnect, _attempt}, state), do: {:noreply, state}
 
+  def handle_info({:reassert_failed, error}, %{engine_state: engine_state} = state)
+      when not is_nil(engine_state) do
+    message = "could not put the session back on its current authentication: "
+    connection_lost(state, Error.new(:connection, message <> Exception.message(error)))
+  end
+
+  def handle_info({:reassert_failed, _error}, state), do: {:noreply, state}
+
   def handle_info({:renew_access, sid, token}, state) do
     state = %{state | renewals: Map.delete(state.renewals, sid)}
 
@@ -412,7 +420,8 @@ defmodule SurrealDB.Connection do
   end
 
   # Methods whose reply changes what the connection tracks about the session.
-  @session_methods ~w(use signin signup authenticate refresh invalidate reset let set unset)
+  @session_methods ~w(use signin signup authenticate refresh revoke invalidate reset let set
+                      unset)
 
   # A timed-out request on an engine that cannot cancel it (a WebSocket) may still run on
   # the server. If it changes session state, keep it pending with no caller, so its late
@@ -730,7 +739,7 @@ defmodule SurrealDB.Connection do
 
         {:ok, schedule_renewal(state, sid, "authenticate", {:ok, nil})}
 
-      {:error, %Error{kind: :connection} = error, state} ->
+      {:error, %Error{kind: kind} = error, state} when kind in [:connection, :timeout] ->
         {:error, error, state}
 
       {:error, _unusable, state} when is_binary(refresh) ->
@@ -754,18 +763,20 @@ defmodule SurrealDB.Connection do
       {:ok, _tokens, state} ->
         {:ok, update_session(state, sid, &%{&1 | credentials: credentials})}
 
-      {:error, %Error{kind: kind} = error, state} when kind in [:connection, :timeout] ->
-        {:error, error, state}
+      # Only a refusal spends the pair; anything else fails the attempt, to try again.
+      {:error, error, state} ->
+        if refused?(error) do
+          state =
+            update_session(
+              state,
+              sid,
+              &%{&1 | token: nil, refresh_token: nil, credentials: credentials}
+            )
 
-      {:error, _unusable, state} ->
-        state =
-          update_session(
-            state,
-            sid,
-            &%{&1 | token: nil, refresh_token: nil, credentials: credentials}
-          )
-
-        restore_signin(state, sid)
+          restore_signin(state, sid)
+        else
+          {:error, error, state}
+        end
     end
   end
 
@@ -1000,7 +1011,7 @@ defmodule SurrealDB.Connection do
           # Putting the session back on its current auth changes nothing the connection
           # tracks (and `authenticate` would drop the stored refresh token).
           Map.get(meta, :reassert) ->
-            state
+            reassert_result(state, result)
 
           stale_renewal?(state, sid, meta) ->
             drop_stale_renewal(state, sid, result)
@@ -1427,6 +1438,16 @@ defmodule SurrealDB.Connection do
   end
 
   defp drop_stale_renewal(state, _sid, _result), do: state
+
+  # If the server would not take the newer auth back, it may still hold the old one. The
+  # connection cannot tell, so it drops the socket: a reconnect restores every session from
+  # what the connection knows. (Over HTTP the server keeps no session to fix.)
+  defp reassert_result(state, {:error, error}) do
+    if state.engine.supports_live?(), do: send(self(), {:reassert_failed, error})
+    state
+  end
+
+  defp reassert_result(state, _result), do: state
 
   @auth_methods ~w(signin signup authenticate refresh invalidate reset revoke detach)
 
