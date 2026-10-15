@@ -61,9 +61,14 @@ defmodule SurrealDB.Engine.HTTP do
         {:ok, conn} ->
           {:ok, conn}
 
-        # The server closed an idle keep-alive connection before we noticed. Nothing was
-        # sent, so it is safe to open a new connection and try once more.
-        {:error, %{requests: requests} = conn, _reason} when map_size(requests) == 0 ->
+        # The server closed an idle keep-alive connection before we noticed, so writing the
+        # request failed. This is the only error retried: it comes from the write itself,
+        # so the server has at most part of this request, which it cannot run, and there is
+        # no earlier request in flight that could be lost. Errors after a successful write
+        # (while waiting for the response) are never retried, since the server may have
+        # run the request.
+        {:error, %{requests: requests} = conn, %Mint.TransportError{reason: reason}}
+        when map_size(requests) == 0 and reason in [:closed, :epipe, :econnreset, :enotconn] ->
           with {:ok, conn} <- reopen(conn), {:ok, conn} <- send_request(conn, headers, body) do
             {:ok, conn}
           else
