@@ -5,12 +5,34 @@ defmodule SurrealDB.TypesTest do
 
   describe "RecordId" do
     test "parses and renders simple ids" do
-      assert RecordId.parse("person:tobie") == RecordId.new("person", "tobie")
+      assert RecordId.parse!("person:tobie") == RecordId.new("person", "tobie")
       assert RecordId.to_string(RecordId.new("person", "tobie")) == "person:tobie"
     end
 
     test "escapes non-simple identifiers with backticks" do
       assert RecordId.to_string(RecordId.new("person", "complex id")) == "person:`complex id`"
+    end
+
+    test "parses integer keys and quoted parts" do
+      assert RecordId.parse!("person:42") == RecordId.new("person", 42)
+      assert RecordId.parse!("person:-7") == RecordId.new("person", -7)
+      assert RecordId.parse!("person:`42`") == RecordId.new("person", "42")
+      assert RecordId.parse!("person:⟨complex id⟩") == RecordId.new("person", "complex id")
+      assert RecordId.parse!("`my table`:`a\\`b`") == RecordId.new("my table", "a`b")
+    end
+
+    test "rejects strings that are not a table:key pair" do
+      assert {:error, _} = RecordId.parse("person")
+      assert {:error, _} = RecordId.parse("person:")
+      assert {:error, _} = RecordId.parse("person:`unterminated")
+      assert {:error, _} = RecordId.parse("person:a b")
+      assert {:error, _} = RecordId.parse("temp:['london', 2024]")
+
+      # An unquoted table name must be an identifier; quoted it can be anything.
+      assert {:error, _} = RecordId.parse("123:foo")
+      assert {:error, _} = RecordId.parse("-users:foo")
+      assert {:ok, %RecordId{table: "123", id: "foo"}} = RecordId.parse("`123`:foo")
+      assert_raise ArgumentError, fn -> RecordId.parse!("nope") end
     end
 
     test "String.Chars protocol" do

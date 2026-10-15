@@ -25,17 +25,24 @@ defmodule SurrealDB do
 
   Methods such as `select/2` and `create/3` accept a "thing" that identifies what to act on:
 
-    * a `SurrealDB.Table` or a bare string without a colon (for example `"person"`) targets
-      a whole table.
-    * a `SurrealDB.RecordId` or a string with a colon (for example `"person:tobie"`) targets
-      a single record.
+    * a string (for example `"person"`) or a `SurrealDB.Table` targets a whole table. A
+      string is always a table name, even if it contains a colon. JSON cannot tell such a
+      name from a record id, so over the JSON codec it returns an `:unsupported` error.
+    * a `SurrealDB.RecordId` targets a single record. Build one with
+      `SurrealDB.RecordId.new/2`, or parse text with `SurrealDB.RecordId.parse!/1`.
+    * a `SurrealDB.StringRecordId` targets a single record whose id the server parses.
     * a `SurrealDB.Range` targets a record id range.
+
+  The SDK never guesses that a string is a record id: a value such as `"user:1234"` read
+  from user input stays a string.
   """
 
-  alias SurrealDB.{Connection, Error, RecordId, Table, Uuid}
+  alias SurrealDB.{Connection, Error, RecordId, StringRecordId, Table, Uuid}
 
   @type conn :: GenServer.server()
-  @type thing :: String.t() | Table.t() | RecordId.t() | SurrealDB.Range.t()
+  @type thing ::
+          String.t() | Table.t() | RecordId.t() | StringRecordId.t() | SurrealDB.Range.t()
+  @type record_ref :: RecordId.t() | StringRecordId.t()
   @type result :: {:ok, term()} | {:error, Error.t()}
 
   @doc """
@@ -219,11 +226,22 @@ defmodule SurrealDB do
   Creates a graph edge from `from` to `to` through the `relation` table, with optional edge
   `data`.
 
-      SurrealDB.relate(db, "person:tobie", "wrote", "article:surreal", %{year: 2024})
+      alias SurrealDB.RecordId
+      SurrealDB.relate(db, RecordId.new("person", "tobie"), "wrote",
+        RecordId.new("article", "surreal"), %{year: 2024})
+
+  `from` and `to` must be record ids (or lists of them); a string raises `ArgumentError`.
   """
-  @spec relate(conn(), thing(), String.t() | Table.t(), thing(), map()) :: result()
+  @spec relate(
+          conn(),
+          record_ref() | [record_ref()],
+          String.t() | Table.t(),
+          record_ref() | [record_ref()],
+          map()
+        ) ::
+          result()
   def relate(conn, from, relation, to, data \\ %{}) do
-    params = [normalize_thing(from), normalize_thing(relation), normalize_thing(to), data]
+    params = [record!(from), normalize_thing(relation), record!(to), data]
     Connection.call(conn, "relate", params)
   end
 
@@ -305,15 +323,18 @@ defmodule SurrealDB do
   @doc false
   def normalize_thing(%Table{} = table), do: table
   def normalize_thing(%RecordId{} = record), do: record
+  def normalize_thing(%StringRecordId{} = record), do: record
   def normalize_thing(%SurrealDB.Range{} = range), do: range
-
-  def normalize_thing(string) when is_binary(string) do
-    if String.contains?(string, ":") do
-      RecordId.parse(string)
-    else
-      Table.new(string)
-    end
-  end
-
+  def normalize_thing(string) when is_binary(string), do: Table.new(string)
   def normalize_thing(other), do: other
+
+  defp record!(%RecordId{} = record), do: record
+  defp record!(%StringRecordId{} = record), do: record
+  defp record!(records) when is_list(records), do: Enum.map(records, &record!/1)
+
+  defp record!(other) do
+    raise ArgumentError,
+          "expected a SurrealDB.RecordId or SurrealDB.StringRecordId, got: #{inspect(other)}. " <>
+            "Strings are never treated as record ids; use SurrealDB.RecordId.parse!/1."
+  end
 end

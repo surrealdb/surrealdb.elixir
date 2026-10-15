@@ -127,16 +127,37 @@ defmodule SurrealDB.ConnectionTest do
     assert :sys.get_state(db).refresh_token == "refresh.jwt"
   end
 
+  test "over JSON, a table name with a colon is refused rather than read as a record id" do
+    db = start(codec: :json)
+
+    assert {:error, %SurrealDB.Error{kind: :unsupported}} = SurrealDB.select(db, "user:1234")
+    assert {:ok, _} = SurrealDB.select(db, "user")
+  end
+
   test "create normalises a bare table name to a Table" do
     db = start()
     {:ok, [record]} = SurrealDB.create(db, "person", %{"name" => "Tobie"})
     assert record["thing"] == inspect(Table.new("person"))
   end
 
-  test "select normalises a colon string to a RecordId" do
+  test "select treats a string with a colon as a table name, never a record id" do
     db = start()
     {:ok, result} = SurrealDB.select(db, "person:tobie")
-    assert result["selected"] == inspect(RecordId.parse("person:tobie"))
+    assert result["selected"] == inspect(Table.new("person:tobie"))
+  end
+
+  test "select passes record ids through" do
+    db = start()
+    {:ok, result} = SurrealDB.select(db, RecordId.parse!("person:tobie"))
+    assert result["selected"] == inspect(RecordId.new("person", "tobie"))
+  end
+
+  test "relate rejects strings for the endpoints" do
+    db = start()
+
+    assert_raise ArgumentError, ~r/never treated as record ids/, fn ->
+      SurrealDB.relate(db, "person:tobie", "wrote", RecordId.new("article", 1))
+    end
   end
 
   test "query returns one result per statement" do

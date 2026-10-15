@@ -86,18 +86,20 @@ Now any process can call `SurrealDB.query(MyApp.SurrealDB, "...")`.
 
 # Select a whole table, a single record, or a range
 {:ok, people} = SurrealDB.select(db, "person")
-{:ok, one} = SurrealDB.select(db, "person:tobie")
+tobie = SurrealDB.RecordId.new("person", "tobie")
+{:ok, one} = SurrealDB.select(db, tobie)
 
 # Update, merge, patch, delete
-{:ok, _} = SurrealDB.merge(db, "person:tobie", %{active: true})
-{:ok, _} = SurrealDB.patch(db, "person:tobie", [%{"op" => "replace", "path" => "/age", "value" => 31}])
-{:ok, _} = SurrealDB.delete(db, "person:tobie")
+{:ok, _} = SurrealDB.merge(db, tobie, %{active: true})
+{:ok, _} = SurrealDB.patch(db, tobie, [%{"op" => "replace", "path" => "/age", "value" => 31}])
+{:ok, _} = SurrealDB.delete(db, tobie)
 
 # Parameterised queries. Each statement's result is returned in order.
 {:ok, [rows]} = SurrealDB.query(db, "SELECT * FROM person WHERE age > $min", %{min: 18})
 
 # Graph edges
-{:ok, _} = SurrealDB.relate(db, "person:tobie", "wrote", "article:surreal", %{year: 2024})
+article = SurrealDB.RecordId.new("article", "surreal")
+{:ok, _} = SurrealDB.relate(db, tobie, "wrote", article, %{year: 2024})
 
 # Functions
 {:ok, uuid} = SurrealDB.run(db, "rand::uuid")
@@ -105,9 +107,15 @@ Now any process can call `SurrealDB.query(MyApp.SurrealDB, "...")`.
 
 A "thing" passed to `select/2`, `create/3`, and friends can be:
 
-- a bare string without a colon (`"person"`) or a `SurrealDB.Table` - a whole table.
-- a string with a colon (`"person:tobie"`) or a `SurrealDB.RecordId` - one record.
+- a string (`"person"`) or a `SurrealDB.Table` - a whole table. A string is always a
+  table name, even when it contains a colon. (JSON cannot tell such a name from a record
+  id, so over the JSON codec a table name with a colon returns an `:unsupported` error.)
+- a `SurrealDB.RecordId` - one record. Parse text with `SurrealDB.RecordId.parse!/1`, or
+  wrap it in a `SurrealDB.StringRecordId` to have the server parse it.
 - a `SurrealDB.Range` - a record id range.
+
+The SDK never guesses that a string is a record id, so a value like `"user:1234"` from user
+input stays a string.
 
 ## Value types
 

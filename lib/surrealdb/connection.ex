@@ -117,18 +117,9 @@ defmodule SurrealDB.Connection do
 
   @impl true
   def handle_call({:rpc, method, params, meta}, from, state) do
-    {id, state} = next_id(state)
-    payload = encode_request(state, id, method, params)
-
-    case state.engine.request(state.engine_state, id, payload, session(state)) do
-      {:ok, engine_state} ->
-        pending = Map.put(state.pending, id, {from, method, params, meta})
-        {:noreply, %{state | engine_state: engine_state, pending: pending}}
-
-      # A dead WebSocket also reports the close as a transport message, which stops the
-      # connection, so failing just this request is enough here.
-      {:error, reason} ->
-        {:reply, {:error, conn_error(reason)}, state}
+    case json_ambiguous_table(state, params) do
+      nil -> send_rpc(method, params, meta, from, state)
+      error -> {:reply, {:error, error}, state}
     end
   end
 
@@ -451,6 +442,43 @@ defmodule SurrealDB.Connection do
   end
 
   defp next_id(state), do: {state.next_id, %{state | next_id: state.next_id + 1}}
+
+  defp send_rpc(method, params, meta, from, state) do
+    {id, state} = next_id(state)
+    payload = encode_request(state, id, method, params)
+
+    case state.engine.request(state.engine_state, id, payload, session(state)) do
+      {:ok, engine_state} ->
+        pending = Map.put(state.pending, id, {from, method, params, meta})
+        {:noreply, %{state | engine_state: engine_state, pending: pending}}
+
+      # A dead WebSocket also reports the close as a transport message, which stops the
+      # connection, so failing just this request is enough here.
+      {:error, reason} ->
+        {:reply, {:error, conn_error(reason)}, state}
+    end
+  end
+
+  # JSON has no table type: the server reads a string such as "user:1234" as a record id,
+  # so a table name with a colon would silently target a record. Refuse it rather than act
+  # on the wrong thing.
+  defp json_ambiguous_table(%{codec: SurrealDB.Codec.JSON}, params) do
+    Enum.find_value(params, fn
+      %SurrealDB.Table{name: name} when is_binary(name) ->
+        if String.contains?(name, ":") do
+          Error.new(
+            :unsupported,
+            "the table name #{inspect(name)} cannot be sent over JSON, which reads it as a " <>
+              "record id; use the CBOR codec"
+          )
+        end
+
+      _other ->
+        nil
+    end)
+  end
+
+  defp json_ambiguous_table(_state, _params), do: nil
 
   defp encode_request(state, id, method, params) do
     state.codec.encode(RPC.request(id, method, wire_params(state, method, params)))

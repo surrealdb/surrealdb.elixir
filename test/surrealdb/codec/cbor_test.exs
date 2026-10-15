@@ -45,6 +45,10 @@ defmodule SurrealDB.Codec.CBORTest do
       assert roundtrip(RecordId.new("person", 42)) == RecordId.new("person", 42)
     end
 
+    test "StringRecordId encodes as a record id tag holding the text" do
+      assert CBOR.encode(SurrealDB.StringRecordId.new("a:b")) == <<0xC8, 0x63, "a:b">>
+    end
+
     test "Table" do
       assert roundtrip(Table.new("person")) == Table.new("person")
     end

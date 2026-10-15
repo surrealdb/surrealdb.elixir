@@ -8,7 +8,7 @@ defmodule SurrealDB.RecordId do
       iex> SurrealDB.RecordId.new("person", "tobie")
       %SurrealDB.RecordId{table: "person", id: "tobie"}
 
-      iex> SurrealDB.RecordId.parse("person:tobie")
+      iex> SurrealDB.RecordId.parse!("person:tobie")
       %SurrealDB.RecordId{table: "person", id: "tobie"}
   """
 
@@ -24,15 +24,96 @@ defmodule SurrealDB.RecordId do
   def new(table, id) when is_binary(table), do: %__MODULE__{table: table, id: id}
 
   @doc """
-  Parses a `table:id` string. Only string ids are produced. For typed ids build the
-  struct directly with `new/2`.
+  Parses a `table:id` string into a record id.
+
+  Plain identifiers, integer keys, and table or key parts quoted with backticks or `⟨⟩`
+  are supported, which covers every string and integer key the server prints. For array,
+  object, or uuid keys build the struct with `new/2`, or send the string as a
+  `SurrealDB.StringRecordId` and let the server parse it.
+
+      iex> SurrealDB.RecordId.parse("person:tobie")
+      {:ok, %SurrealDB.RecordId{table: "person", id: "tobie"}}
+
+      iex> SurrealDB.RecordId.parse("person:42")
+      {:ok, %SurrealDB.RecordId{table: "person", id: 42}}
+
+      iex> SurrealDB.RecordId.parse("person:`123`")
+      {:ok, %SurrealDB.RecordId{table: "person", id: "123"}}
+
+      iex> SurrealDB.RecordId.parse("person")
+      {:error, "expected `:` after the table name in \"person\""}
   """
-  @spec parse(String.t()) :: t()
+  @spec parse(String.t()) :: {:ok, t()} | {:error, String.t()}
   def parse(string) when is_binary(string) do
-    case String.split(string, ":", parts: 2) do
-      [table, id] -> %__MODULE__{table: table, id: id}
-      [table] -> %__MODULE__{table: table, id: nil}
+    with {:ok, table, rest, _quoted} <- part(string, :table),
+         {:ok, rest} <- colon(rest, string),
+         {:ok, key, "", quoted} <- part(rest, :key) do
+      {:ok, %__MODULE__{table: table, id: key_value(key, quoted)}}
+    else
+      {:ok, _key, _rest, _quoted} ->
+        {:error, "unexpected characters after the key in #{inspect(string)}"}
+
+      {:error, reason} ->
+        {:error, reason}
     end
+  end
+
+  @doc "Like `parse/1`, but raises `ArgumentError` when the string is not a record id."
+  @spec parse!(String.t()) :: t()
+  def parse!(string) do
+    case parse(string) do
+      {:ok, record_id} -> record_id
+      {:error, reason} -> raise ArgumentError, "invalid record id: " <> reason
+    end
+  end
+
+  defp colon(":" <> rest, _string), do: {:ok, rest}
+
+  defp colon(_rest, string),
+    do: {:error, "expected `:` after the table name in #{inspect(string)}"}
+
+  defp part("`" <> rest, _kind), do: quoted(rest, "`", [])
+  defp part("⟨" <> rest, _kind), do: quoted(rest, "⟩", [])
+
+  # An unquoted table name is an identifier: it cannot start with a digit or a minus sign.
+  # An unquoted key can also be an integer.
+  defp part(string, kind) do
+    pattern = if kind == :table, do: ~r/^[a-zA-Z_][a-zA-Z0-9_]*/, else: ~r/^-?[a-zA-Z0-9_]+/
+
+    case Regex.run(pattern, string) do
+      [ident] ->
+        size = byte_size(ident)
+        {:ok, ident, binary_part(string, size, byte_size(string) - size), false}
+
+      nil ->
+        {:error, "expected an identifier at #{inspect(string)}"}
+    end
+  end
+
+  defp quoted("\\" <> <<char::utf8, rest::binary>>, close, acc),
+    do: quoted(rest, close, [unescape(char) | acc])
+
+  defp quoted(<<char::utf8, rest::binary>>, close, acc) do
+    if <<char::utf8>> == close do
+      {:ok, acc |> Enum.reverse() |> IO.iodata_to_binary(), rest, true}
+    else
+      quoted(rest, close, [<<char::utf8>> | acc])
+    end
+  end
+
+  defp quoted("", close, _acc), do: {:error, "missing closing #{close}"}
+
+  defp unescape(?n), do: "\n"
+  defp unescape(?t), do: "\t"
+  defp unescape(?r), do: "\r"
+  defp unescape(?0), do: <<0>>
+  defp unescape(?f), do: "\f"
+  defp unescape(char), do: <<char::utf8>>
+
+  defp key_value(key, true), do: key
+
+  defp key_value(key, false) do
+    if Regex.match?(~r/^-?\d+$/, key), do: String.to_integer(key), else: key
   end
 
   @doc "Returns the canonical `table:id` string representation."
