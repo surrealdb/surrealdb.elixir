@@ -207,6 +207,39 @@ defmodule SurrealDB.ConnectionTest do
       assert_receive {:DOWN, ^ref, :process, ^db, {:shutdown, {:connection_lost, _}}}
     end
 
+    @tag :capture_log
+    test "an internal kill still in flight does not stop the callers being told" do
+      Process.flag(:trap_exit, true)
+      base = responder()
+
+      responder = fn
+        "kill", _params -> :noreply
+        method, params -> base.(method, params)
+      end
+
+      {:ok, db} =
+        SurrealDB.Connection.start_link(
+          url: "ws://mock/rpc",
+          engine: SurrealDB.Engine.Mock,
+          responder: responder
+        )
+
+      subscriber = spawn(fn -> Process.sleep(:infinity) end)
+      {:ok, _live_id} = SurrealDB.live(db, "person", to: subscriber)
+
+      # The last subscriber exits, so the connection sends a kill nobody waits for.
+      Process.exit(subscriber, :kill)
+      wait_for_pending(db)
+
+      task = Task.async(fn -> SurrealDB.Connection.call(db, "hang", []) end)
+      wait_for_pending(db, 2)
+      ref = Process.monitor(db)
+      send(db, :mock_closed)
+
+      assert {:error, %SurrealDB.Error{kind: :connection}} = Task.await(task)
+      assert_receive {:DOWN, ^ref, :process, ^db, {:shutdown, {:connection_lost, _}}}
+    end
+
     test "a reset fails the calls in flight and keeps the process" do
       db = start()
       task = Task.async(fn -> SurrealDB.Connection.call(db, "hang", []) end)
@@ -220,10 +253,10 @@ defmodule SurrealDB.ConnectionTest do
     end
   end
 
-  defp wait_for_pending(db) do
-    if map_size(:sys.get_state(db).pending) == 0 do
+  defp wait_for_pending(db, count \\ 1) do
+    if map_size(:sys.get_state(db).pending) < count do
       Process.sleep(5)
-      wait_for_pending(db)
+      wait_for_pending(db, count)
     end
   end
 
@@ -257,6 +290,112 @@ defmodule SurrealDB.ConnectionTest do
       send(db, {:mock_message, Codec.CBOR.encode(notification)})
 
       assert_receive {:relayed, {:surrealdb, :live, _id, %{action: :update}}}, 1_000
+    end
+  end
+
+  describe "live subscribers" do
+    defp notify(db, action, result \\ %{}) do
+      payload = %{
+        "result" => %{"id" => Uuid.new(@live_uuid), "action" => action, "result" => result}
+      }
+
+      send(db, {:mock_message, Codec.CBOR.encode(payload)})
+    end
+
+    defp spawn_relay do
+      parent = self()
+      spawn(fn -> relay_forever(parent) end)
+    end
+
+    defp relay_forever(parent) do
+      receive do
+        :stop ->
+          :ok
+
+        message ->
+          send(parent, {:relayed, self(), message})
+          relay_forever(parent)
+      end
+    end
+
+    test "subscribe_live adds a subscriber instead of replacing the existing one" do
+      db = start()
+      {:ok, live_id} = SurrealDB.live(db, "person")
+      other = spawn_relay()
+      :ok = SurrealDB.subscribe_live(db, live_id, other)
+
+      notify(db, "CREATE")
+
+      assert_receive {:surrealdb, :live, _, %{action: :create}}
+      assert_receive {:relayed, ^other, {:surrealdb, :live, _, %{action: :create}}}
+    end
+
+    test "unsubscribe_live stops delivery to that pid only" do
+      db = start()
+      {:ok, live_id} = SurrealDB.live(db, "person")
+      other = spawn_relay()
+      :ok = SurrealDB.subscribe_live(db, live_id, other)
+      :ok = SurrealDB.unsubscribe_live(db, live_id)
+
+      notify(db, "UPDATE")
+
+      assert_receive {:relayed, ^other, {:surrealdb, :live, _, %{action: :update}}}
+      refute_receive {:surrealdb, :live, _, _}, 50
+    end
+
+    test "kills the live query when its last subscriber exits" do
+      parent = self()
+
+      responder = fn
+        "live", _params ->
+          {:ok, Uuid.new(@live_uuid)}
+
+        "kill", params ->
+          send(parent, {:killed, params})
+          {:ok, nil}
+
+        _method, _params ->
+          {:ok, nil}
+      end
+
+      db = start(responder: responder)
+      first = spawn_relay()
+      second = spawn_relay()
+      {:ok, live_id} = SurrealDB.live(db, "person", to: first)
+      :ok = SurrealDB.subscribe_live(db, live_id, second)
+
+      send(first, :stop)
+      refute_receive {:killed, _}, 50
+      notify(db, "CREATE")
+      assert_receive {:relayed, ^second, {:surrealdb, :live, _, %{action: :create}}}
+
+      send(second, :stop)
+      assert_receive {:killed, [%Uuid{value: @live_uuid}]}, 1_000
+      assert :sys.get_state(db).live == %{}
+      assert :sys.get_state(db).monitors == %{}
+    end
+
+    test "a KILLED notification is delivered and then the live query is forgotten" do
+      db = start()
+      {:ok, _live_id} = SurrealDB.live(db, "person")
+
+      notify(db, "KILLED", nil)
+      assert_receive {:surrealdb, :live, _, %{action: :killed}}
+
+      notify(db, "CREATE")
+      refute_receive {:surrealdb, :live, _, _}, 50
+      assert :sys.get_state(db).live == %{}
+      assert :sys.get_state(db).monitors == %{}
+    end
+
+    test "a reply whose result has an action field is still a reply" do
+      responder = fn
+        "select", _params -> {:ok, %{"id" => "log:1", "action" => "login"}}
+        _method, _params -> {:ok, nil}
+      end
+
+      db = start(responder: responder)
+      assert {:ok, %{"action" => "login"}} = SurrealDB.select(db, RecordId.new("log", 1))
     end
   end
 

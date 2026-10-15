@@ -220,6 +220,42 @@ defmodule SurrealDB.IntegrationTest do
     assert {:ok, [1, 3]} = SurrealDB.query(db, "RETURN 1; RETURN 3")
   end
 
+  describe "live subscribers" do
+    test "every subscriber gets notifications, and KILLED ends the live query" do
+      db = connect()
+      {:ok, _} = SurrealDB.query(db, "DEFINE TABLE watched")
+      {:ok, live_id} = SurrealDB.live(db, "watched")
+
+      parent = self()
+
+      other =
+        spawn(fn ->
+          receive do
+            message -> send(parent, {:other, message})
+          end
+        end)
+
+      :ok = SurrealDB.subscribe_live(db, live_id, other)
+      {:ok, _} = SurrealDB.create(db, "watched", %{"value" => 1})
+
+      assert_receive {:surrealdb, :live, _, %{action: :create, record: %SurrealDB.RecordId{}}},
+                     2_000
+
+      assert_receive {:other, {:surrealdb, :live, _, %{action: :create}}}, 2_000
+
+      {:ok, _} = SurrealDB.query(db, "REMOVE TABLE watched")
+      assert_receive {:surrealdb, :live, _, %{action: :killed}}, 2_000
+      assert :sys.get_state(db).live == %{}
+    end
+
+    test "selecting a record with an action field returns it" do
+      db = connect()
+      id = SurrealDB.RecordId.new("log", 1)
+      {:ok, _} = SurrealDB.create(db, id, %{"action" => "login"})
+      assert {:ok, %{"action" => "login"}} = SurrealDB.select(db, id)
+    end
+  end
+
   test "works over the HTTP engine too" do
     http_url = String.replace(@url, ~r/^ws/, "http")
     db = connect(url: http_url)

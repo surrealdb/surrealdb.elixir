@@ -288,7 +288,12 @@ defmodule SurrealDB do
 
   Notifications are delivered to the subscriber process as messages:
 
-      {:surrealdb, :live, live_id, %{action: :create | :update | :delete, result: record}}
+      {:surrealdb, :live, live_id,
+       %{action: :create | :update | :delete | :killed, result: value, record: record_id}}
+
+  `:killed` is the last message for a live query: the server ended it (for example the
+  table was removed), and the connection forgets it. Subscribers are monitored; when the
+  last subscriber of a live query exits, the connection kills the live query.
 
   ## Options
 
@@ -304,10 +309,22 @@ defmodule SurrealDB do
     Connection.call(conn, "live", [normalize_thing(table), diff], meta: %{subscriber: subscriber})
   end
 
-  @doc "Registers `pid` to also receive notifications for an existing live query id."
+  @doc """
+  Adds `pid` to the processes that receive notifications for an existing live query id.
+  Existing subscribers keep receiving them too.
+  """
   @spec subscribe_live(conn(), Uuid.t() | String.t(), pid()) :: :ok
   def subscribe_live(conn, live_id, pid \\ self()) do
     Connection.subscribe_live(conn, live_id, pid)
+  end
+
+  @doc """
+  Stops delivering notifications for a live query to `pid`. The live query keeps running
+  on the server; use `kill/2` to stop it.
+  """
+  @spec unsubscribe_live(conn(), Uuid.t() | String.t(), pid()) :: :ok
+  def unsubscribe_live(conn, live_id, pid \\ self()) do
+    Connection.unsubscribe_live(conn, live_id, pid)
   end
 
   @doc "Stops a live query."
