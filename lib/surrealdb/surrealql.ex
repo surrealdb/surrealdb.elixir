@@ -74,7 +74,13 @@ defmodule SurrealDB.SurrealQL do
   def to_surql(integer) when is_integer(integer), do: Integer.to_string(integer)
   def to_surql(float) when is_float(float), do: format_float(float) <> "f"
   def to_surql(atom) when is_atom(atom), do: to_surql(Atom.to_string(atom))
-  def to_surql(%Uuid{value: value}), do: "u'" <> value <> "'"
+  # `Uuid.new/1` takes any string, so check the value before it goes into a literal: a
+  # quote in it would end the literal early.
+  def to_surql(%Uuid{value: value}) do
+    if Regex.match?(~r/\A[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\z/, value),
+      do: "u'" <> value <> "'",
+      else: raise(ArgumentError, "not a UUID: #{inspect(value)}")
+  end
 
   def to_surql(%RecordId{table: table, id: id}),
     do: escape_ident(table) <> ":" <> format_rid_key(id)

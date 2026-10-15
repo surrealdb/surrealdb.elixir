@@ -36,6 +36,19 @@ defmodule SurrealDB.SurrealQLTest do
     assert SurrealQL.to_surql(~U[1969-12-31 23:59:59.250000Z]) == "d'1969-12-31T23:59:59.25Z'"
   end
 
+  test "refuses a UUID value that is not a UUID" do
+    uuid = "0190d6f2-8b1e-7000-8000-000000000abc"
+    assert SurrealQL.to_surql(SurrealDB.Uuid.new(uuid)) == "u'#{uuid}'"
+
+    assert_raise ArgumentError, fn ->
+      SurrealQL.to_surql(SurrealDB.Uuid.new(uuid <> "' OR true --"))
+    end
+
+    assert_raise ArgumentError, fn ->
+      SurrealQL.to_surql(RecordId.new("t", SurrealDB.Uuid.new("x'")))
+    end
+  end
+
   test "renders ranges" do
     assert SurrealQL.to_surql(Range.new({:incl, 1}, {:excl, 5})) == "1..5"
     assert SurrealQL.to_surql(Range.new({:excl, 1}, {:incl, 5})) == "1>..=5"
