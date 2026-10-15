@@ -19,11 +19,24 @@ defmodule SurrealDB.Datetime do
   @spec from_unix(integer(), non_neg_integer()) :: t()
   def from_unix(seconds, nanos \\ 0), do: %__MODULE__{seconds: seconds, nanos: nanos}
 
-  @doc "Builds a datetime from a native `DateTime`."
+  @doc """
+  Builds a datetime from a native `DateTime`.
+
+  Before 1970 the seconds are negative and the nanoseconds still count forwards from
+  them, so `nanos` is always in `0..999_999_999`.
+  """
   @spec from_datetime(DateTime.t()) :: t()
   def from_datetime(%DateTime{} = dt) do
-    nanos = DateTime.to_unix(dt, :nanosecond)
-    %__MODULE__{seconds: div(nanos, 1_000_000_000), nanos: rem(nanos, 1_000_000_000)}
+    dt |> DateTime.to_unix(:nanosecond) |> from_unix_nanos()
+  end
+
+  @doc "Builds a datetime from nanoseconds since the Unix epoch."
+  @spec from_unix_nanos(integer()) :: t()
+  def from_unix_nanos(nanos) when is_integer(nanos) do
+    %__MODULE__{
+      seconds: Integer.floor_div(nanos, 1_000_000_000),
+      nanos: Integer.mod(nanos, 1_000_000_000)
+    }
   end
 
   @doc """
