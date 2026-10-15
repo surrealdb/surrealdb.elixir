@@ -210,6 +210,34 @@ defmodule SurrealDB.SessionTest do
       assert_receive {:rpc, "signin", [_credentials], ^fork, nil}, 5_000
     end
 
+    test "a session whose restore times out is kept, and the reconnect tried again" do
+      parent = self()
+      base = responder(parent)
+
+      responder = fn
+        # The session's `use` while restoring: answer it only on the second attempt.
+        "use", params, %{"session" => sid} = request when not is_nil(sid) ->
+          n = Process.put(:session_uses, (Process.get(:session_uses) || 0) + 1) || 0
+          if n == 1, do: :noreply, else: base.("use", params, request)
+
+        method, params, request ->
+          base.(method, params, request)
+      end
+
+      db = start(responder: responder, connect_timeout: 200)
+      {:ok, %Session{id: %Uuid{value: id}} = session} = SurrealDB.new_session(db)
+      {:ok, _} = SurrealDB.use(session, namespace: "ns", database: "db")
+      :ok = SurrealDB.subscribe_status(db)
+      send(db, :mock_closed)
+
+      assert_receive {:surrealdb, :status, :reconnecting,
+                      %{attempt: 2, error: %{kind: :timeout}}},
+                     5_000
+
+      assert_receive {:surrealdb, :status, :connected, %{attempt: 2}}, 5_000
+      assert Map.has_key?(:sys.get_state(db).sessions, id)
+    end
+
     test "a session attached again but not restored is detached" do
       parent = self()
       db = start()
@@ -345,6 +373,16 @@ defmodule SurrealDB.SessionTest do
           raise "boom"
         end)
       end
+    end
+
+    test "a session cannot be started or forked from a transaction" do
+      db = start()
+      {:ok, txn} = SurrealDB.begin(db)
+      drain()
+
+      assert {:error, %Error{kind: :unsupported}} = SurrealDB.new_session(txn)
+      assert {:error, %Error{kind: :unsupported}} = SurrealDB.fork_session(txn)
+      refute_received {:rpc, "attach", _, _, _}
     end
 
     test "transactions cannot be nested" do

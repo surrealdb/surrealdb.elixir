@@ -659,7 +659,8 @@ defmodule SurrealDB.Connection do
         {:ok, state} ->
           {:cont, {:ok, state}}
 
-        {:error, %Error{kind: :connection} = error, state} ->
+        # A slow server is not a refusal; the reconnect attempt is tried again.
+        {:error, %Error{kind: kind} = error, state} when kind in [:connection, :timeout] ->
           {:halt, {:error, error, state}}
 
         {:error, error, state} ->
@@ -672,7 +673,7 @@ defmodule SurrealDB.Connection do
   # A session that was attached again but could not be restored is dropped. Detach it
   # (without waiting) so it does not stay attached on the server, out of reach.
   defp detach_on_error({:error, %Error{kind: kind} = error, state}, sid)
-       when kind != :connection do
+       when kind not in [:connection, :timeout] do
     {id, state} = next_id(state)
 
     case send_request(state, id, nil, "detach", [], %{session: sid}) do
