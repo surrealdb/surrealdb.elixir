@@ -102,6 +102,11 @@ defmodule SurrealDB.Connection do
 
   @default_reconnect [attempts: 5, delay: 1_000, max_delay: 60_000, multiplier: 2.0, jitter: 0.1]
 
+  # The methods a transaction runs. The rest change session state (`use`, `signin`, `let`,
+  # ...), start or end live queries, or run outside any transaction on the server.
+  @txn_methods ~w(query select create insert insert_relation update upsert merge patch delete
+                  relate gql graphql info version ping)
+
   @doc "Starts a connection process. See `SurrealDB.start_link/1` for the options."
   @spec start_link(keyword()) :: GenServer.on_start()
   def start_link(opts) do
@@ -118,7 +123,12 @@ defmodule SurrealDB.Connection do
   `{:error, %SurrealDB.Error{kind: :timeout}}`; the server may still finish it.
   """
   @spec call(handle(), String.t(), list(), keyword()) :: {:ok, term()} | {:error, Error.t()}
-  def call(handle, method, params, opts \\ []) do
+  def call(handle, method, params, opts \\ [])
+
+  def call(%SurrealDB.Transaction{}, method, _params, _opts) when method not in @txn_methods,
+    do: {:error, Error.new(:unsupported, "#{method} cannot run in a transaction")}
+
+  def call(handle, method, params, opts) do
     {server, session, txn} = target(handle)
     meta = Keyword.get(opts, :meta, %{})
     meta = if opts[:timeout], do: Map.put(meta, :timeout, opts[:timeout]), else: meta
@@ -620,7 +630,7 @@ defmodule SurrealDB.Connection do
     Enum.reduce_while(state.session_order, {:ok, state}, fn sid, {:ok, state} ->
       result =
         case rpc_sync(state, "attach", [], sid) do
-          {:ok, _result, state} -> restore_session(state, sid)
+          {:ok, _result, state} -> restore_session(state, sid) |> detach_on_error(sid)
           {:error, error, state} -> {:error, error, state}
         end
 
@@ -638,8 +648,20 @@ defmodule SurrealDB.Connection do
     end)
   end
 
-  # Use the token if the server still accepts it, otherwise sign in again with the stored
-  # credentials. If neither works the session carries on signed out.
+  # A session that was attached again but could not be restored is dropped. Detach it
+  # (without waiting) so it does not stay attached on the server, out of reach.
+  defp detach_on_error({:error, %Error{kind: kind} = error, state}, sid)
+       when kind != :connection do
+    {id, state} = next_id(state)
+
+    case send_request(state, id, nil, "detach", [], %{session: sid}) do
+      {:ok, state} -> {:error, error, state}
+      {:error, _error, state} -> {:error, error, state}
+    end
+  end
+
+  defp detach_on_error(result, _sid), do: result
+
   # Use the token if the server still accepts it, otherwise sign in again with the stored
   # credentials. If neither works the session carries on signed out.
   defp restore_auth(state, sid) do
@@ -1037,7 +1059,8 @@ defmodule SurrealDB.Connection do
 
         if MapSet.size(remaining) == 0 do
           server_id = Map.get(state.live_current, id, id)
-          state |> drop_live(id) |> kill_orphan(server_id)
+          {sid, _params} = Map.get(state.live_specs, id, {nil, nil})
+          state |> drop_live(id) |> kill_orphan(server_id, sid)
         else
           %{state | live: Map.put(state.live, id, remaining)}
         end
@@ -1047,12 +1070,14 @@ defmodule SurrealDB.Connection do
     end)
   end
 
-  defp kill_orphan(%{status: :reconnecting} = state, _server_id), do: state
+  defp kill_orphan(%{status: :reconnecting} = state, _server_id, _sid), do: state
 
-  defp kill_orphan(state, server_id) do
+  # The live query belongs to a session, and only that session can kill it.
+  defp kill_orphan(state, server_id, sid) do
     {id, state} = next_id(state)
+    params = [SurrealDB.Uuid.new(server_id)]
 
-    case send_request(state, id, nil, "kill", [SurrealDB.Uuid.new(server_id)], %{}) do
+    case send_request(state, id, nil, "kill", params, %{session: sid}) do
       {:ok, state} -> state
       {:error, _error, state} -> state
     end

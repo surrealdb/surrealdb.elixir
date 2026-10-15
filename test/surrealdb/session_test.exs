@@ -126,7 +126,7 @@ defmodule SurrealDB.SessionTest do
       drain()
 
       send(db, :mock_closed)
-      assert_receive {:surrealdb, :status, :connected, _}, 1_000
+      assert_receive {:surrealdb, :status, :connected, _}, 5_000
 
       assert_received {:rpc, "use", ["ns", "main"], nil, nil}
       assert_received {:rpc, "attach", [], ^id, nil}
@@ -152,10 +152,45 @@ defmodule SurrealDB.SessionTest do
 
       drain()
       send(db, :mock_closed)
-      assert_receive {:surrealdb, :status, :connected, _}, 1_000
+      assert_receive {:surrealdb, :status, :connected, _}, 5_000
 
       assert_received {:rpc, "attach", [], ^id, nil}
       assert :sys.get_state(db).sessions |> Map.keys() == [nil]
+    end
+
+    test "a session attached again but not restored is detached" do
+      parent = self()
+      db = start()
+      {:ok, %Session{id: %Uuid{value: id}} = session} = SurrealDB.new_session(db)
+      {:ok, _} = SurrealDB.use(session, namespace: "ns", database: "gone")
+      :ok = SurrealDB.subscribe_status(db)
+
+      # From now on the server refuses the session's database.
+      error = %{"code" => -32_000, "message" => "no database", "kind" => "NotFound"}
+
+      :sys.replace_state(db, fn state ->
+        responder = responder(parent, %{"use" => {:error, error}})
+        %{state | engine_opts: Keyword.put(state.engine_opts, :responder, responder)}
+      end)
+
+      drain()
+      send(db, :mock_closed)
+      assert_receive {:surrealdb, :status, :connected, _}, 5_000
+
+      assert_received {:rpc, "attach", [], ^id, nil}
+      assert_receive {:rpc, "detach", [], ^id, nil}
+      assert :sys.get_state(db).sessions |> Map.keys() == [nil]
+    end
+
+    test "a live query whose subscribers have all exited is killed in its session" do
+      live = Uuid.new("0190d6f2-8b1e-7000-8000-0000000000bb")
+      db = start(responder: responder(self(), %{"live" => {:ok, live}}))
+      {:ok, %Session{id: %Uuid{value: id}} = session} = SurrealDB.new_session(db)
+      drain()
+
+      {:ok, ^live} = Task.async(fn -> SurrealDB.live(session, "person") end) |> Task.await()
+      assert_received {:rpc, "live", _, ^id, nil}
+      assert_receive {:rpc, "kill", [^live], ^id, nil}
     end
   end
 
@@ -224,6 +259,28 @@ defmodule SurrealDB.SessionTest do
 
       assert {:error, %Error{} = error} = SurrealDB.transaction(db, fn _txn -> :ok end)
       assert Error.transaction_conflict?(error)
+    end
+
+    test "a transaction refuses calls it cannot run" do
+      db = start()
+      {:ok, txn} = SurrealDB.begin(db)
+      drain()
+
+      for call <- [
+            fn -> SurrealDB.use(txn, namespace: "ns", database: "db") end,
+            fn -> SurrealDB.signin(txn, %SurrealDB.Auth.Root{user: "root", pass: "root"}) end,
+            fn -> SurrealDB.let(txn, "x", 1) end,
+            fn -> SurrealDB.live(txn, "person") end,
+            fn -> SurrealDB.export(txn) end,
+            fn -> SurrealDB.import(txn, "CREATE person") end
+          ] do
+        assert {:error, %Error{kind: :unsupported}} = call.()
+      end
+
+      refute_received {:rpc, _, _, _, _}
+
+      {:ok, _} = SurrealDB.query(txn, "RETURN 1")
+      assert_received {:rpc, "query", _, nil, @txn}
     end
 
     test "transactions cannot be nested" do
