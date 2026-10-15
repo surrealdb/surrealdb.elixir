@@ -16,7 +16,15 @@ defmodule SurrealDB.Duration do
 
   @type t :: %__MODULE__{nanoseconds: non_neg_integer()}
   @type unit ::
-          :nanosecond | :microsecond | :millisecond | :second | :minute | :hour | :day | :week
+          :nanosecond
+          | :microsecond
+          | :millisecond
+          | :second
+          | :minute
+          | :hour
+          | :day
+          | :week
+          | :year
 
   @units %{
     nanosecond: 1,
@@ -26,7 +34,8 @@ defmodule SurrealDB.Duration do
     minute: 60 * 1_000_000_000,
     hour: 3_600 * 1_000_000_000,
     day: 86_400 * 1_000_000_000,
-    week: 7 * 86_400 * 1_000_000_000
+    week: 7 * 86_400 * 1_000_000_000,
+    year: 365 * 86_400 * 1_000_000_000
   }
 
   @doc "Builds a duration from an amount and unit (defaults to nanoseconds)."
@@ -46,13 +55,14 @@ defmodule SurrealDB.Duration do
   def to_parts(%__MODULE__{nanoseconds: ns}), do: {div(ns, 1_000_000_000), rem(ns, 1_000_000_000)}
 
   @doc """
-  Parses a SurrealDB duration string such as `"2w"`, `"1h30m"`, or `"500ms"`.
-  Supported suffixes: `ns`, `us`/`µs`, `ms`, `s`, `m`, `h`, `d`, `w`.
+  Parses a SurrealDB duration string such as `"1y"`, `"2w"`, `"1h30m"`, or `"500ms"`.
+  Supported suffixes: `ns`, `us`/`µs`, `ms`, `s`, `m`, `h`, `d`, `w`, `y`. A year is 365
+  days, as in SurrealDB.
   """
   @spec parse(String.t()) :: t()
   def parse(string) when is_binary(string) do
     nanos =
-      ~r/(\d+)(ns|us|µs|ms|s|m|h|d|w)/
+      ~r/(\d+)(ns|us|µs|ms|s|m|h|d|w|y)/u
       |> Regex.scan(string)
       |> Enum.reduce(0, fn [_, amount, suffix], acc ->
         acc + String.to_integer(amount) * suffix_to_nanos(suffix)
@@ -70,6 +80,7 @@ defmodule SurrealDB.Duration do
   defp suffix_to_nanos("h"), do: @units.hour
   defp suffix_to_nanos("d"), do: @units.day
   defp suffix_to_nanos("w"), do: @units.week
+  defp suffix_to_nanos("y"), do: @units.year
 
   defimpl Inspect do
     import Inspect.Algebra
