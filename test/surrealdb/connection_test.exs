@@ -252,6 +252,22 @@ defmodule SurrealDB.ConnectionTest do
       assert SurrealDB.info_session(db).transport_opts == [verify: :verify_none]
     end
 
+    test "a close that arrives with the version reply fails startup" do
+      Process.flag(:trap_exit, true)
+
+      responder = fn
+        "version", _params -> {:closing, "surrealdb-3.3.4"}
+        _method, _params -> {:ok, nil}
+      end
+
+      assert {:error, %SurrealDB.Error{kind: :connection}} =
+               SurrealDB.Connection.start_link(
+                 url: "ws://mock/rpc",
+                 engine: SurrealDB.Engine.Mock,
+                 responder: responder
+               )
+    end
+
     test "unrelated transport traffic does not push back the setup deadline" do
       Process.flag(:trap_exit, true)
 
@@ -379,6 +395,22 @@ defmodule SurrealDB.ConnectionTest do
       info = SurrealDB.info_session(db)
       assert {info.namespace, info.database} == {"ns", "db"}
       assert :sys.get_state(db).pending == %{}
+    end
+
+    test "a timed-out let still records the parameter when its reply arrives late" do
+      responder = fn
+        "let", _params -> :noreply
+        "version", _params -> {:ok, "surrealdb-3.3.4"}
+        _method, params -> {:ok, params}
+      end
+
+      db = start(responder: responder, timeout: 50)
+      assert {:error, %SurrealDB.Error{kind: :timeout}} = SurrealDB.let(db, "x", 1)
+
+      [id] = Map.keys(:sys.get_state(db).pending)
+      send(db, {:mock_message, Codec.CBOR.encode(%{"id" => id, "result" => nil})})
+
+      assert :sys.get_state(db).sessions[nil].vars == %{"x" => 1}
     end
 
     test "a live query that starts after its call timed out is killed" do
