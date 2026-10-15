@@ -206,10 +206,21 @@ defmodule SurrealDB.Connection do
   # A timed-out request on an engine that cannot cancel it (a WebSocket) may still run on
   # the server. If it changes session state, keep it pending with no caller, so its late
   # reply still updates the namespace, database, and auth the connection reports and sends.
+  # A late `live` reply starts a query nobody listens to, so it is killed.
   defp await_late_reply(state, pending, id, method, params, meta) do
-    if method in @session_methods and not function_exported?(state.engine, :cancel, 2),
-      do: Map.put(pending, id, {nil, method, params, Map.delete(meta, :timer)}),
-      else: pending
+    cond do
+      function_exported?(state.engine, :cancel, 2) ->
+        pending
+
+      method == "live" ->
+        Map.put(pending, id, {nil, method, params, %{late_live: true}})
+
+      method in @session_methods ->
+        Map.put(pending, id, {nil, method, params, Map.delete(meta, :timer)})
+
+      true ->
+        pending
+    end
   end
 
   defp handle_transport(message, state) do
@@ -495,6 +506,9 @@ defmodule SurrealDB.Connection do
     # removed table, a revoked principal), so forget it and its subscribers.
     if action == :killed, do: drop_live(state, id), else: state
   end
+
+  defp register_live(state, "live", %{late_live: true}, {:ok, live_id}),
+    do: kill_orphan(state, normalize_id(live_id))
 
   defp register_live(state, "live", %{subscriber: pid}, {:ok, live_id}) when is_pid(pid) do
     add_subscriber(state, normalize_id(live_id), pid)
