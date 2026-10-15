@@ -650,7 +650,8 @@ defmodule SurrealDB.Connection do
         {:ok, _server_id, state} ->
           {:cont, {:ok, state}}
 
-        {:error, %Error{kind: :connection} = error, state} ->
+        # A slow reply is not a refusal: the server may have started it. Try again.
+        {:error, %Error{kind: kind} = error, state} when kind in [:connection, :timeout] ->
           {:halt, {:error, error, state}}
 
         {:error, error, state} ->
@@ -722,17 +723,24 @@ defmodule SurrealDB.Connection do
 
           {:closed, state} ->
             error = Error.new(:connection, "connection closed")
-            finish_sync({:error, error, fail_pending(state, error)}, stash)
+            finish_sync({:error, error, fail_sync(state, id, error)}, stash)
         end
 
       {:error, reason, engine_state} ->
         error = conn_error(reason)
 
         finish_sync(
-          {:error, error, fail_pending(%{state | engine_state: engine_state}, error)},
+          {:error, error, fail_sync(%{state | engine_state: engine_state}, id, error)},
           stash
         )
     end
+  end
+
+  # Failing the pending requests also files this one's result under `sync`; nothing will
+  # read it, so drop it rather than keep one per failed attempt.
+  defp fail_sync(state, id, error) do
+    state = fail_pending(state, error)
+    %{state | sync: Map.delete(state.sync, id)}
   end
 
   # While a reconnect restores the session, calls join the queue at once (so their timers

@@ -376,6 +376,45 @@ defmodule SurrealDB.ReconnectTest do
     assert System.monotonic_time(:millisecond) - started < 1_500
   end
 
+  test "a restarted live query that times out retries the reconnect instead of ending" do
+    responder =
+      on_reconnect(self(), "live", fn
+        1, _params -> :noreply
+        _n, _params -> :default
+      end)
+
+    db = start(responder: responder, connect_timeout: 200)
+    {:ok, live_id} = SurrealDB.live(db, "person")
+    :ok = SurrealDB.subscribe_status(db)
+    send(db, :mock_closed)
+
+    assert_receive {:surrealdb, :status, :reconnecting, %{attempt: 2, error: %{kind: :timeout}}},
+                   3_000
+
+    assert_receive {:surrealdb, :status, :connected, %{attempt: 2}}, 3_000
+    refute_received {:surrealdb, :live, ^live_id, %{action: :killed}}
+    assert Map.has_key?(:sys.get_state(db).live_specs, live_id.value)
+  end
+
+  test "a socket that closes during a restore leaves no stale sync result behind" do
+    responder =
+      on_reconnect(self(), "version", fn
+        n, _params when n in [1, 2] ->
+          send(self(), :mock_closed)
+          :noreply
+
+        _n, _params ->
+          :default
+      end)
+
+    db = start(responder: responder)
+    :ok = SurrealDB.subscribe_status(db)
+    send(db, :mock_closed)
+
+    assert_receive {:surrealdb, :status, :connected, %{attempt: 3}}, 3_000
+    assert :sys.get_state(db).sync == %{}
+  end
+
   test "backoff stops growing at the cap, however many attempts" do
     config = [delay: 1_000, max_delay: 60_000, multiplier: 2.0, jitter: 0.0]
     assert Connection.backoff(config, 5_000) == 60_000
