@@ -262,7 +262,7 @@ defmodule SurrealDB.Connection do
         message = "sessions and transactions need a WebSocket connection"
         {:reply, {:error, Error.new(:unsupported, message)}, state}
 
-      error = json_ambiguous_table(state, params) ->
+      error = json_unsupported(state, params) ->
         {:reply, {:error, error}, state}
 
       true ->
@@ -1687,10 +1687,11 @@ defmodule SurrealDB.Connection do
 
   defp wire_params(_state, _sid, _method, params), do: params
 
-  # JSON has no table type: the server reads a string such as "user:1234" as a record id,
-  # so a table name with a colon would silently target a record. Refuse it rather than act
-  # on the wrong thing.
-  defp json_ambiguous_table(%{codec: SurrealDB.Codec.JSON}, params) do
+  # Values JSON cannot carry faithfully. It has no table type: the server reads a string
+  # such as "user:1234" as a record id, so a table name with a colon would silently target
+  # a record. Nor has it a record id range: "t:1..=5" reads as the record t:1. Refuse them
+  # rather than act on the wrong thing.
+  defp json_unsupported(%{codec: SurrealDB.Codec.JSON}, params) do
     Enum.find_value(params, fn
       %SurrealDB.Table{name: name} when is_binary(name) ->
         if String.contains?(name, ":") do
@@ -1701,12 +1702,27 @@ defmodule SurrealDB.Connection do
           )
         end
 
-      _other ->
-        nil
+      other ->
+        if contains_range?(other) do
+          Error.new(
+            :unsupported,
+            "a SurrealDB.RecordIdRange cannot be sent over JSON; use the CBOR codec, or " <>
+              "write the range in a query"
+          )
+        end
     end)
   end
 
-  defp json_ambiguous_table(_state, _params), do: nil
+  defp json_unsupported(_state, _params), do: nil
+
+  defp contains_range?(%SurrealDB.RecordIdRange{}), do: true
+  defp contains_range?(list) when is_list(list), do: Enum.any?(list, &contains_range?/1)
+  defp contains_range?(%MapSet{} = set), do: Enum.any?(set, &contains_range?/1)
+  # The JSON codec sends other structs as maps of their fields, so look at those too.
+  defp contains_range?(%_struct{} = struct), do: struct |> Map.from_struct() |> contains_range?()
+  defp contains_range?(map) when is_map(map), do: Enum.any?(map, &contains_range?/1)
+  defp contains_range?({key, value}), do: contains_range?(key) or contains_range?(value)
+  defp contains_range?(_other), do: false
 
   defp decode(state, binary), do: state.codec.decode(binary)
 

@@ -31,7 +31,9 @@ defmodule SurrealDB do
     * a `SurrealDB.RecordId` targets a single record. Build one with
       `SurrealDB.RecordId.new/2`, or parse text with `SurrealDB.RecordId.parse!/1`.
     * a `SurrealDB.StringRecordId` targets a single record whose id the server parses.
-    * a `SurrealDB.Range` targets a record id range.
+    * a `SurrealDB.RecordIdRange` targets the records in a range of ids, for example
+      `SurrealDB.RecordIdRange.new("person", {:incl, 1}, {:excl, 100})`. JSON has no
+      way to send one, so over the JSON codec it returns an `:unsupported` error.
 
   The SDK never guesses that a string is a record id: a value such as `"user:1234"` read
   from user input stays a string.
@@ -48,7 +50,12 @@ defmodule SurrealDB do
   """
   @type conn :: GenServer.server() | SurrealDB.Session.t() | Transaction.t()
   @type thing ::
-          String.t() | Table.t() | RecordId.t() | StringRecordId.t() | SurrealDB.Range.t()
+          String.t()
+          | Table.t()
+          | RecordId.t()
+          | StringRecordId.t()
+          | SurrealDB.RecordIdRange.t()
+          | SurrealDB.Range.t()
   @type record_ref :: RecordId.t() | StringRecordId.t()
   @type result :: {:ok, term()} | {:error, Error.t()}
 

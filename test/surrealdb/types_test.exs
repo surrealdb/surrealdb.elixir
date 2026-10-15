@@ -3,6 +3,9 @@ defmodule SurrealDB.TypesTest do
 
   alias SurrealDB.{Duration, RecordId, Uuid}
 
+  doctest SurrealDB.FileRef
+  doctest SurrealDB.RecordIdRange
+
   describe "RecordId" do
     test "parses and renders simple ids" do
       assert RecordId.parse!("person:tobie") == RecordId.new("person", "tobie")

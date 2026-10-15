@@ -3,6 +3,11 @@ defmodule SurrealDB.ConnectionTest do
 
   alias SurrealDB.{Codec, RecordId, Table, Uuid}
 
+  defmodule Wrapper do
+    @moduledoc false
+    defstruct [:range]
+  end
+
   @live_uuid "0190d6f2-8b1e-7000-8000-000000000001"
 
   defp responder do
@@ -149,6 +154,21 @@ defmodule SurrealDB.ConnectionTest do
 
     assert {:error, %SurrealDB.Error{kind: :unsupported}} = SurrealDB.select(db, "user:1234")
     assert {:ok, _} = SurrealDB.select(db, "user")
+  end
+
+  test "over JSON, a record id range is refused rather than sent as a plain object" do
+    db = start(codec: :json)
+    range = SurrealDB.RecordIdRange.new("t", {:incl, 1}, {:incl, 5})
+
+    assert {:error, %SurrealDB.Error{kind: :unsupported}} = SurrealDB.select(db, range)
+
+    assert {:error, %SurrealDB.Error{kind: :unsupported}} =
+             SurrealDB.query(db, "SELECT * FROM $r", %{"r" => range})
+
+    assert {:error, %SurrealDB.Error{kind: :unsupported}} =
+             SurrealDB.query(db, "SELECT * FROM $r", %{"r" => %Wrapper{range: range}})
+
+    assert {:ok, _} = SurrealDB.select(db, "t")
   end
 
   test "create normalises a bare table name to a Table" do
