@@ -28,7 +28,8 @@ defmodule SurrealDB.Connection do
     2. authentication: the access token, or signing in again with the credentials the
        session last signed in with,
     3. the namespace and database,
-    4. connection parameters set with `SurrealDB.let/3`,
+    4. connection parameters set with `SurrealDB.let/3`. If one cannot be set again, the
+       attempt fails and the next one starts after the backoff,
     5. live queries started with `SurrealDB.live/3`. Each one is started again on the
        server, and its notifications keep arriving under the live query id the caller
        already has.
@@ -197,22 +198,12 @@ defmodule SurrealDB.Connection do
   end
 
   @impl true
-  def handle_call({:rpc, method, params, meta}, from, %{status: :reconnecting} = state) do
-    {id, state} = next_id(state)
-    meta = start_timer(meta, id, Map.get(meta, :timeout, state.timeout))
-    {:noreply, %{state | queue: [{id, from, method, params, meta} | state.queue]}}
-  end
-
   def handle_call({:rpc, method, params, meta}, from, state) do
     case json_ambiguous_table(state, params) do
       nil ->
         {id, state} = next_id(state)
         meta = start_timer(meta, id, Map.get(meta, :timeout, state.timeout))
-
-        case send_request(state, id, from, method, params, meta) do
-          {:ok, state} -> {:noreply, state}
-          {:error, error, state} -> {:reply, {:error, error}, state}
-        end
+        dispatch(state, id, from, method, params, meta)
 
       error ->
         {:reply, {:error, error}, state}
@@ -300,6 +291,17 @@ defmodule SurrealDB.Connection do
   end
 
   def handle_info(message, state), do: handle_transport(message, state)
+
+  # Requests made while reconnecting wait in the queue until the session is restored.
+  defp dispatch(%{status: :reconnecting} = state, id, from, method, params, meta),
+    do: {:noreply, %{state | queue: [{id, from, method, params, meta} | state.queue]}}
+
+  defp dispatch(state, id, from, method, params, meta) do
+    case send_request(state, id, from, method, params, meta) do
+      {:ok, state} -> {:noreply, state}
+      {:error, error, state} -> {:reply, {:error, error}, state}
+    end
+  end
 
   # Let the engine clean up after a timed-out request (see `Engine.cancel/2`).
   defp cancel_in_engine(state, id) do
@@ -426,25 +428,47 @@ defmodule SurrealDB.Connection do
   # The delay before reconnect attempt `attempt` (1-based): `delay * multiplier^(attempt-1)`,
   # spread by up to `jitter` either way and capped at `max_delay`.
   def backoff(config, attempt) do
-    base = config[:delay] * :math.pow(config[:multiplier], attempt - 1)
+    base = config[:delay] * :math.pow(config[:multiplier], exponent(config, attempt))
     spread = 1 + config[:jitter] * (2 * :rand.uniform() - 1)
-    round(min(base * spread, config[:max_delay]))
+    round(min(min(base, config[:max_delay]) * spread, config[:max_delay]))
+  end
+
+  # The exponent stops growing once the delay has reached `max_delay`, so an unlimited
+  # number of attempts can't overflow `:math.pow/2`.
+  defp exponent(config, attempt) do
+    delay = config[:delay]
+    multiplier = config[:multiplier]
+    max_delay = config[:max_delay]
+
+    cond do
+      multiplier <= 1 -> attempt - 1
+      delay <= 0 or max_delay <= delay -> 0
+      true -> min(attempt - 1, ceil(:math.log(max_delay / delay) / :math.log(multiplier)))
+    end
   end
 
   defp flush_queue(state) do
     state.queue
     |> Enum.reverse()
     |> Enum.reduce(%{state | queue: []}, fn {id, from, method, params, meta}, state ->
-      case send_request(state, id, from, method, params, meta) do
-        {:ok, state} ->
-          state
+      if expired?(meta) do
+        # Its timeout message is still in the mailbox; answer now and don't send it late.
+        reply(state, from, id, timeout_error(method))
+      else
+        case send_request(state, id, from, method, params, meta) do
+          {:ok, state} ->
+            state
 
-        {:error, error, state} ->
-          cancel_timer(meta)
-          reply(state, from, id, {:error, error})
+          {:error, error, state} ->
+            cancel_timer(meta)
+            reply(state, from, id, {:error, error})
+        end
       end
     end)
   end
+
+  defp expired?(%{timer: timer}), do: Process.read_timer(timer) == false
+  defp expired?(_meta), do: false
 
   defp fail_queue(state, error) do
     Enum.reduce(state.queue, %{state | queue: []}, fn {id, from, _method, _params, meta}, state ->
@@ -572,28 +596,21 @@ defmodule SurrealDB.Connection do
     Enum.reduce_while(state.vars, {:ok, state}, fn {name, value}, {:ok, state} ->
       case rpc_sync(state, "let", [name, value]) do
         {:ok, _result, state} -> {:cont, {:ok, state}}
-        {:error, %Error{kind: :connection} = error, state} -> {:halt, {:error, error, state}}
-        {:error, _error, state} -> {:cont, {:ok, state}}
+        # Carrying on would serve requests that expect the parameter without it.
+        {:error, error, state} -> {:halt, {:error, error, state}}
       end
     end)
   end
 
   # Starts every managed live query again and points its caller-facing id at the new
-  # server id. A live query the server refuses to restart is ended with `:killed`.
+  # server id (see `register_live/5`). A live query the server refuses to restart is ended
+  # with `:killed`.
   defp restore_live(state) do
     state = %{state | live_ids: %{}}
 
     Enum.reduce_while(state.live_specs, {:ok, state}, fn {id, params}, {:ok, state} ->
-      case rpc_sync(state, "live", params) do
-        {:ok, server_id, state} ->
-          server_id = normalize_id(server_id)
-
-          state = %{
-            state
-            | live_current: Map.put(state.live_current, id, server_id),
-              live_ids: Map.put(state.live_ids, server_id, id)
-          }
-
+      case rpc_sync(state, "live", params, %{restore_live: id}) do
+        {:ok, _server_id, state} ->
           {:cont, {:ok, state}}
 
         {:error, %Error{kind: :connection} = error, state} ->
@@ -614,10 +631,10 @@ defmodule SurrealDB.Connection do
   # replay. The reply goes through the normal routing (so notifications and other replies
   # keep flowing), and any message that is not for the transport, such as a caller's
   # `GenServer.call`, is put back in the mailbox afterwards rather than lost.
-  defp rpc_sync(state, method, params) do
+  defp rpc_sync(state, method, params, meta \\ %{}) do
     {id, state} = next_id(state)
 
-    case send_request(state, id, :sync, method, params, %{}) do
+    case send_request(state, id, :sync, method, params, meta) do
       {:ok, state} ->
         deadline = System.monotonic_time(:millisecond) + state.connect_timeout
         await_sync(state, id, method, deadline, [])
@@ -652,7 +669,10 @@ defmodule SurrealDB.Connection do
   defp await_sync_message(state, id, method, deadline, stash, message) do
     case state.engine.handle_transport(state.engine_state, message) do
       :unknown ->
-        await_sync(state, id, method, deadline, [message | stash])
+        case absorb(state, message) do
+          {:ok, state} -> await_sync(state, id, method, deadline, stash)
+          :stash -> await_sync(state, id, method, deadline, [message | stash])
+        end
 
       {:ok, events, engine_state} ->
         case Enum.reduce_while(
@@ -677,6 +697,31 @@ defmodule SurrealDB.Connection do
         )
     end
   end
+
+  # While a reconnect restores the session, calls join the queue at once (so their timers
+  # start) and queued calls time out on time, rather than waiting in the stash.
+  defp absorb(%{status: :reconnecting} = state, {:"$gen_call", from, {:rpc, _, _, _} = call}) do
+    case handle_call(call, from, state) do
+      {:noreply, state} ->
+        {:ok, state}
+
+      {:reply, reply, state} ->
+        GenServer.reply(from, reply)
+        {:ok, state}
+    end
+  end
+
+  defp absorb(%{status: :reconnecting} = state, {:request_timeout, id}) do
+    case List.keytake(state.queue, id, 0) do
+      {{^id, from, method, _params, _meta}, queue} ->
+        {:ok, reply(%{state | queue: queue}, from, id, timeout_error(method))}
+
+      nil ->
+        :stash
+    end
+  end
+
+  defp absorb(_state, _message), do: :stash
 
   defp finish_sync(result, stash) do
     stash |> Enum.reverse() |> Enum.each(&send(self(), &1))
@@ -793,6 +838,18 @@ defmodule SurrealDB.Connection do
     }
 
     add_subscriber(state, id, pid)
+  end
+
+  # A live query restarted after a reconnect. The mapping goes in as the reply is handled,
+  # so a notification in the same transport batch already reaches its subscribers.
+  defp register_live(state, "live", _params, %{restore_live: id}, {:ok, server_id}) do
+    server_id = normalize_id(server_id)
+
+    %{
+      state
+      | live_current: Map.put(state.live_current, id, server_id),
+        live_ids: Map.put(state.live_ids, server_id, id)
+    }
   end
 
   defp register_live(state, "kill", _params, %{live_id: live_id}, {:ok, _result}) do
