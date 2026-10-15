@@ -88,6 +88,25 @@ defmodule SurrealDB.ConnectionTest do
                {nil, nil}
     end
 
+    test "selecting only a database keeps it when no namespace is set" do
+      db = recording_start([])
+      assert {:ok, _} = SurrealDB.use(db, database: "app")
+      assert_receive {:use, [%SurrealDB.None{}, "app"]}
+      assert SurrealDB.info_session(db).database == "app"
+    end
+
+    test "over JSON, an unchanged selection is sent as its current value, not NULL" do
+      db = recording_start(codec: :json, namespace: "test", database: "app")
+      assert_receive {:use, ["test", "app"]}
+
+      assert {:ok, _} = SurrealDB.use(db, database: "other")
+      assert_receive {:use, ["test", "other"]}
+
+      assert {:ok, _} = SurrealDB.use(db, database: :unset)
+      assert_receive {:use, ["test", nil]}
+      assert SurrealDB.info_session(db).namespace == "test"
+    end
+
     test "connecting with only a namespace leaves the database unchanged" do
       _db = recording_start(namespace: "test")
       assert_receive {:use, ["test", %SurrealDB.None{}]}

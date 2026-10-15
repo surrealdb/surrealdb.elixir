@@ -267,7 +267,7 @@ defmodule SurrealDB.Connection do
   defp scan_for_reply([{:reply, reply_id, binary} | rest], state, id) do
     case decode(state, binary) do
       {:ok, %{} = decoded} ->
-        scan_for_reply([{:decoded, Map.put_new(decoded, "id", reply_id)} | rest], state, id)
+        scan_for_reply([{:decoded, Map.put(decoded, "id", reply_id)} | rest], state, id)
 
       _other when reply_id == id ->
         {:found, {:error, Error.new(:decode, "could not decode the reply", details: binary)},
@@ -305,7 +305,8 @@ defmodule SurrealDB.Connection do
   defp process_event({:reply, id, binary}, {:ok, state}) do
     case decode(state, binary) do
       {:ok, %{} = decoded} ->
-        {:cont, {:ok, route(Map.put_new(decoded, "id", id), state)}}
+        # The transport knows which request this answers; the body's id is not trusted.
+        {:cont, {:ok, route(Map.put(decoded, "id", id), state)}}
 
       _other ->
         error = Error.new(:decode, "could not decode the reply to request #{id}", details: binary)
@@ -408,10 +409,9 @@ defmodule SurrealDB.Connection do
   defp apply_side_effects(state, _method, _params, {:error, _error}), do: state
 
   defp apply_side_effects(state, "use", [namespace, database], {:ok, _result}) do
-    namespace = use_value(namespace, state.namespace)
-    # The server drops the database when the namespace is cleared.
+    # The server drops the database when the namespace is cleared (sent as NULL).
     database = if is_nil(namespace), do: nil, else: use_value(database, state.database)
-    %{state | namespace: namespace, database: database}
+    %{state | namespace: use_value(namespace, state.namespace), database: database}
   end
 
   defp apply_side_effects(state, method, _params, {:ok, token})
@@ -453,8 +453,15 @@ defmodule SurrealDB.Connection do
   defp next_id(state), do: {state.next_id, %{state | next_id: state.next_id + 1}}
 
   defp encode_request(state, id, method, params) do
-    state.codec.encode(RPC.request(id, method, params))
+    state.codec.encode(RPC.request(id, method, wire_params(state, method, params)))
   end
+
+  # JSON has no NONE, so a "leave unchanged" `use` parameter would arrive as NULL and clear
+  # the selection. Send the current selection in its place.
+  defp wire_params(%{codec: SurrealDB.Codec.JSON} = state, "use", [namespace, database]),
+    do: [use_value(namespace, state.namespace), use_value(database, state.database)]
+
+  defp wire_params(_state, _method, params), do: params
 
   defp decode(state, binary), do: state.codec.decode(binary)
 
