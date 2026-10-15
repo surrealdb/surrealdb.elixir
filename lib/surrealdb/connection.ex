@@ -1590,7 +1590,8 @@ defmodule SurrealDB.Connection do
   defp contains_range?(%SurrealDB.RecordIdRange{}), do: true
   defp contains_range?(list) when is_list(list), do: Enum.any?(list, &contains_range?/1)
   defp contains_range?(%MapSet{} = set), do: Enum.any?(set, &contains_range?/1)
-  defp contains_range?(%_struct{}), do: false
+  # The JSON codec sends other structs as maps of their fields, so look at those too.
+  defp contains_range?(%_struct{} = struct), do: struct |> Map.from_struct() |> contains_range?()
   defp contains_range?(map) when is_map(map), do: Enum.any?(map, &contains_range?/1)
   defp contains_range?({key, value}), do: contains_range?(key) or contains_range?(value)
   defp contains_range?(_other), do: false
