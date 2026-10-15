@@ -94,11 +94,17 @@ defmodule SurrealDB do
     end
   end
 
-  @doc "Signs in with the given credentials and returns the auth token."
+  @doc """
+  Signs in with the given credentials and returns the auth token.
+
+  The token is a JWT string, or a map with `"access"` and `"refresh"` tokens when the
+  record access method was defined `WITH REFRESH`. Either way the connection keeps the
+  access token and sends it with every later request.
+  """
   @spec signin(conn(), SurrealDB.Auth.t()) :: result()
   def signin(conn, auth), do: Connection.call(conn, "signin", [SurrealDB.Auth.to_params(auth)])
 
-  @doc "Signs up via record access and returns the auth token."
+  @doc "Signs up via record access and returns the auth token, as `signin/2` does."
   @spec signup(conn(), SurrealDB.Auth.Record.t()) :: result()
   def signup(conn, auth), do: Connection.call(conn, "signup", [SurrealDB.Auth.to_params(auth)])
 
