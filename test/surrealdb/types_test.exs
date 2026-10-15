@@ -43,6 +43,11 @@ defmodule SurrealDB.TypesTest do
       assert Duration.parse("5µs") == Duration.new(5, :microsecond)
     end
 
+    test "ignores non-ASCII digits instead of raising" do
+      assert Duration.parse("١y") == Duration.new(0)
+      assert Duration.parse("2h١y") == Duration.new(2, :hour)
+    end
+
     test "converts to and from parts" do
       assert Duration.from_parts(5, 250) |> Duration.to_parts() == {5, 250}
     end

@@ -62,7 +62,7 @@ defmodule SurrealDB.Duration do
   @spec parse(String.t()) :: t()
   def parse(string) when is_binary(string) do
     nanos =
-      ~r/(\d+)(ns|us|µs|ms|s|m|h|d|w|y)/u
+      ~r/([0-9]+)(ns|us|µs|ms|s|m|h|d|w|y)/u
       |> Regex.scan(string)
       |> Enum.reduce(0, fn [_, amount, suffix], acc ->
         acc + String.to_integer(amount) * suffix_to_nanos(suffix)
