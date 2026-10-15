@@ -15,7 +15,19 @@ defmodule SurrealDB.Engine.HTTP do
 
   @behaviour SurrealDB.Engine
 
-  defstruct [:mint, :scheme, :host, :port, :path, :content_type, :connect_opts, requests: %{}]
+  alias SurrealDB.Error
+
+  defstruct [
+    :mint,
+    :scheme,
+    :host,
+    :port,
+    :path,
+    :content_type,
+    :connect_opts,
+    :codec,
+    requests: %{}
+  ]
 
   @impl true
   def supports_live?, do: false
@@ -38,7 +50,8 @@ defmodule SurrealDB.Engine.HTTP do
       port: port,
       path: path,
       content_type: content_type,
-      connect_opts: connect_opts
+      connect_opts: connect_opts,
+      codec: Keyword.get(opts, :codec, SurrealDB.Codec.CBOR)
     }
 
     open(conn)
@@ -52,12 +65,12 @@ defmodule SurrealDB.Engine.HTTP do
   end
 
   @impl true
-  def request(%__MODULE__{} = conn, payload, session) do
+  def request(%__MODULE__{} = conn, id, payload, session) do
     headers = build_headers(conn, session)
     body = IO.iodata_to_binary(payload)
 
     with {:ok, conn} <- ensure_open(conn) do
-      case send_request(conn, headers, body) do
+      case send_request(conn, id, headers, body) do
         {:ok, conn} ->
           {:ok, conn}
 
@@ -69,7 +82,8 @@ defmodule SurrealDB.Engine.HTTP do
         # run the request.
         {:error, %{requests: requests} = conn, %Mint.TransportError{reason: reason}}
         when map_size(requests) == 0 and reason in [:closed, :epipe, :econnreset, :enotconn] ->
-          with {:ok, conn} <- reopen(conn), {:ok, conn} <- send_request(conn, headers, body) do
+          with {:ok, conn} <- reopen(conn),
+               {:ok, conn} <- send_request(conn, id, headers, body) do
             {:ok, conn}
           else
             {:error, _conn, reason} -> {:error, reason}
@@ -82,10 +96,10 @@ defmodule SurrealDB.Engine.HTTP do
     end
   end
 
-  defp send_request(conn, headers, body) do
+  defp send_request(conn, id, headers, body) do
     case Mint.HTTP.request(conn.mint, "POST", conn.path, headers, body) do
       {:ok, mint, ref} ->
-        requests = Map.put(conn.requests, ref, %{status: nil, body: []})
+        requests = Map.put(conn.requests, ref, %{id: id, status: nil, headers: [], body: []})
         {:ok, %{conn | mint: mint, requests: requests}}
 
       {:error, mint, reason} ->
@@ -109,13 +123,13 @@ defmodule SurrealDB.Engine.HTTP do
         :unknown
 
       {:ok, mint, responses} ->
-        {events, requests} = process_responses(responses, conn.requests, [])
+        {events, requests} = process_responses(responses, conn, conn.requests, [])
         {:ok, events, %{conn | mint: mint, requests: requests}}
 
       # The connection dropped. Whatever completed before it is still delivered; the rest
       # is lost, and the next request reconnects.
       {:error, mint, reason, responses} ->
-        {events, _requests} = process_responses(responses, conn.requests, [])
+        {events, _requests} = process_responses(responses, conn, conn.requests, [])
         Mint.HTTP.close(mint)
         {:ok, events ++ [{:reset, reason}], %{conn | mint: mint, requests: %{}}}
     end
@@ -127,36 +141,120 @@ defmodule SurrealDB.Engine.HTTP do
     :ok
   end
 
-  defp process_responses([], requests, events), do: {Enum.reverse(events), requests}
+  defp process_responses([], _conn, requests, events), do: {Enum.reverse(events), requests}
 
-  defp process_responses([{:status, ref, status} | rest], requests, events) do
-    requests = update_in(requests[ref].status, fn _ -> status end)
-    process_responses(rest, requests, events)
+  defp process_responses([{:status, ref, status} | rest], conn, requests, events) do
+    requests = update_request(requests, ref, &%{&1 | status: status})
+    process_responses(rest, conn, requests, events)
   end
 
-  defp process_responses([{:headers, _ref, _headers} | rest], requests, events) do
-    process_responses(rest, requests, events)
+  defp process_responses([{:headers, ref, headers} | rest], conn, requests, events) do
+    requests = update_request(requests, ref, &%{&1 | headers: &1.headers ++ headers})
+    process_responses(rest, conn, requests, events)
   end
 
-  defp process_responses([{:data, ref, data} | rest], requests, events) do
-    requests = update_in(requests[ref].body, &[&1, data])
-    process_responses(rest, requests, events)
+  defp process_responses([{:data, ref, data} | rest], conn, requests, events) do
+    requests = update_request(requests, ref, &%{&1 | body: [&1.body, data]})
+    process_responses(rest, conn, requests, events)
   end
 
-  defp process_responses([{:done, ref} | rest], requests, events) do
-    {request, requests} = Map.pop(requests, ref)
-    body = IO.iodata_to_binary(request.body)
-    process_responses(rest, requests, [{:message, body} | events])
+  defp process_responses([{:done, ref} | rest], conn, requests, events) do
+    case Map.pop(requests, ref) do
+      {nil, requests} ->
+        process_responses(rest, conn, requests, events)
+
+      {request, requests} ->
+        event = response_event(conn, request, IO.iodata_to_binary(request.body))
+        process_responses(rest, conn, requests, [event | events])
+    end
   end
 
-  defp process_responses([{:error, ref, reason} | rest], requests, events) do
-    requests = Map.delete(requests, ref)
-    process_responses(rest, requests, [{:reset, reason} | events])
+  defp process_responses([{:error, ref, reason} | rest], conn, requests, events) do
+    case Map.pop(requests, ref) do
+      {nil, requests} ->
+        process_responses(rest, conn, requests, events)
+
+      {request, requests} ->
+        error = Error.new(:connection, inspect(reason), details: reason)
+        process_responses(rest, conn, requests, [{:failed, request.id, error} | events])
+    end
   end
 
-  defp process_responses([_other | rest], requests, events) do
-    process_responses(rest, requests, events)
+  defp process_responses([_other | rest], conn, requests, events) do
+    process_responses(rest, conn, requests, events)
   end
+
+  defp update_request(requests, ref, fun) do
+    case Map.fetch(requests, ref) do
+      {:ok, request} -> Map.put(requests, ref, fun.(request))
+      :error -> requests
+    end
+  end
+
+  # RPC errors arrive with status 200, so a 2xx body is always an RPC message. Any other
+  # status is a failure of the request itself (bad token, wrong content type, server
+  # error), and its body is plain text or JSON rather than an RPC message.
+  defp response_event(_conn, %{id: id, status: status}, body) when status in 200..299,
+    do: {:reply, id, body}
+
+  defp response_event(conn, %{id: id, status: status, headers: headers}, body) do
+    {:failed, id, status_error(conn, status, headers, body)}
+  end
+
+  defp status_error(conn, status, headers, body) do
+    content_type = header(headers, "content-type") || ""
+
+    case decode_error_body(conn, content_type, body) do
+      %{"error" => %{} = rpc_error} ->
+        Error.from_rpc(rpc_error)
+
+      %{} = json ->
+        message =
+          Enum.find_value(["information", "description", "details"], body, fn key ->
+            if is_binary(json[key]), do: json[key]
+          end)
+
+        Error.new(status_kind(status), "HTTP #{status}: #{message}", code: status, details: json)
+
+      nil ->
+        message = if body == "", do: reason_phrase(status), else: String.trim(body)
+        Error.new(status_kind(status), "HTTP #{status}: #{message}", code: status, details: body)
+    end
+  end
+
+  defp decode_error_body(conn, content_type, body) do
+    cond do
+      String.starts_with?(content_type, "application/json") ->
+        case Jason.decode(body) do
+          {:ok, %{} = map} -> map
+          _ -> nil
+        end
+
+      String.starts_with?(content_type, conn.codec.content_type()) ->
+        case conn.codec.decode(body) do
+          {:ok, %{} = map} -> map
+          _ -> nil
+        end
+
+      true ->
+        nil
+    end
+  end
+
+  defp header(headers, name) do
+    Enum.find_value(headers, fn {key, value} -> if String.downcase(key) == name, do: value end)
+  end
+
+  defp status_kind(status) when status in [401, 403], do: :auth
+  defp status_kind(_status), do: :http
+
+  defp reason_phrase(401), do: "Unauthorized"
+  defp reason_phrase(403), do: "Forbidden"
+  defp reason_phrase(404), do: "Not Found"
+  defp reason_phrase(413), do: "Payload Too Large"
+  defp reason_phrase(415), do: "Unsupported Media Type"
+  defp reason_phrase(status) when status >= 500, do: "Server Error"
+  defp reason_phrase(_status), do: "Request Failed"
 
   defp build_headers(conn, session) do
     [{"content-type", conn.content_type}, {"accept", conn.content_type}]

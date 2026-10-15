@@ -140,6 +140,15 @@ defmodule SurrealDB.IntegrationTest do
     end
   end
 
+  test "an HTTP error status fails the call at once instead of timing out" do
+    http_url = @url |> String.replace(~r/^ws/, "http") |> String.replace(~r{/rpc$}, "/missing")
+    db = start_supervised!({SurrealDB.Connection, url: http_url})
+
+    {micros, result} = :timer.tc(fn -> SurrealDB.version(db) end)
+    assert {:error, %SurrealDB.Error{kind: :http, code: 404}} = result
+    assert micros < 5_000_000
+  end
+
   test "works over the HTTP engine too" do
     http_url = String.replace(@url, ~r/^ws/, "http")
     db = connect(url: http_url)

@@ -25,7 +25,7 @@ defmodule SurrealDB.Engine.Mock do
   end
 
   @impl true
-  def request(%__MODULE__{codec: codec, responder: responder} = conn, payload, _session) do
+  def request(%__MODULE__{codec: codec, responder: responder} = conn, _id, payload, _session) do
     {:ok, request} = codec.decode(IO.iodata_to_binary(payload))
     id = request["id"]
     method = request["method"]
@@ -34,6 +34,9 @@ defmodule SurrealDB.Engine.Mock do
     case responder.(method, params) do
       :noreply ->
         :ok
+
+      {:failed, error} ->
+        send(self(), {:mock_failed, id, error})
 
       {:ok, result} ->
         send(self(), {:mock_message, codec.encode(%{"id" => id, "result" => result})})
@@ -50,6 +53,7 @@ defmodule SurrealDB.Engine.Mock do
     {:ok, [{:message, IO.iodata_to_binary(payload)}], conn}
   end
 
+  def handle_transport(conn, {:mock_failed, id, error}), do: {:ok, [{:failed, id, error}], conn}
   def handle_transport(conn, :mock_closed), do: {:ok, [:closed], conn}
   def handle_transport(conn, {:mock_reset, reason}), do: {:ok, [{:reset, reason}], conn}
   def handle_transport(_conn, _message), do: :unknown

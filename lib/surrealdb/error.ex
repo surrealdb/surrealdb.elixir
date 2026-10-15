@@ -7,12 +7,13 @@ defmodule SurrealDB.Error do
     * `:rpc` - the server returned an error for an RPC call (`code`/`message` set).
     * `:connection` - the transport could not be established or was lost.
     * `:decode` - a response could not be decoded.
-    * `:auth` - authentication or authorisation failed.
+    * `:auth` - authentication or authorisation failed (including HTTP 401 and 403).
+    * `:http` - the HTTP engine got a non-2xx status; `code` holds the status.
     * `:timeout` - the request did not complete in time.
     * `:unsupported` - the operation is not available on the active engine.
   """
 
-  @type kind :: :rpc | :connection | :decode | :auth | :timeout | :unsupported
+  @type kind :: :rpc | :connection | :decode | :auth | :http | :timeout | :unsupported
   @type t :: %__MODULE__{
           kind: kind(),
           message: String.t(),

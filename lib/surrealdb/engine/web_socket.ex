@@ -51,7 +51,7 @@ defmodule SurrealDB.Engine.WebSocket do
   end
 
   @impl true
-  def request(%__MODULE__{} = conn, payload, _session) do
+  def request(%__MODULE__{} = conn, _id, payload, _session) do
     frame = {conn.frame_type, IO.iodata_to_binary(payload)}
 
     with {:ok, websocket, data} <- Mint.WebSocket.encode(conn.websocket, frame),
