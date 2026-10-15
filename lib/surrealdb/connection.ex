@@ -1023,6 +1023,11 @@ defmodule SurrealDB.Connection do
   defp public_reply("query", _meta, {:ok, statements}) when is_list(statements),
     do: RPC.parse_query(statements)
 
+  # Over JSON the server sends a live query id as a string. Return it as the `Uuid` the
+  # notifications carry, so a caller can match one against the other.
+  defp public_reply("live", _meta, {:ok, id}) when is_binary(id),
+    do: {:ok, SurrealDB.Uuid.new(id)}
+
   defp public_reply(_method, _meta, {:ok, value}), do: {:ok, value}
 
   # ── State mutation from method side effects ─────────────────────────────────

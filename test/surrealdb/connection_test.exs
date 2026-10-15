@@ -495,6 +495,23 @@ defmodule SurrealDB.ConnectionTest do
 
       assert_receive {:relayed, {:surrealdb, :live, _id, %{action: :update}}}, 1_000
     end
+
+    test "over JSON, live returns the same Uuid its notifications carry" do
+      responder = fn
+        "live", _params -> {:ok, String.upcase(@live_uuid)}
+        "version", _params -> {:ok, "surrealdb-3.3.4"}
+        _method, params -> {:ok, params}
+      end
+
+      db = start(codec: :json, responder: responder)
+      {:ok, live_id} = SurrealDB.live(db, "person")
+      assert live_id == Uuid.new(@live_uuid)
+
+      notification = %{"result" => %{"id" => @live_uuid, "action" => "CREATE", "result" => %{}}}
+      send(db, {:mock_message, Codec.JSON.encode(notification)})
+
+      assert_receive {:surrealdb, :live, ^live_id, %{action: :create}}, 1_000
+    end
   end
 
   describe "live subscribers" do
