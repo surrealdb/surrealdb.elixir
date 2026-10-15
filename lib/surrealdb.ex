@@ -68,10 +68,30 @@ defmodule SurrealDB do
 
   # ── Session and auth ───────────────────────────────────────────────────────
 
-  @doc "Selects the namespace and/or database to use. Pass `nil` to leave one unchanged."
+  @doc """
+  Selects the namespace and/or database to use.
+
+  A key that is missing or `nil` leaves that selection unchanged, so
+  `use(db, database: "other")` switches the database and keeps the namespace. Pass
+  `:unset` to clear a selection. Clearing the namespace also clears the database.
+
+      SurrealDB.use(db, namespace: "app", database: "prod")
+      SurrealDB.use(db, database: "staging")
+      SurrealDB.use(db, database: :unset)
+  """
   @spec use(conn(), keyword()) :: result()
   def use(conn, opts) do
-    Connection.call(conn, "use", [opts[:namespace], opts[:database]])
+    params = [use_param(opts, :namespace), use_param(opts, :database)]
+    Connection.call(conn, "use", params)
+  end
+
+  # The server reads NONE as "leave unchanged" and NULL as "clear".
+  defp use_param(opts, key) do
+    case Keyword.get(opts, key) do
+      nil -> SurrealDB.None.none()
+      :unset -> nil
+      name when is_binary(name) -> name
+    end
   end
 
   @doc "Signs in with the given credentials and returns the auth token."

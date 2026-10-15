@@ -175,7 +175,9 @@ defmodule SurrealDB.Connection do
   defp maybe_use(state, nil, nil, _timeout), do: {:ok, state}
 
   defp maybe_use(state, namespace, database, timeout) do
-    case rpc_sync(state, "use", [namespace, database], timeout) do
+    params = [namespace || SurrealDB.None.none(), database || SurrealDB.None.none()]
+
+    case rpc_sync(state, "use", params, timeout) do
       {:ok, _result, state} -> {:ok, state}
       {:error, reason, state} -> {:error, reason, state}
     end
@@ -344,15 +346,11 @@ defmodule SurrealDB.Connection do
 
   defp apply_side_effects(state, _method, _params, {:error, _error}), do: state
 
-  defp apply_side_effects(state, "use", params, {:ok, _result}) do
-    namespace = Enum.at(params, 0)
-    database = Enum.at(params, 1)
-
-    %{
-      state
-      | namespace: namespace || state.namespace,
-        database: database || state.database
-    }
+  defp apply_side_effects(state, "use", [namespace, database], {:ok, _result}) do
+    namespace = use_value(namespace, state.namespace)
+    # The server drops the database when the namespace is cleared.
+    database = if is_nil(namespace), do: nil, else: use_value(database, state.database)
+    %{state | namespace: namespace, database: database}
   end
 
   defp apply_side_effects(state, method, _params, {:ok, token})
@@ -369,6 +367,9 @@ defmodule SurrealDB.Connection do
   end
 
   defp apply_side_effects(state, _method, _params, _result), do: state
+
+  defp use_value(%SurrealDB.None{}, current), do: current
+  defp use_value(value, _current), do: value
 
   # ── Low level helpers ────────────────────────────────────────────────────
 

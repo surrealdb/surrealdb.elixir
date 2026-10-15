@@ -78,6 +78,21 @@ defmodule SurrealDB.IntegrationTest do
     assert created["n"] == 1
   end
 
+  test "use with only a database keeps the namespace on the server" do
+    db = connect()
+    {:ok, _} = SurrealDB.create(db, "marker", %{"n" => 1})
+
+    assert {:ok, _} = SurrealDB.use(db, namespace: "test", database: nil)
+    assert {:ok, [[%{"n" => 1}]]} = SurrealDB.query(db, "SELECT n FROM marker")
+
+    assert {:ok, _} = SurrealDB.use(db, database: :unset)
+
+    assert {:ok, [%{"namespace" => "test", "database" => db_name}]} =
+             SurrealDB.query(db, "RETURN { namespace: session::ns(), database: session::db() }")
+
+    assert db_name in [nil, %SurrealDB.None{}]
+  end
+
   test "works over the HTTP engine too" do
     http_url = String.replace(@url, ~r/^ws/, "http")
     db = connect(url: http_url)
