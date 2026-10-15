@@ -6,22 +6,48 @@ defmodule SurrealDB.Rest do
 
   alias SurrealDB.Error
 
+  @export_options ~w(database_definition users accesses params functions analyzers apis
+                      buckets modules configs tables versions records sequences)a
+
   @spec export(map(), keyword()) :: {:ok, String.t()} | {:error, Error.t()}
   def export(session, opts) do
-    headers = [{"accept", "text/plain"}]
     timeout = Keyword.get(opts, :timeout, 60_000)
 
-    case request(session, "GET", "/export", headers, "", timeout) do
-      {:ok, status, body} when status in 200..299 ->
-        {:ok, body}
+    # With no options, GET exports everything; options go in a POSTed config.
+    {method, headers, body} =
+      case export_config(opts) do
+        config when map_size(config) == 0 ->
+          {"GET", [{"accept", "text/plain"}], ""}
 
-      {:ok, status, body} ->
-        {:error, Error.new(:rpc, "export failed", code: status, details: body)}
+        config ->
+          headers = [{"accept", "text/plain"}, {"content-type", "application/json"}]
+          {"POST", headers, Jason.encode!(config)}
+      end
 
-      {:error, error} ->
-        {:error, error}
+    case request(session, method, "/export", headers, body, timeout) do
+      {:ok, status, body} when status in 200..299 -> {:ok, body}
+      {:ok, status, body} -> {:error, status_error("export failed", status, body)}
+      {:error, error} -> {:error, error}
     end
   end
+
+  defp export_config(opts) do
+    for {key, value} <- opts, key in @export_options, into: %{} do
+      {Atom.to_string(key), export_value(key, value)}
+    end
+  end
+
+  defp export_value(:tables, {:exclude, tables}),
+    do: %{"exclude" => Enum.map(tables, &table_name/1)}
+
+  defp export_value(:tables, tables) when is_list(tables), do: Enum.map(tables, &table_name/1)
+  defp export_value(_key, value) when is_boolean(value), do: value
+
+  defp export_value(key, value),
+    do: raise(ArgumentError, "invalid export option #{key}: #{inspect(value)}")
+
+  defp table_name(%SurrealDB.Table{name: name}), do: name
+  defp table_name(name) when is_binary(name), do: name
 
   @spec health(map(), keyword()) :: :ok | {:error, Error.t()}
   def health(session, opts) do
@@ -49,15 +75,47 @@ defmodule SurrealDB.Rest do
     timeout = Keyword.get(opts, :timeout, 60_000)
 
     case request(session, "POST", "/import", headers, surql, timeout) do
-      {:ok, status, _body} when status in 200..299 ->
-        {:ok, :imported}
-
-      {:ok, status, body} ->
-        {:error, Error.new(:rpc, "import failed", code: status, details: body)}
-
-      {:error, error} ->
-        {:error, error}
+      {:ok, status, _body} when status in 200..299 -> {:ok, :imported}
+      {:ok, 422, body} -> {:error, import_failures(body)}
+      {:ok, status, body} -> {:error, status_error("import failed", status, body)}
+      {:error, error} -> {:error, error}
     end
+  end
+
+  # The server answers 422 with the statements that failed. The import is not a
+  # transaction, so the statements that did not fail were still applied.
+  defp import_failures(body) do
+    case Jason.decode(body) do
+      {:ok, statements} when is_list(statements) ->
+        failures =
+          for %{"status" => "ERR"} = statement <- statements, do: Error.from_statement(statement)
+
+        first = List.first(failures)
+        count = length(failures)
+        noun = if count == 1, do: "statement", else: "statements"
+
+        message =
+          "import: #{count} #{noun} failed" <>
+            if(first, do: "; first: #{first.message}", else: "")
+
+        Error.new(:query, message, code: 422, details: %{failures: failures})
+
+      _ ->
+        status_error("import failed", 422, body)
+    end
+  end
+
+  # Error responses carry a JSON body whose `information` says what went wrong.
+  defp status_error(context, status, body) do
+    message =
+      case Jason.decode(body) do
+        {:ok, %{"information" => information}} when is_binary(information) -> information
+        {:ok, %{"description" => description}} when is_binary(description) -> description
+        _ -> if body == "", do: "HTTP #{status}", else: body
+      end
+
+    kind = if status in [401, 403], do: :auth, else: :http
+    Error.new(kind, "#{context}: #{message}", code: status, details: body)
   end
 
   defp request(session, method, path, headers, body, timeout) do
