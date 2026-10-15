@@ -128,13 +128,26 @@ defmodule SurrealDB.Rest do
     connect_opts =
       [protocols: [:http1], mode: :passive] ++ tls_opts(scheme, session[:transport_opts])
 
-    with {:ok, conn} <- Mint.HTTP.connect(scheme, host, port, connect_opts),
-         {:ok, conn, ref} <- Mint.HTTP.request(conn, method, path, headers, body),
-         {:ok, status, response_body} <- recv(conn, ref, timeout, nil, []) do
-      {:ok, status, response_body}
-    else
-      {:error, reason} -> {:error, connection_error(reason)}
-      {:error, _conn, reason} -> {:error, connection_error(reason)}
+    case Mint.HTTP.connect(scheme, host, port, connect_opts) do
+      {:ok, conn} ->
+        # Once connected, every outcome closes the connection so no socket is left open.
+        result =
+          with {:ok, conn, ref} <- Mint.HTTP.request(conn, method, path, headers, body) do
+            recv(conn, ref, timeout, nil, [])
+          end
+
+        case result do
+          {:ok, conn, status, response_body} ->
+            Mint.HTTP.close(conn)
+            {:ok, status, response_body}
+
+          {:error, conn, reason} ->
+            Mint.HTTP.close(conn)
+            {:error, connection_error(reason)}
+        end
+
+      {:error, reason} ->
+        {:error, connection_error(reason)}
     end
   end
 
@@ -142,20 +155,13 @@ defmodule SurrealDB.Rest do
     case Mint.HTTP.recv(conn, 0, timeout) do
       {:ok, conn, responses} ->
         case reduce(responses, ref, status, body) do
-          {:done, status, body} ->
-            Mint.HTTP.close(conn)
-            {:ok, status, IO.iodata_to_binary(body)}
-
-          {:cont, status, body} ->
-            recv(conn, ref, timeout, status, body)
-
-          {:error, reason} ->
-            Mint.HTTP.close(conn)
-            {:error, connection_error(reason)}
+          {:done, status, body} -> {:ok, conn, status, IO.iodata_to_binary(body)}
+          {:cont, status, body} -> recv(conn, ref, timeout, status, body)
+          {:error, reason} -> {:error, conn, reason}
         end
 
-      {:error, _conn, reason, _responses} ->
-        {:error, connection_error(reason)}
+      {:error, conn, reason, _responses} ->
+        {:error, conn, reason}
     end
   end
 
