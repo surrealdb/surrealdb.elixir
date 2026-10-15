@@ -15,9 +15,10 @@ It aims for feature parity with the official JavaScript SDKs (`surrealdb` and
 - **Two protocols**: CBOR (default, full type fidelity) and JSON.
 - **Native value types**: `RecordId`, `Table`, `Uuid`, `Duration`, `Datetime`, `Decimal`,
   `Geometry`, `Range`, `Bytes`, and `None`.
-- **Full RPC surface**: `use`, `signin`, `signup`, `authenticate`, `invalidate`, `let`,
-  `unset`, `query`, `select`, `create`, `insert`, `insert_relation`, `update`, `upsert`,
-  `merge`, `patch`, `delete`, `relate`, `run`, `info`, `version`, plus `export`/`import`.
+- **Full RPC surface**: `use`, `signin`, `signup`, `authenticate`, `refresh`, `revoke`,
+  `invalidate`, `reset`, `let`, `unset`, `query`, `select`, `create`, `insert`,
+  `insert_relation`, `update`, `upsert`, `merge`, `patch`, `delete`, `relate`, `run`,
+  `info`, `version`, plus `export`/`import`.
 - **Sessions and interactive transactions** with handles you pass in place of the
   connection.
 - **Live queries** delivered to any process as messages.
@@ -63,6 +64,7 @@ Options:
 - `:name` - register the process under a name.
 - `:timeout` - request timeout in milliseconds, or `:infinity` (default 30000).
   `SurrealDB.query/4` takes a per-request `timeout:` too.
+- `:renew_access` - renew access tokens before they expire (default `true`).
 - `:version_check` - refuse servers outside `>= 2.1.0` and `< 5.0.0` (default `true`).
 - `:transport_opts` - extra transport options, for example TLS settings.
 
@@ -193,6 +195,22 @@ projected onto their closest JSON representation.
 {:ok, _} = SurrealDB.authenticate(db, token)
 {:ok, _} = SurrealDB.invalidate(db)
 ```
+
+When a record access method is defined `WITH REFRESH`, `signin/2` and `signup/2` return
+an access and refresh token pair, and the connection keeps both:
+
+```elixir
+{:ok, %{"access" => _, "refresh" => _} = pair} = SurrealDB.signin(db, record_auth)
+
+{:ok, new_pair} = SurrealDB.refresh(db)        # exchange the refresh token for a new pair
+{:ok, _} = SurrealDB.authenticate(other, pair)  # authenticate with a pair, keeping the refresh token
+{:ok, _} = SurrealDB.revoke(db)                 # the refresh token can no longer be used
+```
+
+The connection renews the access token a minute before it expires (or halfway through a
+shorter lifetime): with the refresh token when it has one, otherwise by signing in again
+with the credentials it signed in with. Turn this off with `renew_access: false`. After a
+reconnect, a refused access token is refreshed the same way.
 
 ## Sessions and transactions
 

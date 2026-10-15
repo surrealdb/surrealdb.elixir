@@ -9,6 +9,8 @@ defmodule SurrealDB.Connection.Session do
     :refresh_token,
     # signin params to sign in again with when the token can no longer be used
     :credentials,
+    # changes whenever the session's authentication does (see `Connection`)
+    :auth_gen,
     vars: %{}
   ]
 end

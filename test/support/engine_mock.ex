@@ -10,11 +10,12 @@ defmodule SurrealDB.Engine.Mock do
   `{:mock_message, encoded_payload}` message; `handle_transport/2` forwards it like any
   other engine message. Send `:mock_closed` to simulate a dead transport, or
   `{:mock_reset, reason}` to simulate lost in-flight requests. A responder that returns
-  `:noreply` leaves the request unanswered, `{:delay, ms, result}` answers after `ms`,
-  `{:batch, result, payloads}` delivers the reply and the extra payloads in one transport
-  message, and `{:closing, result}` answers and closes the transport in the same batch. A
-  responder of arity 3 also gets the decoded request, to check its `"session"` and `"txn"`
-  fields.
+  `:noreply` leaves the request unanswered, `{:delay, ms, result}` (or
+  `{:delay, ms, {:error, error}}`) answers after `ms`, `{:batch, result, payloads}` delivers
+  the reply and the extra payloads in one transport message, and `{:closing, result}`
+  answers and closes the transport in the same batch. `{:send_error, reason}` fails the
+  send itself. A responder of arity 3 also gets the decoded request, to check its
+  `"session"` and `"txn"` fields.
   """
 
   @behaviour SurrealDB.Engine
@@ -42,6 +43,9 @@ defmodule SurrealDB.Engine.Mock do
     params = request["params"] || []
 
     case respond(responder, method, params, request) do
+      {:send_error, reason} ->
+        {:error, reason}
+
       :noreply ->
         :ok
 
@@ -57,19 +61,22 @@ defmodule SurrealDB.Engine.Mock do
       {:error, error} ->
         send(self(), {:mock_message, codec.encode(%{"id" => id, "error" => error})})
 
+      {:delay, ms, {:error, error}} ->
+        reply = codec.encode(%{"id" => id, "error" => error})
+        Process.send_after(self(), {:mock_message, reply}, ms)
+
       {:delay, ms, result} ->
-        Process.send_after(
-          self(),
-          {:mock_message, codec.encode(%{"id" => id, "result" => result})},
-          ms
-        )
+        reply = codec.encode(%{"id" => id, "result" => result})
+        Process.send_after(self(), {:mock_message, reply}, ms)
 
       {:batch, result, payloads} ->
         reply = codec.encode(%{"id" => id, "result" => result})
         send(self(), {:mock_batch, [reply | Enum.map(payloads, &codec.encode/1)]})
     end
-
-    {:ok, conn}
+    |> case do
+      {:error, reason} -> {:error, reason}
+      _sent -> {:ok, conn}
+    end
   end
 
   # A 3-arity responder also gets the whole request, to see its session and txn.

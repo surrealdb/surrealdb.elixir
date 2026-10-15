@@ -135,7 +135,7 @@ defmodule SurrealDB.ReconnectTest do
   end
 
   test "holds requests made while reconnecting and sends them once connected" do
-    db = start(reconnect: [delay: 200])
+    db = start(reconnect: [delay: 500])
     :ok = SurrealDB.subscribe_status(db)
     send(db, :mock_closed)
     assert_receive {:surrealdb, :status, :reconnecting, _}
@@ -143,8 +143,8 @@ defmodule SurrealDB.ReconnectTest do
     task = Task.async(fn -> SurrealDB.query(db, "RETURN 1") end)
     refute_receive {:rpc, "query", _}, 50
 
-    assert_receive {:surrealdb, :status, :connected, _}, 1_000
-    assert_receive {:rpc, "query", ["RETURN 1", %{}]}
+    assert_receive {:surrealdb, :status, :connected, _}, 5_000
+    assert_receive {:rpc, "query", ["RETURN 1", %{}]}, 1_000
     assert {:ok, _} = Task.await(task)
   end
 

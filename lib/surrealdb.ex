@@ -71,6 +71,10 @@ defmodule SurrealDB do
       `attempts` (default 5, or `:infinity`), `delay` (first delay in ms, default 1000),
       `max_delay` (default 60000), `multiplier` (default 2.0), and `jitter` (default 0.1).
       See `SurrealDB.Connection` for what is restored.
+    * `:renew_access` - when `true` (the default), the connection renews a session's access
+      token a minute before it expires: with the refresh token when the session has one,
+      otherwise by signing in again with the credentials it signed in with. A session
+      authenticated with only a token is not renewed.
     * `:version_check` - when `true` (the default), the connection asks the server for its
       version and refuses to start unless it is supported: `>= 2.1.0` and `< 5.0.0`. See
       `SurrealDB.Version`.
@@ -146,9 +150,74 @@ defmodule SurrealDB do
   @spec signup(conn(), SurrealDB.Auth.Record.t()) :: result()
   def signup(conn, auth), do: Connection.call(conn, "signup", [SurrealDB.Auth.to_params(auth)])
 
-  @doc "Authenticates the connection with an existing token."
-  @spec authenticate(conn(), String.t()) :: result()
-  def authenticate(conn, token), do: Connection.call(conn, "authenticate", [token])
+  @typedoc """
+  An access token, or an access and refresh token pair as `signin/2` returns it for a
+  record access method defined `WITH REFRESH`.
+  """
+  @type tokens :: String.t() | %{required(String.t() | atom()) => String.t()}
+
+  @doc """
+  Authenticates the connection with an existing token.
+
+  Pass the access and refresh token pair (`%{"access" => _, "refresh" => _}`) to keep the
+  refresh token too, so `refresh/1` and automatic renewal can use it.
+  """
+  @spec authenticate(conn(), tokens()) :: result()
+  def authenticate(conn, token) when is_binary(token),
+    do: Connection.call(conn, "authenticate", [token])
+
+  def authenticate(conn, tokens) when is_map(tokens) do
+    %{"access" => access, "refresh" => refresh} = token_pair(tokens)
+    Connection.call(conn, "authenticate", [access], meta: %{refresh_token: refresh})
+  end
+
+  @doc """
+  Exchanges a refresh token for a new access and refresh token pair, and authenticates the
+  session with the new access token. The old refresh token can not be used again.
+
+  With no tokens given, it uses the pair the session holds from `signin/2`, `signup/2`, or
+  `authenticate/2`.
+
+      {:ok, %{"access" => access, "refresh" => refresh}} = SurrealDB.refresh(db)
+  """
+  @spec refresh(conn(), tokens() | nil) :: result()
+  def refresh(conn, tokens \\ nil) do
+    with {:ok, pair} <- stored_pair(conn, tokens) do
+      Connection.call(conn, "refresh", [pair])
+    end
+  end
+
+  @doc """
+  Revokes a refresh token so it can not be used to get new access tokens. The session stays
+  authenticated until its access token expires.
+
+  With no tokens given, it revokes the refresh token the session holds.
+  """
+  @spec revoke(conn(), tokens() | nil) :: result()
+  def revoke(conn, tokens \\ nil) do
+    with {:ok, pair} <- stored_pair(conn, tokens) do
+      Connection.call(conn, "revoke", [pair])
+    end
+  end
+
+  defp stored_pair(conn, nil) do
+    case Connection.session_info(conn) do
+      %{token: access, refresh_token: refresh} when is_binary(access) and is_binary(refresh) ->
+        {:ok, %{"access" => access, "refresh" => refresh}}
+
+      _ ->
+        {:error, Error.new(:auth, "the session has no refresh token")}
+    end
+  end
+
+  defp stored_pair(_conn, tokens) when is_map(tokens), do: {:ok, token_pair(tokens)}
+
+  defp token_pair(tokens) do
+    %{
+      "access" => tokens["access"] || tokens[:access],
+      "refresh" => tokens["refresh"] || tokens[:refresh]
+    }
+  end
 
   @doc "Invalidates the current session authentication."
   @spec invalidate(conn()) :: result()
