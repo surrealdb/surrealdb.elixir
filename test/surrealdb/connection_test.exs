@@ -203,6 +203,16 @@ defmodule SurrealDB.ConnectionTest do
   end
 
   describe "version check" do
+    # Sends replies to a request nobody made until the connection process exits.
+    defp chatter(conn) do
+      if Process.alive?(conn) do
+        reply = Codec.CBOR.encode(%{"id" => 999_999, "result" => nil})
+        send(conn, {:mock_message, reply})
+        Process.sleep(20)
+        chatter(conn)
+      end
+    end
+
     defp version_responder(version) do
       fn
         "version", _params -> {:ok, version}
@@ -240,6 +250,33 @@ defmodule SurrealDB.ConnectionTest do
     test "keeps the transport options for one-off HTTP requests" do
       db = start(transport_opts: [verify: :verify_none])
       assert SurrealDB.info_session(db).transport_opts == [verify: :verify_none]
+    end
+
+    test "unrelated transport traffic does not push back the setup deadline" do
+      Process.flag(:trap_exit, true)
+
+      responder = fn
+        "version", _params ->
+          conn = self()
+          spawn(fn -> chatter(conn) end)
+          :noreply
+
+        _method, _params ->
+          {:ok, nil}
+      end
+
+      {micros, result} =
+        :timer.tc(fn ->
+          SurrealDB.Connection.start_link(
+            url: "ws://mock/rpc",
+            engine: SurrealDB.Engine.Mock,
+            responder: responder,
+            connect_timeout: 200
+          )
+        end)
+
+      assert {:error, %SurrealDB.Error{kind: :timeout}} = result
+      assert micros < 1_000_000
     end
 
     test "a transport that closes during the version call fails startup, check or not" do
@@ -283,7 +320,7 @@ defmodule SurrealDB.ConnectionTest do
 
       assert {:error, %SurrealDB.Error{kind: :timeout}} = result
       assert micros < 1_000_000
-      assert [{nil, "hang", [], %{discard: true}}] = Map.values(:sys.get_state(db).pending)
+      assert :sys.get_state(db).pending == %{}
       assert {:ok, _} = SurrealDB.Connection.call(db, "ping", [])
     end
 
@@ -300,7 +337,7 @@ defmodule SurrealDB.ConnectionTest do
 
       assert {:error, %SurrealDB.Error{kind: :timeout}} = SurrealDB.select(db, "audit")
 
-      [id] = Map.keys(:sys.get_state(db).pending)
+      id = :sys.get_state(db).next_id - 1
       row = %{"id" => Uuid.new(@live_uuid), "action" => "CREATE", "result" => %{}}
       send(db, {:mock_message, Codec.CBOR.encode(%{"id" => id, "result" => row})})
 
@@ -363,6 +400,28 @@ defmodule SurrealDB.ConnectionTest do
 
       assert_receive {:kill, [%Uuid{value: @live_uuid}]}
       assert :sys.get_state(db).live == %{}
+    end
+
+    test "a call that runs out of time in the mailbox is not sent" do
+      parent = self()
+
+      responder = fn
+        "create", params -> tap({:ok, params}, fn _ -> send(parent, :created) end)
+        "version", _params -> {:ok, "surrealdb-3.3.4"}
+        _method, params -> {:ok, params}
+      end
+
+      db = start(responder: responder)
+      :ok = :sys.suspend(db)
+
+      task =
+        Task.async(fn -> SurrealDB.Connection.call(db, "create", ["person"], timeout: 50) end)
+
+      Process.sleep(150)
+      :ok = :sys.resume(db)
+
+      assert {:error, %SurrealDB.Error{kind: :timeout}} = Task.await(task)
+      refute_receive :created, 100
     end
 
     test "the connection-wide timeout applies by default" do
