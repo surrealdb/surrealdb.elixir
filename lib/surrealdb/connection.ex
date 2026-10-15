@@ -37,7 +37,10 @@ defmodule SurrealDB.Connection do
     :refresh_token,
     next_id: 1,
     pending: %{},
-    live: %{}
+    # live query id => MapSet of subscriber pids
+    live: %{},
+    # subscriber pid => monitor ref
+    monitors: %{}
   ]
 
   @default_connect_timeout 15_000
@@ -64,10 +67,16 @@ defmodule SurrealDB.Connection do
     end
   end
 
-  @doc "Registers `pid` to receive notifications for an existing live query id."
+  @doc "Adds `pid` to the subscribers of a live query id."
   @spec subscribe_live(GenServer.server(), term(), pid()) :: :ok
   def subscribe_live(server, live_id, pid) do
     GenServer.call(server, {:subscribe_live, live_id, pid})
+  end
+
+  @doc "Removes `pid` from the subscribers of a live query id."
+  @spec unsubscribe_live(GenServer.server(), term(), pid()) :: :ok
+  def unsubscribe_live(server, live_id, pid) do
+    GenServer.call(server, {:unsubscribe_live, live_id, pid})
   end
 
   @doc "Returns the active session info: namespace, database, whether a token is set, engine."
@@ -133,7 +142,11 @@ defmodule SurrealDB.Connection do
   end
 
   def handle_call({:subscribe_live, live_id, pid}, _from, state) do
-    {:reply, :ok, %{state | live: Map.put(state.live, normalize_id(live_id), pid)}}
+    {:reply, :ok, add_subscriber(state, normalize_id(live_id), pid)}
+  end
+
+  def handle_call({:unsubscribe_live, live_id, pid}, _from, state) do
+    {:reply, :ok, remove_subscriber(state, normalize_id(live_id), pid)}
   end
 
   def handle_call(:session_info, _from, state) do
@@ -152,7 +165,17 @@ defmodule SurrealDB.Connection do
   end
 
   @impl true
-  def handle_info(message, state) do
+  def handle_info({:DOWN, ref, :process, pid, _reason} = message, state) do
+    if Map.get(state.monitors, pid) == ref do
+      {:noreply, subscriber_down(state, pid)}
+    else
+      handle_transport(message, state)
+    end
+  end
+
+  def handle_info(message, state), do: handle_transport(message, state)
+
+  defp handle_transport(message, state) do
     case state.engine.handle_transport(state.engine_state, message) do
       :unknown ->
         {:noreply, state}
@@ -328,10 +351,9 @@ defmodule SurrealDB.Connection do
   end
 
   defp route(decoded, state) do
-    case notification(decoded) do
-      {:notification, live_id, action, result} ->
-        dispatch_live(state, live_id, action, result)
-        state
+    case notification(decoded, state) do
+      {:notification, live_id, notification} ->
+        dispatch_live(state, live_id, notification)
 
       :reply ->
         deliver_reply(decoded, state)
@@ -349,44 +371,134 @@ defmodule SurrealDB.Connection do
         state = %{state | pending: pending}
         state = apply_side_effects(state, method, params, result)
         state = register_live(state, method, meta, result)
-        GenServer.reply(from, public_reply(method, meta, result))
+        if from, do: GenServer.reply(from, public_reply(method, meta, result))
         state
     end
   end
 
-  defp notification(decoded) do
+  # A reply carries the id of a pending request. Anything else whose result looks like a
+  # notification is one: SurrealDB 2.x put the notification fields at the top level, 3.x
+  # sends them under `result` with no top-level id. Checking for a pending id first means a
+  # reply whose result happens to have an `action` field is still delivered as a reply.
+  defp notification(decoded, state) do
     cond do
+      Map.has_key?(state.pending, decoded["id"]) ->
+        :reply
+
       Map.has_key?(decoded, "action") ->
-        {:notification, decoded["id"], decoded["action"], decoded["result"]}
+        {:notification, decoded["id"], decoded}
 
       is_map(decoded["result"]) and Map.has_key?(decoded["result"], "action") ->
-        inner = decoded["result"]
-        {:notification, inner["id"], inner["action"], inner["result"]}
+        {:notification, decoded["result"]["id"], decoded["result"]}
 
       true ->
         :reply
     end
   end
 
-  defp dispatch_live(state, live_id, action, result) do
-    case Map.get(state.live, normalize_id(live_id)) do
-      nil ->
-        :ok
+  defp dispatch_live(state, live_id, notification) do
+    id = normalize_id(live_id)
+    action = RPC.action(notification["action"])
 
-      pid ->
-        send(pid, {:surrealdb, :live, live_id, %{action: RPC.action(action), result: result}})
-    end
+    message =
+      {:surrealdb, :live, live_id,
+       %{action: action, result: notification["result"], record: notification["record"]}}
+
+    state.live |> Map.get(id, MapSet.new()) |> Enum.each(&send(&1, message))
+
+    # KILLED is the last notification a live query sends: the server ended it (KILL, a
+    # removed table, a revoked principal), so forget it and its subscribers.
+    if action == :killed, do: drop_live(state, id), else: state
   end
 
   defp register_live(state, "live", %{subscriber: pid}, {:ok, live_id}) when is_pid(pid) do
-    %{state | live: Map.put(state.live, normalize_id(live_id), pid)}
+    add_subscriber(state, normalize_id(live_id), pid)
   end
 
   defp register_live(state, "kill", %{live_id: live_id}, {:ok, _result}) do
-    %{state | live: Map.delete(state.live, normalize_id(live_id))}
+    drop_live(state, normalize_id(live_id))
   end
 
   defp register_live(state, _method, _meta, _result), do: state
+
+  # ── Live subscribers ───────────────────────────────────────────────────────
+
+  defp add_subscriber(state, id, pid) do
+    subscribers = state.live |> Map.get(id, MapSet.new()) |> MapSet.put(pid)
+    state = %{state | live: Map.put(state.live, id, subscribers)}
+
+    if Map.has_key?(state.monitors, pid) do
+      state
+    else
+      %{state | monitors: Map.put(state.monitors, pid, Process.monitor(pid))}
+    end
+  end
+
+  defp remove_subscriber(state, id, pid) do
+    case Map.fetch(state.live, id) do
+      {:ok, subscribers} ->
+        subscribers = MapSet.delete(subscribers, pid)
+        state = %{state | live: Map.put(state.live, id, subscribers)}
+        demonitor_unused(state, [pid])
+
+      :error ->
+        state
+    end
+  end
+
+  defp drop_live(state, id) do
+    {subscribers, live} = Map.pop(state.live, id, MapSet.new())
+    demonitor_unused(%{state | live: live}, MapSet.to_list(subscribers))
+  end
+
+  # A subscriber exited. Drop it everywhere, and kill every live query it was the last
+  # subscriber of, so the server stops sending notifications nobody will read.
+  defp subscriber_down(state, pid) do
+    state = %{state | monitors: Map.delete(state.monitors, pid)}
+
+    Enum.reduce(state.live, state, fn {id, subscribers}, state ->
+      if MapSet.member?(subscribers, pid) do
+        remaining = MapSet.delete(subscribers, pid)
+
+        if MapSet.size(remaining) == 0 do
+          state |> Map.update!(:live, &Map.delete(&1, id)) |> kill_orphan(id)
+        else
+          %{state | live: Map.put(state.live, id, remaining)}
+        end
+      else
+        state
+      end
+    end)
+  end
+
+  defp kill_orphan(state, id) do
+    {request_id, state} = next_id(state)
+    payload = encode_request(state, request_id, "kill", [SurrealDB.Uuid.new(id)])
+
+    case state.engine.request(state.engine_state, request_id, payload, session(state)) do
+      {:ok, engine_state} ->
+        pending = Map.put(state.pending, request_id, {nil, "kill", [id], %{}})
+        %{state | engine_state: engine_state, pending: pending}
+
+      {:error, _reason} ->
+        state
+    end
+  end
+
+  defp demonitor_unused(state, pids) do
+    Enum.reduce(pids, state, fn pid, state ->
+      still_used = Enum.any?(state.live, fn {_id, subs} -> MapSet.member?(subs, pid) end)
+
+      case {still_used, Map.pop(state.monitors, pid)} do
+        {false, {ref, monitors}} when is_reference(ref) ->
+          Process.demonitor(ref, [:flush])
+          %{state | monitors: monitors}
+
+        _other ->
+          state
+      end
+    end)
+  end
 
   # ── Result shaping ─────────────────────────────────────────────────────────
 
