@@ -54,6 +54,8 @@ defmodule SurrealDB.TypesTest do
           6_007_008_009
 
       assert Duration.to_string(%Duration{nanoseconds: ns}) == "1y2w3d4h5m6s7ms8µs9ns"
+      assert Duration.parse("1y2w3d4h5m6s7ms8µs9ns") == %Duration{nanoseconds: ns}
+      assert Duration.parse(Duration.to_string(Duration.new(365, :day))) == Duration.new(1, :year)
     end
   end
 

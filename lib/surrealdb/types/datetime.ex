@@ -23,7 +23,11 @@ defmodule SurrealDB.Datetime do
   @spec from_datetime(DateTime.t()) :: t()
   def from_datetime(%DateTime{} = dt) do
     nanos = DateTime.to_unix(dt, :nanosecond)
-    %__MODULE__{seconds: div(nanos, 1_000_000_000), nanos: rem(nanos, 1_000_000_000)}
+    # Floor division keeps `nanos` non-negative before 1970.
+    %__MODULE__{
+      seconds: Integer.floor_div(nanos, 1_000_000_000),
+      nanos: Integer.mod(nanos, 1_000_000_000)
+    }
   end
 
   @doc """

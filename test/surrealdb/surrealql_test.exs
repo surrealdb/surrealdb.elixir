@@ -32,6 +32,8 @@ defmodule SurrealDB.SurrealQLTest do
 
     assert SurrealQL.to_surql(Datetime.from_unix(-1, 250_000_000)) ==
              "d'1969-12-31T23:59:59.25Z'"
+
+    assert SurrealQL.to_surql(~U[1969-12-31 23:59:59.250000Z]) == "d'1969-12-31T23:59:59.25Z'"
   end
 
   test "renders ranges" do
@@ -39,5 +41,9 @@ defmodule SurrealDB.SurrealQLTest do
     assert SurrealQL.to_surql(Range.new({:excl, 1}, {:incl, 5})) == "1>..=5"
     assert SurrealQL.to_surql(Range.new(nil, nil)) == ".."
     assert SurrealQL.to_surql(RecordId.new("t", Range.new({:incl, "a"}, nil))) == "t:a.."
+    assert SurrealQL.to_surql(Range.new({:incl, "a"}, {:incl, "z"})) == "'a'..='z'"
+
+    assert SurrealQL.to_surql(RecordId.new("t", Range.new({:incl, "a"}, {:incl, "z"}))) ==
+             "t:a..=z"
   end
 end

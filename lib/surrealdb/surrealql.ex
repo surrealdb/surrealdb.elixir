@@ -58,7 +58,7 @@ defmodule SurrealDB.SurrealQL do
   @spec format_rid_key(term()) :: String.t()
   def format_rid_key(key) when is_binary(key), do: escape_rid_key(key)
   def format_rid_key(key) when is_integer(key), do: Integer.to_string(key)
-  def format_rid_key(%Range{} = range), do: to_surql(range)
+  def format_rid_key(%Range{} = range), do: range_to_surql(range, &rid_bound/1)
   def format_rid_key(key), do: to_surql(key)
 
   @doc "Renders any supported value as a SurrealQL literal."
@@ -85,7 +85,7 @@ defmodule SurrealDB.SurrealQL do
   def to_surql(%Datetime{} = datetime), do: "d'" <> Datetime.to_iso8601(datetime) <> "'"
   def to_surql(%DateTime{} = datetime), do: datetime |> Datetime.from_datetime() |> to_surql()
   def to_surql(%Bytes{data: data}), do: "b\"" <> Base.encode16(data) <> "\""
-  def to_surql(%Range{} = range), do: range_to_surql(range)
+  def to_surql(%Range{} = range), do: range_to_surql(range, &value_bound/1)
 
   def to_surql(%Geometry{type: :point, coordinates: [x, y]}),
     do: "(" <> to_number(x) <> ", " <> to_number(y) <> ")"
@@ -168,27 +168,32 @@ defmodule SurrealDB.SurrealQL do
     end
   end
 
-  defp range_to_surql(%Range{begin: begin_bound, end: end_bound}) do
+  # `bound` renders each bound: as a record id key inside a record id (`person:a..=z`), as
+  # an ordinary value anywhere else (`'a'..='z'`).
+  defp range_to_surql(%Range{begin: begin_bound, end: end_bound}, bound) do
     left =
       case begin_bound do
         nil -> ""
-        {:incl, value} -> range_bound(value)
-        {:excl, value} -> range_bound(value) <> ">"
+        {:incl, value} -> bound.(value)
+        {:excl, value} -> bound.(value) <> ">"
       end
 
     right =
       case end_bound do
         nil -> ""
-        {:incl, value} -> "=" <> range_bound(value)
-        {:excl, value} -> range_bound(value)
+        {:incl, value} -> "=" <> bound.(value)
+        {:excl, value} -> bound.(value)
       end
 
     left <> ".." <> right
   end
 
-  defp range_bound(%Range{} = range), do: "(" <> range_to_surql(range) <> ")"
-  defp range_bound(value) when is_binary(value), do: escape_rid_key(value)
-  defp range_bound(value), do: to_surql(value)
+  defp rid_bound(%Range{} = range), do: "(" <> range_to_surql(range, &rid_bound/1) <> ")"
+  defp rid_bound(value) when is_binary(value), do: escape_rid_key(value)
+  defp rid_bound(value), do: to_surql(value)
+
+  defp value_bound(%Range{} = range), do: "(" <> range_to_surql(range, &value_bound/1) <> ")"
+  defp value_bound(value), do: to_surql(value)
 
   defp to_number(n) when is_integer(n), do: Integer.to_string(n)
   defp to_number(n) when is_float(n), do: format_float(n)
