@@ -103,10 +103,11 @@ defmodule SurrealDB.Connection do
 
   @default_reconnect [attempts: 5, delay: 1_000, max_delay: 60_000, multiplier: 2.0, jitter: 0.1]
 
-  # The methods a transaction runs. The rest change session state (`use`, `signin`, `let`,
-  # ...), start or end live queries, or run outside any transaction on the server.
+  # The methods a transaction runs: queries and data methods. The rest change session state
+  # (`use`, `signin`, `let`, ...), start or end live queries, or ask about the connection or
+  # server (`info`, `version`, `ping`), which a transaction has no part in.
   @txn_methods ~w(query select create insert insert_relation update upsert merge patch delete
-                  relate gql graphql info version ping)
+                  relate gql graphql)
 
   @doc "Starts a connection process. See `SurrealDB.start_link/1` for the options."
   @spec start_link(keyword()) :: GenServer.on_start()
