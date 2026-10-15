@@ -12,10 +12,10 @@ defmodule SurrealDB.Engine.Mock do
   `{:mock_reset, reason}` to simulate lost in-flight requests. A responder that returns
   `:noreply` leaves the request unanswered, `{:delay, ms, result}` (or
   `{:delay, ms, {:error, error}}`) answers after `ms`, `{:batch, result, payloads}`
-  delivers the reply and the extra payloads in one transport message, and
-  `{:frames, results}` answers it with one response per result, as a streaming query is
-  answered. A responder of arity 3 also gets the decoded request, to check its `"session"`
-  and `"txn"` fields.
+  delivers the reply and the extra payloads in one transport message, `{:send_error,
+  reason}` fails the send itself, and `{:frames, results}` answers it with one response
+  per result, as a streaming query is answered. A responder of arity 3 also gets the
+  decoded request, to check its `"session"` and `"txn"` fields.
   """
 
   @behaviour SurrealDB.Engine
@@ -43,6 +43,9 @@ defmodule SurrealDB.Engine.Mock do
     params = request["params"] || []
 
     case respond(responder, method, params, request) do
+      {:send_error, reason} ->
+        {:error, reason}
+
       :noreply ->
         :ok
 
@@ -72,8 +75,10 @@ defmodule SurrealDB.Engine.Mock do
         reply = codec.encode(%{"id" => id, "result" => result})
         send(self(), {:mock_batch, [reply | Enum.map(payloads, &codec.encode/1)]})
     end
-
-    {:ok, conn}
+    |> case do
+      {:error, reason} -> {:error, reason}
+      _sent -> {:ok, conn}
+    end
   end
 
   # A 3-arity responder also gets the whole request, to see its session and txn.
