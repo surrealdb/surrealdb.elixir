@@ -392,10 +392,22 @@ defmodule SurrealDB.Connection do
   # A timed-out request on an engine that cannot cancel it (a WebSocket) may still run on
   # the server. If it changes session state, keep it pending with no caller, so its late
   # reply still updates the namespace, database, and auth the connection reports and sends.
+  # A late `live` reply starts a query nobody listens to, so it is killed.
   defp await_late_reply(state, pending, id, method, params, meta) do
-    if method in @session_methods and not function_exported?(state.engine, :cancel, 2),
-      do: Map.put(pending, id, {nil, method, params, Map.delete(meta, :timer)}),
-      else: pending
+    cond do
+      function_exported?(state.engine, :cancel, 2) ->
+        pending
+
+      method == "live" ->
+        meta = meta |> Map.take([:session]) |> Map.put(:late_live, true)
+        Map.put(pending, id, {nil, method, params, meta})
+
+      method in @session_methods ->
+        Map.put(pending, id, {nil, method, params, Map.delete(meta, :timer)})
+
+      true ->
+        pending
+    end
   end
 
   defp handle_transport(message, state) do
@@ -757,7 +769,8 @@ defmodule SurrealDB.Connection do
         {:ok, _server_id, state} ->
           {:cont, {:ok, state}}
 
-        {:error, %Error{kind: :connection} = error, state} ->
+        # A slow reply is not a refusal: the server may have started it. Try again.
+        {:error, %Error{kind: kind} = error, state} when kind in [:connection, :timeout] ->
           {:halt, {:error, error, state}}
 
         {:error, error, state} ->
@@ -829,17 +842,24 @@ defmodule SurrealDB.Connection do
 
           {:closed, state} ->
             error = Error.new(:connection, "connection closed")
-            finish_sync({:error, error, fail_pending(state, error)}, stash)
+            finish_sync({:error, error, fail_sync(state, id, error)}, stash)
         end
 
       {:error, reason, engine_state} ->
         error = conn_error(reason)
 
         finish_sync(
-          {:error, error, fail_pending(%{state | engine_state: engine_state}, error)},
+          {:error, error, fail_sync(%{state | engine_state: engine_state}, id, error)},
           stash
         )
     end
+  end
+
+  # Failing the pending requests also files this one's result under `sync`; nothing will
+  # read it, so drop it rather than keep one per failed attempt.
+  defp fail_sync(state, id, error) do
+    state = fail_pending(state, error)
+    %{state | sync: Map.delete(state.sync, id)}
   end
 
   # While a reconnect restores the session, calls join the queue at once (so their timers
@@ -971,6 +991,9 @@ defmodule SurrealDB.Connection do
     |> Map.get(id, MapSet.new())
     |> Enum.each(&send(&1, {:surrealdb, :live, public_id, message}))
   end
+
+  defp register_live(state, "live", _params, %{late_live: true} = meta, {:ok, server_id}),
+    do: kill_orphan(state, normalize_id(server_id), Map.get(meta, :session))
 
   defp register_live(state, "live", params, %{subscriber: pid} = meta, {:ok, server_id})
        when is_pid(pid) do

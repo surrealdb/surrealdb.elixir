@@ -307,6 +307,27 @@ defmodule SurrealDB.ConnectionTest do
       assert :sys.get_state(db).pending == %{}
     end
 
+    test "a live query that starts after its call timed out is killed" do
+      parent = self()
+
+      responder = fn
+        "live", _params -> :noreply
+        "kill", params -> tap({:ok, nil}, fn _ -> send(parent, {:kill, params}) end)
+        "version", _params -> {:ok, "surrealdb-3.3.4"}
+        _method, params -> {:ok, params}
+      end
+
+      db = start(responder: responder, timeout: 50)
+      assert {:error, %SurrealDB.Error{kind: :timeout}} = SurrealDB.live(db, "person")
+
+      [id] = Map.keys(:sys.get_state(db).pending)
+      late = %{"id" => id, "result" => Uuid.new(@live_uuid)}
+      send(db, {:mock_message, Codec.CBOR.encode(late)})
+
+      assert_receive {:kill, [%Uuid{value: @live_uuid}]}
+      assert :sys.get_state(db).live == %{}
+    end
+
     test "the connection-wide timeout applies by default" do
       db = start(timeout: 50)
 
