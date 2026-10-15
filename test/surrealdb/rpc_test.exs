@@ -44,6 +44,7 @@ defmodule SurrealDB.RPCTest do
     assert RPC.action("CREATE") == :create
     assert RPC.action("UPDATE") == :update
     assert RPC.action(:delete) == :delete
+    assert RPC.action("SOMETHING_NEW") == "something_new"
   end
 
   describe "engine selection" do
