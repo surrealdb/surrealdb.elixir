@@ -18,11 +18,22 @@ defmodule SurrealDB.IntegrationTest do
 
   @url System.get_env("SURREALDB_URL", "ws://localhost:8000/rpc")
 
+  # A fresh database per test, so tests never see each other's data and every run starts
+  # from a database that does not exist yet.
+  setup do
+    Process.put(
+      :it_database,
+      "it_#{System.system_time(:microsecond)}_#{System.unique_integer([:positive])}"
+    )
+
+    :ok
+  end
+
   defp connect(opts \\ []) do
     base = [
       url: @url,
       namespace: "test",
-      database: "test",
+      database: Process.get(:it_database, "test"),
       auth: %SurrealDB.Auth.Root{user: "root", pass: "root"}
     ]
 
@@ -52,12 +63,19 @@ defmodule SurrealDB.IntegrationTest do
 
   test "live query receives a notification" do
     db = connect()
+    {:ok, _} = SurrealDB.query(db, "DEFINE TABLE watched")
     assert {:ok, live_id} = SurrealDB.live(db, "watched")
 
     {:ok, _} = SurrealDB.create(db, "watched", %{"value" => 1})
 
     assert_receive {:surrealdb, :live, _id, %{action: :create}}, 2_000
     assert {:ok, _} = SurrealDB.kill(db, live_id)
+  end
+
+  test "signs in before selecting a database that does not exist yet" do
+    db = connect()
+    assert {:ok, [created]} = SurrealDB.create(db, "fresh", %{"n" => 1})
+    assert created["n"] == 1
   end
 
   test "works over the HTTP engine too" do
