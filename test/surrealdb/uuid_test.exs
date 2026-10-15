@@ -24,4 +24,17 @@ defmodule SurrealDB.UuidTest do
     Process.sleep(2)
     assert Uuid.v7().value > value
   end
+
+  test "v7 UUIDs sort in the order they were made, within a millisecond and across processes" do
+    values = for _ <- 1..5_000, do: Uuid.v7().value
+    assert values == Enum.sort(values)
+    assert length(Enum.uniq(values)) == 5_000
+
+    all =
+      1..8
+      |> Enum.map(fn _ -> Task.async(fn -> for _ <- 1..1_000, do: Uuid.v7().value end) end)
+      |> Enum.flat_map(&Task.await/1)
+
+    assert length(Enum.uniq(all)) == 8_000
+  end
 end

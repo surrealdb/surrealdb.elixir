@@ -84,10 +84,13 @@ jobs:
           docker run --detach --name surrealdb --publish 8000:8000 \
             surrealdb/surrealdb:${{ matrix.surrealdb }} \
             start --user root --pass root memory
+          # /ready, unlike /health, only succeeds once startup (including the root user)
+          # has finished.
           for _ in $(seq 1 60); do
-            if curl --silent --fail http://127.0.0.1:8000/health; then break; fi
+            if curl --silent --fail http://127.0.0.1:8000/ready; then break; fi
             sleep 1
           done
+          curl --silent --fail http://127.0.0.1:8000/ready
           curl --silent --fail http://127.0.0.1:8000/version
           echo
 

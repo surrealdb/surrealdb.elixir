@@ -74,9 +74,14 @@ defmodule SurrealDB.Engine.HTTP do
         {:ok, conn} ->
           {:ok, conn}
 
-        # The server closed an idle keep-alive connection before we noticed. Nothing was
-        # sent, so it is safe to open a new connection and try once more.
-        {:error, %{requests: requests} = conn, _reason} when map_size(requests) == 0 ->
+        # The server closed an idle keep-alive connection before we noticed, so writing the
+        # request failed. This is the only error retried: it comes from the write itself,
+        # so the server has at most part of this request, which it cannot run, and there is
+        # no earlier request in flight that could be lost. Errors after a successful write
+        # (while waiting for the response) are never retried, since the server may have
+        # run the request.
+        {:error, %{requests: requests} = conn, %Mint.TransportError{reason: reason}}
+        when map_size(requests) == 0 and reason in [:closed, :epipe, :econnreset, :enotconn] ->
           with {:ok, conn} <- reopen(conn),
                {:ok, conn} <- send_request(conn, id, headers, body) do
             {:ok, conn}
@@ -109,6 +114,30 @@ defmodule SurrealDB.Engine.HTTP do
   defp reopen(conn) do
     Mint.HTTP.close(conn.mint)
     open(%{conn | requests: %{}})
+  end
+
+  # HTTP/1.1 answers pipelined requests in order, so a request that timed out would hold up
+  # every request after it. Close the connection (the next request opens a new one) and
+  # fail the requests that were waiting behind it; they cannot be retried, since the server
+  # may already have run them.
+  @impl true
+  def cancel(%__MODULE__{} = conn, id) do
+    if Enum.any?(conn.requests, fn {_ref, request} -> request.id == id end) do
+      {:ok, mint} = Mint.HTTP.close(conn.mint)
+
+      error =
+        Error.new(
+          :connection,
+          "the HTTP connection was closed because an earlier request on it (#{id}) timed out"
+        )
+
+      events =
+        for {_ref, request} <- conn.requests, request.id != id, do: {:failed, request.id, error}
+
+      {:ok, events, %{conn | mint: mint, requests: %{}}}
+    else
+      {:ok, [], conn}
+    end
   end
 
   @impl true
@@ -204,7 +233,11 @@ defmodule SurrealDB.Engine.HTTP do
         Error.from_rpc(rpc_error)
 
       %{} = json ->
-        message = json["information"] || json["description"] || json["details"] || body
+        message =
+          Enum.find_value(["information", "description", "details"], body, fn key ->
+            if is_binary(json[key]), do: json[key]
+          end)
+
         Error.new(status_kind(status), "HTTP #{status}: #{message}", code: status, details: json)
 
       nil ->
