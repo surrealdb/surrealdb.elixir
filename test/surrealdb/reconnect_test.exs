@@ -399,6 +399,33 @@ defmodule SurrealDB.ReconnectTest do
     assert System.monotonic_time(:millisecond) - started < 1_500
   end
 
+  test "local calls are answered while a slow restore runs" do
+    parent = self()
+    base = responder(parent)
+
+    responder = fn
+      "version", params ->
+        n = Process.put(:versions, (Process.get(:versions) || 0) + 1) || 0
+        send(parent, {:rpc, "version", params})
+        if n > 0, do: {:delay, 1_500, "surrealdb-3.3.4"}, else: {:ok, "surrealdb-3.3.4"}
+
+      method, params ->
+        base.(method, params)
+    end
+
+    db = start(responder: responder)
+    :ok = SurrealDB.subscribe_status(db)
+    drain()
+    send(db, :mock_closed)
+    assert_receive {:surrealdb, :status, :reconnecting, _}
+    assert_receive {:rpc, "version", _}, 1_000
+
+    assert %{} = GenServer.call(db, :session_info, 500)
+    assert :ok = GenServer.call(db, {:unsubscribe_status, self()}, 500)
+    assert :ok = GenServer.call(db, {:subscribe_status, self()}, 500)
+    assert_receive {:surrealdb, :status, :connected, _}, 3_000
+  end
+
   test "a restarted live query that times out retries the reconnect instead of ending" do
     responder =
       on_reconnect(self(), "live", fn

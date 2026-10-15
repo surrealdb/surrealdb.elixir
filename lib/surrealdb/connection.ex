@@ -762,6 +762,22 @@ defmodule SurrealDB.Connection do
     end
   end
 
+  # Calls the connection answers from its own state need no server, so a slow restore does
+  # not make their callers wait (and exit on GenServer's default call timeout).
+  defp absorb(%{status: :reconnecting} = state, {:"$gen_call", from, call})
+       when call == :session_info or
+              (is_tuple(call) and
+                 elem(call, 0) in [
+                   :subscribe_live,
+                   :unsubscribe_live,
+                   :subscribe_status,
+                   :unsubscribe_status
+                 ]) do
+    {:reply, reply, state} = handle_call(call, from, state)
+    GenServer.reply(from, reply)
+    {:ok, state}
+  end
+
   defp absorb(%{status: :reconnecting} = state, {:request_timeout, id}) do
     case List.keytake(state.queue, id, 0) do
       {{^id, from, method, _params, _meta}, queue} ->
