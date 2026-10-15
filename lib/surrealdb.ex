@@ -26,7 +26,8 @@ defmodule SurrealDB do
   Methods such as `select/2` and `create/3` accept a "thing" that identifies what to act on:
 
     * a string (for example `"person"`) or a `SurrealDB.Table` targets a whole table. A
-      string is always a table name, even if it contains a colon.
+      string is always a table name, even if it contains a colon. JSON cannot tell such a
+      name from a record id, so over the JSON codec it returns an `:unsupported` error.
     * a `SurrealDB.RecordId` targets a single record. Build one with
       `SurrealDB.RecordId.new/2`, or parse text with `SurrealDB.RecordId.parse!/1`.
     * a `SurrealDB.StringRecordId` targets a single record whose id the server parses.

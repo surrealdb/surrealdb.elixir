@@ -204,12 +204,18 @@ defmodule SurrealDB.Connection do
   end
 
   def handle_call({:rpc, method, params, meta}, from, state) do
-    {id, state} = next_id(state)
-    meta = start_timer(meta, id, Map.get(meta, :timeout, state.timeout))
+    case json_ambiguous_table(state, params) do
+      nil ->
+        {id, state} = next_id(state)
+        meta = start_timer(meta, id, Map.get(meta, :timeout, state.timeout))
 
-    case send_request(state, id, from, method, params, meta) do
-      {:ok, state} -> {:noreply, state}
-      {:error, error, state} -> {:reply, {:error, error}, state}
+        case send_request(state, id, from, method, params, meta) do
+          {:ok, state} -> {:noreply, state}
+          {:error, error, state} -> {:reply, {:error, error}, state}
+        end
+
+      error ->
+        {:reply, {:error, error}, state}
     end
   end
 
@@ -241,6 +247,7 @@ defmodule SurrealDB.Connection do
       version: state.version,
       status: state.status,
       uri: state.uri,
+      transport_opts: Keyword.get(state.engine_opts, :transport_opts),
       engine: state.engine,
       codec: state.codec,
       supports_live?: state.engine.supports_live?()
@@ -267,7 +274,7 @@ defmodule SurrealDB.Connection do
     case Map.pop(state.pending, id) do
       {{from, method, _params, _meta}, pending} ->
         state = reply(%{state | pending: pending}, from, id, timeout_error(method))
-        {:noreply, state}
+        cancel_in_engine(state, id)
 
       {nil, _pending} ->
         case List.keytake(state.queue, id, 0) do
@@ -293,6 +300,21 @@ defmodule SurrealDB.Connection do
   end
 
   def handle_info(message, state), do: handle_transport(message, state)
+
+  # Let the engine clean up after a timed-out request (see `Engine.cancel/2`).
+  defp cancel_in_engine(state, id) do
+    if function_exported?(state.engine, :cancel, 2) do
+      {:ok, events, engine_state} = state.engine.cancel(state.engine_state, id)
+      state = %{state | engine_state: engine_state}
+
+      case Enum.reduce_while(events, {:ok, state}, &process_event/2) do
+        {:ok, state} -> {:noreply, state}
+        {:closed, state} -> connection_lost(state, "connection closed")
+      end
+    else
+      {:noreply, state}
+    end
+  end
 
   defp handle_transport(message, state) do
     case state.engine.handle_transport(state.engine_state, message) do
@@ -467,8 +489,16 @@ defmodule SurrealDB.Connection do
           _ok -> {:ok, state}
         end
 
-      {:ok, _other, state} ->
-        {:ok, state}
+      {:ok, other, state} ->
+        if state.version_check do
+          message =
+            "the server's version reply #{inspect(other)} is not a version; " <>
+              "pass `version_check: false` to connect anyway"
+
+          {:error, Error.new(:unsupported, message, details: other), state}
+        else
+          {:ok, state}
+        end
 
       {:error, %Error{kind: :connection} = error, state} ->
         {:error, error, state}
@@ -663,7 +693,8 @@ defmodule SurrealDB.Connection do
   defp process_event({:reply, id, binary}, {:ok, state}) do
     case decode(state, binary) do
       {:ok, %{} = decoded} ->
-        {:cont, {:ok, route(Map.put_new(decoded, "id", id), state)}}
+        # The transport knows which request this answers; the body's id is not trusted.
+        {:cont, {:ok, route(Map.put(decoded, "id", id), state)}}
 
       _other ->
         error = Error.new(:decode, "could not decode the reply to request #{id}", details: binary)
@@ -891,9 +922,9 @@ defmodule SurrealDB.Connection do
   defp apply_side_effects(state, _method, _params, {:error, _error}), do: state
 
   defp apply_side_effects(state, "use", [namespace, database], {:ok, _result}) do
-    namespace = use_value(namespace, state.namespace)
-    # The server drops the database when the namespace is cleared.
+    # The server drops the database when the namespace is cleared (sent as NULL).
     database = if is_nil(namespace), do: nil, else: use_value(database, state.database)
+    namespace = use_value(namespace, state.namespace)
     %{state | namespace: namespace, database: database}
   end
 
@@ -1001,8 +1032,36 @@ defmodule SurrealDB.Connection do
   defp next_id(state), do: {state.next_id, %{state | next_id: state.next_id + 1}}
 
   defp encode_request(state, id, method, params) do
-    state.codec.encode(RPC.request(id, method, params))
+    state.codec.encode(RPC.request(id, method, wire_params(state, method, params)))
   end
+
+  # JSON has no NONE, so a "leave unchanged" `use` parameter would arrive as NULL and clear
+  # the selection. Send the current selection in its place.
+  defp wire_params(%{codec: SurrealDB.Codec.JSON} = state, "use", [namespace, database]),
+    do: [use_value(namespace, state.namespace), use_value(database, state.database)]
+
+  defp wire_params(_state, _method, params), do: params
+
+  # JSON has no table type: the server reads a string such as "user:1234" as a record id,
+  # so a table name with a colon would silently target a record. Refuse it rather than act
+  # on the wrong thing.
+  defp json_ambiguous_table(%{codec: SurrealDB.Codec.JSON}, params) do
+    Enum.find_value(params, fn
+      %SurrealDB.Table{name: name} when is_binary(name) ->
+        if String.contains?(name, ":") do
+          Error.new(
+            :unsupported,
+            "the table name #{inspect(name)} cannot be sent over JSON, which reads it as a " <>
+              "record id; use the CBOR codec"
+          )
+        end
+
+      _other ->
+        nil
+    end)
+  end
+
+  defp json_ambiguous_table(_state, _params), do: nil
 
   defp decode(state, binary), do: state.codec.decode(binary)
 
