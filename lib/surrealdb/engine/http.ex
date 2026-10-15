@@ -7,11 +7,15 @@ defmodule SurrealDB.Engine.HTTP do
   `Surreal-NS`, `Surreal-DB`, and `Authorization` headers on every request.
 
   Live queries are not available on this engine. Use a `ws://` or `wss://` URL for those.
+
+  The underlying HTTP/1.1 connection is kept alive between requests. When the server or
+  the network closes it, the requests in flight fail and the next request opens a new
+  connection.
   """
 
   @behaviour SurrealDB.Engine
 
-  defstruct [:mint, :path, :host, :content_type, requests: %{}]
+  defstruct [:mint, :scheme, :host, :port, :path, :content_type, :connect_opts, requests: %{}]
 
   @impl true
   def supports_live?, do: false
@@ -28,12 +32,22 @@ defmodule SurrealDB.Engine.HTTP do
       [protocols: [:http1], mode: :active]
       |> Keyword.merge(transport_opts(scheme, opts))
 
-    case Mint.HTTP.connect(scheme, host, port, connect_opts) do
-      {:ok, mint} ->
-        {:ok, %__MODULE__{mint: mint, path: path, host: host, content_type: content_type}}
+    conn = %__MODULE__{
+      scheme: scheme,
+      host: host,
+      port: port,
+      path: path,
+      content_type: content_type,
+      connect_opts: connect_opts
+    }
 
-      {:error, reason} ->
-        {:error, reason}
+    open(conn)
+  end
+
+  defp open(conn) do
+    case Mint.HTTP.connect(conn.scheme, conn.host, conn.port, conn.connect_opts) do
+      {:ok, mint} -> {:ok, %{conn | mint: mint}}
+      {:error, reason} -> {:error, reason}
     end
   end
 
@@ -42,17 +56,46 @@ defmodule SurrealDB.Engine.HTTP do
     headers = build_headers(conn, session)
     body = IO.iodata_to_binary(payload)
 
+    with {:ok, conn} <- ensure_open(conn) do
+      case send_request(conn, headers, body) do
+        {:ok, conn} ->
+          {:ok, conn}
+
+        # The server closed an idle keep-alive connection before we noticed. Nothing was
+        # sent, so it is safe to open a new connection and try once more.
+        {:error, %{requests: requests} = conn, _reason} when map_size(requests) == 0 ->
+          with {:ok, conn} <- reopen(conn), {:ok, conn} <- send_request(conn, headers, body) do
+            {:ok, conn}
+          else
+            {:error, _conn, reason} -> {:error, reason}
+            {:error, reason} -> {:error, reason}
+          end
+
+        {:error, _conn, reason} ->
+          {:error, reason}
+      end
+    end
+  end
+
+  defp send_request(conn, headers, body) do
     case Mint.HTTP.request(conn.mint, "POST", conn.path, headers, body) do
       {:ok, mint, ref} ->
         requests = Map.put(conn.requests, ref, %{status: nil, body: []})
         {:ok, %{conn | mint: mint, requests: requests}}
 
       {:error, mint, reason} ->
-        {:error, %{conn | mint: mint}, reason} |> elem_error()
+        {:error, %{conn | mint: mint}, reason}
     end
   end
 
-  defp elem_error({:error, _conn, reason}), do: {:error, reason}
+  defp ensure_open(conn) do
+    if Mint.HTTP.open?(conn.mint), do: {:ok, conn}, else: reopen(conn)
+  end
+
+  defp reopen(conn) do
+    Mint.HTTP.close(conn.mint)
+    open(%{conn | requests: %{}})
+  end
 
   @impl true
   def handle_transport(%__MODULE__{} = conn, message) do
@@ -64,8 +107,12 @@ defmodule SurrealDB.Engine.HTTP do
         {events, requests} = process_responses(responses, conn.requests, [])
         {:ok, events, %{conn | mint: mint, requests: requests}}
 
-      {:error, mint, _reason, _responses} ->
-        {:ok, [:closed], %{conn | mint: mint}}
+      # The connection dropped. Whatever completed before it is still delivered; the rest
+      # is lost, and the next request reconnects.
+      {:error, mint, reason, responses} ->
+        {events, _requests} = process_responses(responses, conn.requests, [])
+        Mint.HTTP.close(mint)
+        {:ok, events ++ [{:reset, reason}], %{conn | mint: mint, requests: %{}}}
     end
   end
 
@@ -97,9 +144,9 @@ defmodule SurrealDB.Engine.HTTP do
     process_responses(rest, requests, [{:message, body} | events])
   end
 
-  defp process_responses([{:error, ref, _reason} | rest], requests, events) do
+  defp process_responses([{:error, ref, reason} | rest], requests, events) do
     requests = Map.delete(requests, ref)
-    process_responses(rest, requests, [:closed | events])
+    process_responses(rest, requests, [{:reset, reason} | events])
   end
 
   defp process_responses([_other | rest], requests, events) do

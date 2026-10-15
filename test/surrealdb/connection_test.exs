@@ -16,6 +16,7 @@ defmodule SurrealDB.ConnectionTest do
       "live", [_thing, _diff] -> {:ok, Uuid.new(@live_uuid)}
       "kill", _params -> {:ok, nil}
       "boom", _params -> {:error, %{"code" => -32_000, "message" => "explosion"}}
+      "hang", _params -> :noreply
       method, params -> {:ok, %{"method" => method, "params" => params}}
     end
   end
@@ -128,6 +129,48 @@ defmodule SurrealDB.ConnectionTest do
     db = start()
     assert {:ok, _} = SurrealDB.let(db, "x", 1)
     assert {:ok, _} = SurrealDB.unset(db, "x")
+  end
+
+  describe "connection loss" do
+    @tag :capture_log
+    test "a closed transport fails pending calls and stops the process" do
+      Process.flag(:trap_exit, true)
+
+      {:ok, db} =
+        SurrealDB.Connection.start_link(
+          url: "ws://mock/rpc",
+          engine: SurrealDB.Engine.Mock,
+          responder: responder()
+        )
+
+      ref = Process.monitor(db)
+      task = Task.async(fn -> SurrealDB.Connection.call(db, "hang", []) end)
+      wait_for_pending(db)
+
+      send(db, :mock_closed)
+
+      assert {:error, %SurrealDB.Error{kind: :connection}} = Task.await(task)
+      assert_receive {:DOWN, ^ref, :process, ^db, {:shutdown, {:connection_lost, _}}}
+    end
+
+    test "a reset fails the calls in flight and keeps the process" do
+      db = start()
+      task = Task.async(fn -> SurrealDB.Connection.call(db, "hang", []) end)
+      wait_for_pending(db)
+
+      send(db, {:mock_reset, :closed})
+
+      assert {:error, %SurrealDB.Error{kind: :connection}} = Task.await(task)
+      assert Process.alive?(db)
+      assert {:ok, _} = SurrealDB.version(db)
+    end
+  end
+
+  defp wait_for_pending(db) do
+    if map_size(:sys.get_state(db).pending) == 0 do
+      Process.sleep(5)
+      wait_for_pending(db)
+    end
   end
 
   describe "live queries" do
