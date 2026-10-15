@@ -60,3 +60,6 @@ jobs:
 
       - name: Run tests
         run: mix test
+
+      - name: Build the hex package
+        run: mix hex.build
