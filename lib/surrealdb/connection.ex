@@ -193,15 +193,6 @@ defmodule SurrealDB.Connection do
     GenServer.call(server, {:session_info, session})
   end
 
-  @doc false
-  # Copies the credentials a forked session needs to sign in again on its own after a
-  # reconnect.
-  def copy_auth(from, to) do
-    {server, from_session, _txn} = target(from)
-    {_server, to_session, _txn} = target(to)
-    GenServer.call(server, {:copy_auth, from_session, to_session})
-  end
-
   # ── GenServer callbacks ─────────────────────────────────────────────────
 
   @impl true
@@ -274,17 +265,6 @@ defmodule SurrealDB.Connection do
     end
   end
 
-  def handle_call({:copy_auth, from_sid, to_sid}, _from, state) do
-    source = Map.get(state.sessions, from_sid, %Session{})
-
-    state =
-      update_session(state, to_sid, fn session ->
-        %{session | refresh_token: source.refresh_token, credentials: source.credentials}
-      end)
-
-    {:reply, :ok, state}
-  end
-
   def handle_call({:subscribe_live, live_id, pid}, _from, state) do
     {:reply, :ok, add_subscriber(state, normalize_id(live_id), pid)}
   end
@@ -309,6 +289,8 @@ defmodule SurrealDB.Connection do
 
     info = %{
       session: sid && SurrealDB.Uuid.new(sid),
+      # false for a session that was closed, or dropped after a reconnect
+      attached: Map.has_key?(state.sessions, sid),
       namespace: session.namespace,
       database: session.database,
       token: session.token,
@@ -940,7 +922,9 @@ defmodule SurrealDB.Connection do
       {{from, method, params, meta}, pending} ->
         cancel_timer(meta)
         state = %{state | pending: pending}
-        state = apply_effects(state, Map.get(meta, :session), method, params, result)
+        sid = Map.get(meta, :session)
+        state = apply_effects(state, sid, method, params, result)
+        state = copy_auth(state, sid, method, meta, result)
         state = register_live(state, method, params, meta, result)
         reply(state, from, id, public_reply(method, meta, result))
     end
@@ -1140,6 +1124,21 @@ defmodule SurrealDB.Connection do
   defp public_reply(_method, _meta, {:ok, value}), do: {:ok, value}
 
   # ── State mutation from method side effects ─────────────────────────────────
+
+  # A fork authenticates with its source's token and takes the source's refresh token and
+  # credentials in the same step, so it can sign in again on its own if a reconnect comes
+  # straight after.
+  defp copy_auth(state, sid, "authenticate", %{copy_auth_from: from_sid}, {:ok, _result}) do
+    source = session(state, from_sid)
+
+    update_session(
+      state,
+      sid,
+      &%{&1 | refresh_token: source.refresh_token, credentials: source.credentials}
+    )
+  end
+
+  defp copy_auth(state, _sid, _method, _meta, _result), do: state
 
   defp apply_effects(state, _sid, _method, _params, {:error, _error}), do: state
 
