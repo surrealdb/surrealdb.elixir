@@ -209,7 +209,11 @@ defmodule SurrealDB.Engine.HTTP do
         Error.from_rpc(rpc_error)
 
       %{} = json ->
-        message = json["information"] || json["description"] || json["details"] || body
+        message =
+          Enum.find_value(["information", "description", "details"], body, fn key ->
+            if is_binary(json[key]), do: json[key]
+          end)
+
         Error.new(status_kind(status), "HTTP #{status}: #{message}", code: status, details: json)
 
       nil ->

@@ -266,7 +266,7 @@ defmodule SurrealDB.Connection do
   defp scan_for_reply([{:reply, reply_id, binary} | rest], state, id) do
     case decode(state, binary) do
       {:ok, %{} = decoded} ->
-        scan_for_reply([{:decoded, Map.put_new(decoded, "id", reply_id)} | rest], state, id)
+        scan_for_reply([{:decoded, Map.put(decoded, "id", reply_id)} | rest], state, id)
 
       _other when reply_id == id ->
         {:found, {:error, Error.new(:decode, "could not decode the reply", details: binary)},
@@ -304,7 +304,8 @@ defmodule SurrealDB.Connection do
   defp process_event({:reply, id, binary}, {:ok, state}) do
     case decode(state, binary) do
       {:ok, %{} = decoded} ->
-        {:cont, {:ok, route(Map.put_new(decoded, "id", id), state)}}
+        # The transport knows which request this answers; the body's id is not trusted.
+        {:cont, {:ok, route(Map.put(decoded, "id", id), state)}}
 
       _other ->
         error = Error.new(:decode, "could not decode the reply to request #{id}", details: binary)
