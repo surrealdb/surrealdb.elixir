@@ -207,7 +207,7 @@ defmodule SurrealDB.Connection do
   # the server. If it changes session state, keep it pending with no caller, so its late
   # reply still updates the namespace, database, and auth the connection reports and sends.
   # A late `live` reply starts a query nobody listens to, so it is killed. Any other request
-  # keeps a tombstone, so its late reply is dropped instead of being read as a notification.
+  # is forgotten: its late reply carries an id, so it is never read as a notification.
   defp await_late_reply(state, pending, id, method, params, meta) do
     cond do
       function_exported?(state.engine, :cancel, 2) ->
@@ -220,7 +220,7 @@ defmodule SurrealDB.Connection do
         Map.put(pending, id, {nil, method, params, Map.delete(meta, :timer)})
 
       true ->
-        Map.put(pending, id, {nil, method, params, %{discard: true}})
+        pending
     end
   end
 
@@ -331,19 +331,22 @@ defmodule SurrealDB.Connection do
 
     case state.engine.request(state.engine_state, id, payload, session(state)) do
       {:ok, engine_state} ->
-        await_reply(%{state | engine_state: engine_state}, id, method, params, timeout)
+        state = %{state | engine_state: engine_state}
+        await_reply(state, id, method, params, deadline(timeout))
 
       {:error, reason} ->
         {:error, conn_error(reason), state}
     end
   end
 
-  defp await_reply(state, id, method, params, timeout) do
+  # The deadline is absolute, so transport traffic that is not the reply (pings, other
+  # frames) cannot keep pushing the timeout back.
+  defp await_reply(state, id, method, params, deadline) do
     receive do
       message ->
         case state.engine.handle_transport(state.engine_state, message) do
           :unknown ->
-            await_reply(state, id, method, params, timeout)
+            await_reply(state, id, method, params, deadline)
 
           {:ok, events, engine_state} ->
             state = %{state | engine_state: engine_state}
@@ -358,16 +361,23 @@ defmodule SurrealDB.Connection do
                 end
 
               {:not_found, state} ->
-                await_reply(state, id, method, params, timeout)
+                await_reply(state, id, method, params, deadline)
             end
 
           {:error, reason, engine_state} ->
             {:error, conn_error(reason), %{state | engine_state: engine_state}}
         end
     after
-      timeout -> {:error, Error.new(:timeout, "RPC #{method} timed out during setup"), state}
+      remaining(deadline) ->
+        {:error, Error.new(:timeout, "RPC #{method} timed out during setup"), state}
     end
   end
+
+  defp deadline(:infinity), do: :infinity
+  defp deadline(timeout), do: System.monotonic_time(:millisecond) + timeout
+
+  defp remaining(:infinity), do: :infinity
+  defp remaining(deadline), do: max(deadline - System.monotonic_time(:millisecond), 0)
 
   defp scan_for_reply([], state, _id), do: {:not_found, state}
 
