@@ -111,10 +111,11 @@ defmodule SurrealDB.Connection do
 
   @default_reconnect [attempts: 5, delay: 1_000, max_delay: 60_000, multiplier: 2.0, jitter: 0.1]
 
-  # The methods a transaction runs. The rest change session state (`use`, `signin`, `let`,
-  # ...), start or end live queries, or run outside any transaction on the server.
+  # The methods a transaction runs: queries and data methods. The rest change session state
+  # (`use`, `signin`, `let`, ...), start or end live queries, or ask about the connection or
+  # server (`info`, `version`, `ping`), which a transaction has no part in.
   @txn_methods ~w(query select create insert insert_relation update upsert merge patch delete
-                  relate gql graphql info version ping)
+                  relate gql graphql)
 
   @doc "Starts a connection process. See `SurrealDB.start_link/1` for the options."
   @spec start_link(keyword()) :: GenServer.on_start()
@@ -288,12 +289,17 @@ defmodule SurrealDB.Connection do
         {:reply, {:error, error}, state}
 
       true ->
-        {id, state} = next_id(state)
+        meta = local_sent_at(meta, from)
+        timeout = Map.get(meta, :timeout, state.timeout)
 
-        meta =
-          meta |> local_sent_at(from) |> start_timer(id, Map.get(meta, :timeout, state.timeout))
-
-        dispatch(state, id, from, method, params, meta)
+        # A call that waited out its whole timeout in the mailbox (behind a reconnect, say)
+        # is answered here: its caller has given up, so it must not be sent.
+        if out_of_time?(meta, timeout) do
+          {:reply, timeout_error(method), state}
+        else
+          {id, state} = next_id(state)
+          dispatch(state, id, from, method, params, start_timer(meta, id, timeout))
+        end
     end
   end
 
@@ -502,8 +508,8 @@ defmodule SurrealDB.Connection do
   # reply still updates the namespace, database, and auth the connection reports and sends.
   # A late `live` reply starts a query nobody listens to, so it is killed; a late `attach`
   # or `begin` opens a session or transaction nobody holds, so it is detached or cancelled.
-  # Any other request keeps a tombstone, so its late reply is dropped instead of being read
-  # as a notification.
+  # Any other request is forgotten: its late reply carries an id, so it is never read as a
+  # notification.
   defp await_late_reply(state, pending, id, method, params, meta) do
     cond do
       function_exported?(state.engine, :cancel, 2) ->
@@ -521,7 +527,7 @@ defmodule SurrealDB.Connection do
         Map.put(pending, id, {nil, method, params, meta})
 
       true ->
-        Map.put(pending, id, {nil, method, params, %{discard: true}})
+        pending
     end
   end
 
@@ -800,8 +806,9 @@ defmodule SurrealDB.Connection do
   defp detach_on_error(result, _sid), do: result
 
   # Use the token if the server still accepts it, otherwise sign in again with the stored
-  # credentials. A failed sign-in fails the attempt; with no credentials to sign in with,
-  # the session carries on signed out.
+  # credentials. A refused token with no credentials to fall back on, or a failed sign-in,
+  # fails the attempt: serving queued requests signed out would run them with the wrong
+  # permissions.
   defp restore_auth(state, sid) do
     case session(state, sid) do
       %Session{token: nil, credentials: nil} -> {:ok, state}
@@ -826,6 +833,9 @@ defmodule SurrealDB.Connection do
       {:error, _unusable, state} when is_binary(refresh) ->
         restore_refresh(state, sid, token, refresh, credentials)
 
+      {:error, refused, state} when is_nil(credentials) ->
+        {:error, refused, state}
+
       {:error, _unusable, state} ->
         state =
           update_session(
@@ -844,9 +854,10 @@ defmodule SurrealDB.Connection do
       {:ok, _tokens, state} ->
         {:ok, update_session(state, sid, &%{&1 | credentials: credentials})}
 
-      # Only a refusal spends the pair; anything else fails the attempt, to try again.
+      # Only a refusal spends the pair, and then only if signing in again can replace it;
+      # anything else fails the attempt, to try again.
       {:error, error, state} ->
-        if refused?(error) do
+        if refused?(error) and not is_nil(credentials) do
           state =
             update_session(
               state,
@@ -861,19 +872,11 @@ defmodule SurrealDB.Connection do
     end
   end
 
+  # The attempt fails and the next one tries again.
   defp restore_signin(state, sid) do
-    case session(state, sid).credentials do
-      nil ->
-        Logger.warning("SurrealDB reconnected signed out: the token is no longer valid")
-        {:ok, state}
-
-      credentials ->
-        # Serving queued requests signed out would run them with the wrong permissions, so
-        # the attempt fails and the next one tries again.
-        case rpc_sync(state, "signin", [credentials], sid) do
-          {:ok, _result, state} -> {:ok, state}
-          {:error, error, state} -> {:error, error, state}
-        end
+    case rpc_sync(state, "signin", [session(state, sid).credentials], sid) do
+      {:ok, _result, state} -> {:ok, state}
+      {:error, error, state} -> {:error, error, state}
     end
   end
 
@@ -1140,9 +1143,6 @@ defmodule SurrealDB.Connection do
     case Map.pop(state.pending, id) do
       {nil, _pending} ->
         state
-
-      {{nil, _method, _params, %{discard: true}}, pending} ->
-        %{state | pending: pending}
 
       {{nil, method, _params, %{late: true} = meta}, pending} ->
         undo_late(%{state | pending: pending}, method, Map.get(meta, :session), result)
@@ -1768,6 +1768,9 @@ defmodule SurrealDB.Connection do
 
   defp waited(%{sent_at: sent_at}), do: System.monotonic_time(:millisecond) - sent_at
   defp waited(_meta), do: 0
+
+  defp out_of_time?(_meta, :infinity), do: false
+  defp out_of_time?(meta, timeout), do: waited(meta) >= timeout
 
   # Monotonic time is only comparable within one node.
   defp local_sent_at(meta, {pid, _tag}) when node(pid) == node(), do: meta

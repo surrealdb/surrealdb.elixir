@@ -395,6 +395,8 @@ defmodule SurrealDB.SessionTest do
             fn -> SurrealDB.signin(txn, %SurrealDB.Auth.Root{user: "root", pass: "root"}) end,
             fn -> SurrealDB.let(txn, "x", 1) end,
             fn -> SurrealDB.live(txn, "person") end,
+            fn -> SurrealDB.info(txn) end,
+            fn -> SurrealDB.version(txn) end,
             fn -> SurrealDB.export(txn) end,
             fn -> SurrealDB.import(txn, "CREATE person") end
           ] do

@@ -341,6 +341,29 @@ defmodule SurrealDB.ReconnectTest do
     assert :sys.get_state(db).sessions[nil].credentials
   end
 
+  test "a refused token with no credentials to sign in with fails the reconnect attempt" do
+    base = responder(self())
+    refused = %{"code" => -32_002, "message" => "Token expired", "kind" => "NotAllowed"}
+
+    responder = fn
+      "authenticate", params ->
+        n = Process.put(:authenticates, (Process.get(:authenticates) || 0) + 1) || 0
+        if n == 1, do: {:error, refused}, else: base.("authenticate", params)
+
+      method, params ->
+        base.(method, params)
+    end
+
+    db = start(responder: responder)
+    {:ok, _} = SurrealDB.authenticate(db, "token.only")
+    :ok = SurrealDB.subscribe_status(db)
+    send(db, :mock_closed)
+
+    assert_receive {:surrealdb, :status, :reconnecting, %{attempt: 2, error: %{kind: :rpc}}}
+    assert_receive {:surrealdb, :status, :connected, %{attempt: 2}}
+    assert SurrealDB.info_session(db).token == "token.only"
+  end
+
   test "a call's timeout runs from when it was made, even during a slow handshake" do
     parent = self()
     base = responder(parent)
