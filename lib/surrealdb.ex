@@ -670,6 +670,18 @@ defmodule SurrealDB do
 
   Uses the HTTP `/export` endpoint, derived from the connection URL, regardless of the
   connection's engine.
+
+  ## Options
+
+  With no options everything is exported. These choose what is included, each `true` or
+  `false`: `:users`, `:accesses`, `:params`, `:functions`, `:analyzers`, `:versions`,
+  `:records`, and on SurrealDB 3.x also `:database_definition`, `:apis`, `:buckets`,
+  `:modules`, `:configs`, and `:sequences`. `:tables` is `true`, `false`, a list of table
+  names, or `{:exclude, names}`.
+
+      SurrealDB.export(db, tables: ["person"], records: false)
+
+    * `:timeout` - milliseconds to wait for the response (default 60000).
   """
   @spec export(conn(), keyword()) :: {:ok, String.t()} | {:error, Error.t()}
   def export(conn, opts \\ [])
@@ -677,11 +689,26 @@ defmodule SurrealDB do
   def export(conn, opts), do: SurrealDB.Rest.export(Connection.session_info(conn), opts)
 
   @doc """
-  Imports a SurrealQL script into the selected namespace and database.
+  Imports a SurrealQL script into the selected namespace and database, as `export/2`
+  writes it.
 
-  Uses the HTTP `/import` endpoint, derived from the connection URL.
+  Uses the HTTP `/import` endpoint, derived from the connection URL. The server requires the
+  script to start with `OPTION IMPORT;`, which an export always does.
+
+  An import is not a transaction: statements that fail do not stop the others. When any
+  fail, it returns `{:error, %SurrealDB.Error{kind: :query}}` whose `details.failures` lists
+  the error of each failed statement, in order.
+
+      case SurrealDB.import(db, script) do
+        {:ok, :imported} -> :ok
+        {:error, %SurrealDB.Error{details: %{failures: failures}}} -> failures
+      end
+
+  ## Options
+
+    * `:timeout` - milliseconds to wait for the response (default 60000).
   """
-  @spec import(conn(), String.t(), keyword()) :: {:ok, term()} | {:error, Error.t()}
+  @spec import(conn(), String.t(), keyword()) :: {:ok, :imported} | {:error, Error.t()}
   def import(conn, surql, opts \\ [])
   def import(%Transaction{}, _surql, _opts), do: {:error, http_in_txn("import")}
 

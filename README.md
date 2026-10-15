@@ -294,6 +294,22 @@ SurrealDB.kill(db, live_id)
 
 `action` is one of `:create`, `:update`, or `:delete`.
 
+## Export and import
+
+```elixir
+{:ok, script} = SurrealDB.export(db)
+{:ok, schema} = SurrealDB.export(db, records: false, tables: {:exclude, ["audit"]})
+
+case SurrealDB.import(other_db, script) do
+  {:ok, :imported} -> :ok
+  # An import is not a transaction: the other statements were still applied.
+  {:error, %SurrealDB.Error{details: %{failures: failures}}} -> failures
+end
+```
+
+Both use the server's HTTP endpoints whatever the engine. The server only imports scripts
+that start with `OPTION IMPORT;`, as exports do.
+
 ## Choosing the engine and protocol
 
 ```elixir

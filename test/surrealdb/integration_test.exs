@@ -374,6 +374,67 @@ defmodule SurrealDB.IntegrationTest do
     end
   end
 
+  describe "export and import" do
+    test "export picks what to include, and import restores it elsewhere" do
+      db = connect()
+
+      {:ok, _} =
+        SurrealDB.query(
+          db,
+          "CREATE person:tobie SET name = 'Tobie'; CREATE secret:1; DEFINE PARAM $p VALUE 1"
+        )
+
+      assert {:ok, script} = SurrealDB.export(db, tables: ["person"], params: false)
+      assert script =~ "OPTION IMPORT"
+      assert script =~ "person:tobie"
+      refute script =~ "secret"
+      refute script =~ "DEFINE PARAM"
+
+      assert {:ok, schema_only} = SurrealDB.export(db, records: false)
+      refute schema_only =~ "person:tobie"
+
+      other = "#{Process.get(:it_database)}_import"
+      {:ok, _} = SurrealDB.query(db, "DEFINE DATABASE #{other}")
+
+      auth = %SurrealDB.Auth.Root{user: "root", pass: "root"}
+      opts = [url: @url, namespace: "test", database: other, auth: auth]
+      target = start_supervised!({SurrealDB.Connection, opts}, id: :target)
+
+      assert {:ok, :imported} = SurrealDB.import(target, script)
+
+      assert {:ok, %{"name" => "Tobie"}} =
+               SurrealDB.select(target, SurrealDB.RecordId.new("person", "tobie"))
+    end
+
+    test "an import reports the statements that failed and applies the rest" do
+      db = connect()
+      {:ok, _} = SurrealDB.query(db, "CREATE a:5")
+
+      script = "OPTION IMPORT; CREATE a:1; THROW 'bad'; CREATE a:5; CREATE a:2;"
+
+      assert {:error, %SurrealDB.Error{kind: :query, details: %{failures: failures}}} =
+               SurrealDB.import(db, script)
+
+      assert [
+               %SurrealDB.Error{server_kind: :thrown},
+               %SurrealDB.Error{server_kind: :already_exists}
+             ] =
+               failures
+
+      assert {:ok, [[%{"id" => _}, %{"id" => _}, %{"id" => _}]]} =
+               SurrealDB.query(db, "SELECT id FROM a")
+    end
+
+    test "an import without OPTION IMPORT says why it was refused" do
+      db = connect()
+
+      assert {:error, %SurrealDB.Error{kind: :http, code: 400, message: message}} =
+               SurrealDB.import(db, "CREATE a:1")
+
+      assert message =~ "OPTION IMPORT"
+    end
+  end
+
   test "strings are never turned into record ids" do
     db = connect()
     {:ok, _} = SurrealDB.create(db, SurrealDB.RecordId.new("user", 1234), %{"n" => 1})
