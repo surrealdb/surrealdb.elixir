@@ -263,8 +263,14 @@ defmodule SurrealDB.Connection do
 
   def handle_info({:request_timeout, id}, state) do
     case Map.pop(state.pending, id) do
-      {{from, method, _params, _meta}, pending} ->
+      {{from, method, params, meta}, pending} ->
         state = reply(%{state | pending: pending}, from, id, timeout_error(method))
+
+        state = %{
+          state
+          | pending: await_late_reply(state, state.pending, id, method, params, meta)
+        }
+
         cancel_in_engine(state, id)
 
       {nil, _pending} ->
@@ -316,6 +322,18 @@ defmodule SurrealDB.Connection do
     else
       {:noreply, state}
     end
+  end
+
+  # Methods whose reply changes what the connection tracks about the session.
+  @session_methods ~w(use signin signup authenticate invalidate reset let set unset)
+
+  # A timed-out request on an engine that cannot cancel it (a WebSocket) may still run on
+  # the server. If it changes session state, keep it pending with no caller, so its late
+  # reply still updates the namespace, database, and auth the connection reports and sends.
+  defp await_late_reply(state, pending, id, method, params, meta) do
+    if method in @session_methods and not function_exported?(state.engine, :cancel, 2),
+      do: Map.put(pending, id, {nil, method, params, Map.delete(meta, :timer)}),
+      else: pending
   end
 
   defp handle_transport(message, state) do
@@ -524,7 +542,9 @@ defmodule SurrealDB.Connection do
           {:ok, state}
         end
 
-      {:error, %Error{kind: :connection} = error, state} ->
+      # A dead transport fails startup whatever the check setting; with the check off,
+      # only a server that cannot answer `version` is let through.
+      {:error, %Error{kind: kind} = error, state} when kind in [:connection, :timeout] ->
         {:error, error, state}
 
       {:error, error, state} ->
