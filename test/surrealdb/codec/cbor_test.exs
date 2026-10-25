@@ -95,6 +95,10 @@ defmodule SurrealDB.Codec.CBORTest do
       assert roundtrip(Duration.from_parts(5, 250)) == Duration.from_parts(5, 250)
     end
 
+    test "Duration strings (tag 13) accept years" do
+      assert CBOR.decode(<<0xCD, 0x62, "1y">>) == {:ok, Duration.new(365, :day)}
+    end
+
     test "Datetime preserves seconds and nanos" do
       datetime = Datetime.from_unix(1_700_000_000, 123_456_789)
       assert roundtrip(datetime) == datetime

@@ -76,6 +76,21 @@ defmodule SurrealDB.TypesTest do
       assert Duration.parse("2w") == Duration.new(2, :week)
     end
 
+    test "parses years as 365 days" do
+      assert Duration.parse("1y") == Duration.new(365, :day)
+      assert Duration.parse("2y3w") == Duration.new(2 * 365 + 21, :day)
+      assert Duration.new(1, :year) == Duration.new(365, :day)
+    end
+
+    test "parses microseconds written with the micro sign" do
+      assert Duration.parse("5µs") == Duration.new(5, :microsecond)
+    end
+
+    test "ignores non-ASCII digits instead of raising" do
+      assert Duration.parse("١y") == Duration.new(0)
+      assert Duration.parse("2h١y") == Duration.new(2, :hour)
+    end
+
     test "converts to and from parts" do
       assert Duration.from_parts(5, 250) |> Duration.to_parts() == {5, 250}
     end
