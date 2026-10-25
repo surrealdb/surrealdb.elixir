@@ -772,6 +772,17 @@ defmodule SurrealDB.IntegrationTest do
              )
   end
 
+  test "datetimes before 1970 round-trip through the server" do
+    db = connect()
+    {:ok, dt, _} = DateTime.from_iso8601("1969-12-31T23:59:59.250000Z")
+    datetime = SurrealDB.Datetime.from_datetime(dt)
+
+    assert {:ok, [true]} =
+             SurrealDB.query(db, "RETURN $d = d'1969-12-31T23:59:59.25Z'", %{d: datetime})
+
+    assert {:ok, [^datetime]} = SurrealDB.query(db, "RETURN d'1969-12-31T23:59:59.25Z'")
+  end
+
   test "works over the HTTP engine too" do
     http_url = String.replace(@url, ~r/^ws/, "http")
     db = connect(url: http_url)

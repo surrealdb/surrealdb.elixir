@@ -1,7 +1,25 @@
 defmodule SurrealDB.TypesTest do
   use ExUnit.Case, async: true
 
-  alias SurrealDB.{Duration, RecordId, Uuid}
+  alias SurrealDB.{Datetime, Duration, RecordId, Uuid}
+
+  describe "Datetime" do
+    test "keeps nanoseconds positive before 1970" do
+      {:ok, dt, _} = DateTime.from_iso8601("1969-12-31T23:59:59.250000Z")
+      assert Datetime.from_datetime(dt) == %Datetime{seconds: -1, nanos: 250_000_000}
+      assert dt |> Datetime.from_datetime() |> Datetime.to_datetime() == dt
+    end
+
+    test "handles whole seconds before 1970" do
+      {:ok, dt, _} = DateTime.from_iso8601("1900-01-01T00:00:00Z")
+      assert Datetime.from_datetime(dt) == %Datetime{seconds: -2_208_988_800, nanos: 0}
+    end
+
+    test "builds from Unix nanoseconds" do
+      assert Datetime.from_unix_nanos(-1) == %Datetime{seconds: -1, nanos: 999_999_999}
+      assert Datetime.from_unix_nanos(1_500_000_000) == %Datetime{seconds: 1, nanos: 500_000_000}
+    end
+  end
 
   doctest SurrealDB.FileRef
   doctest SurrealDB.RecordIdRange
