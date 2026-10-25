@@ -201,4 +201,59 @@ defmodule SurrealDB.Engine.HTTPTest do
     assert {:error, _reason} = result
     assert micros < 5_000_000
   end
+
+  describe "cbor.2 negotiation" do
+    # Answers each request in `content_type`, reporting the request's headers.
+    defp negotiating_server(bypass, content_type) do
+      parent = self()
+
+      Bypass.stub(bypass, "POST", "/rpc", fn conn ->
+        headers = Map.new(["content-type", "accept"], &{&1, Plug.Conn.get_req_header(conn, &1)})
+        send(parent, {:request, headers})
+        {:ok, body, conn} = Plug.Conn.read_body(conn)
+        {:ok, %{"id" => id}} = SurrealDB.Codec.CBOR2.decode(body)
+
+        result =
+          if content_type =~ "v=2", do: SurrealDB.Number.u8(5), else: 5
+
+        codec = if content_type =~ "v=2", do: SurrealDB.Codec.CBOR2, else: CBOR
+        reply(conn, 200, content_type, codec.encode(%{"id" => id, "result" => result}))
+      end)
+    end
+
+    test "switches to cbor.2 after the server answers in it", %{bypass: bypass, url: url} do
+      negotiating_server(bypass, "application/cbor; v=2")
+      db = start(url)
+
+      assert {:ok, %SurrealDB.Number{kind: :u8, value: 5}} =
+               SurrealDB.Connection.call(db, "ping", [])
+
+      assert_receive {:request,
+                      %{
+                        "content-type" => ["application/cbor"],
+                        "accept" => ["application/cbor; v=2"]
+                      }}
+
+      assert {:ok, %SurrealDB.Number{}} = SurrealDB.Connection.call(db, "ping", [])
+
+      assert_receive {:request,
+                      %{
+                        "content-type" => ["application/cbor; v=2"],
+                        "accept" => ["application/cbor; v=2"]
+                      }}
+
+      assert SurrealDB.Connection.session_info(db).codec == SurrealDB.Codec.CBOR2
+    end
+
+    test "stays on cbor when the server answers in it", %{bypass: bypass, url: url} do
+      negotiating_server(bypass, "application/cbor")
+      db = start(url)
+
+      assert {:ok, 5} = SurrealDB.Connection.call(db, "ping", [])
+      assert {:ok, 5} = SurrealDB.Connection.call(db, "ping", [])
+      assert_receive {:request, %{"content-type" => ["application/cbor"]}}
+      assert_receive {:request, %{"content-type" => ["application/cbor"]}}
+      assert SurrealDB.Connection.session_info(db).codec == CBOR
+    end
+  end
 end

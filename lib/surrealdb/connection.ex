@@ -244,7 +244,7 @@ defmodule SurrealDB.Connection do
         engine: engine,
         engine_state: engine_state,
         engine_opts: engine_opts,
-        codec: codec,
+        codec: engine_codec(engine, engine_state) || codec,
         uri: uri,
         sessions: %{
           nil => %Session{
@@ -551,7 +551,7 @@ defmodule SurrealDB.Connection do
         {:noreply, state}
 
       {:ok, events, engine_state} ->
-        state = %{state | engine_state: engine_state}
+        state = put_engine_state(state, engine_state)
 
         case Enum.reduce_while(events, {:ok, state}, &process_event/2) do
           {:ok, state} -> {:noreply, state}
@@ -593,7 +593,7 @@ defmodule SurrealDB.Connection do
 
     result =
       case state.engine.connect(state.uri, state.engine_opts) do
-        {:ok, engine_state} -> restore(%{state | engine_state: engine_state})
+        {:ok, engine_state} -> restore(put_engine_state(state, engine_state))
         {:error, reason} -> {:retry, conn_error(reason), state}
       end
 
@@ -995,7 +995,7 @@ defmodule SurrealDB.Connection do
       {:ok, events, engine_state} ->
         case Enum.reduce_while(
                events,
-               {:ok, %{state | engine_state: engine_state}},
+               {:ok, put_engine_state(state, engine_state)},
                &process_event/2
              ) do
           {:ok, state} ->
@@ -1887,12 +1887,24 @@ defmodule SurrealDB.Connection do
   defp send_timeout(timeout) when is_integer(timeout), do: timeout
   defp send_timeout(_infinity), do: nil
 
+  # The engine takes on the codec the server agreed to (see `Engine.codec/1`).
+  defp put_engine_state(state, engine_state) do
+    codec = engine_codec(state.engine, engine_state) || state.codec
+    %{state | engine_state: engine_state, codec: codec}
+  end
+
+  defp engine_codec(engine, engine_state) do
+    if function_exported?(engine, :codec, 1), do: engine.codec(engine_state)
+  end
+
+  # Plain CBOR is offered as `cbor.2, cbor`: SurrealDB 4.0 takes `cbor.2`, older servers
+  # `cbor`. The engine reports which one the server chose.
   defp engine_opts(codec, opts) do
     frame_type = if codec.subprotocol() == "json", do: :text, else: :binary
+    codecs = if codec == Codec.CBOR, do: [Codec.CBOR2, Codec.CBOR], else: [codec]
 
     [
-      content_type: codec.content_type(),
-      subprotocol: codec.subprotocol(),
+      codecs: codecs,
       frame_type: frame_type,
       codec: codec
     ]

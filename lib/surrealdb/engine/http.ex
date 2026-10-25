@@ -8,6 +8,11 @@ defmodule SurrealDB.Engine.HTTP do
 
   Live queries are not available on this engine. Use a `ws://` or `wss://` URL for those.
 
+  With the default codec, every request asks for `cbor.2` (`Accept: application/cbor; v=2`)
+  and is sent as plain `application/cbor`. Once the server answers in `cbor.2`, as
+  SurrealDB 4.0 does, requests are sent in it too. Older servers answer plain `cbor`, and
+  the engine stays on it.
+
   The underlying HTTP/1.1 connection is kept alive between requests. When the server or
   the network closes it, the requests in flight fail and the next request opens a new
   connection.
@@ -24,8 +29,10 @@ defmodule SurrealDB.Engine.HTTP do
     :port,
     :path,
     :content_type,
+    :accept,
     :connect_opts,
     :codec,
+    codecs: [],
     requests: %{}
   ]
 
@@ -33,12 +40,16 @@ defmodule SurrealDB.Engine.HTTP do
   def supports_live?, do: false
 
   @impl true
+  def codec(%__MODULE__{codec: codec}), do: codec
+
+  @impl true
   def connect(%URI{} = uri, opts) do
     scheme = if uri.scheme == "https", do: :https, else: :http
     host = uri.host || "localhost"
     port = uri.port || default_port(scheme)
     path = rpc_path(uri.path)
-    content_type = Keyword.get(opts, :content_type, "application/cbor")
+    codecs = Keyword.get(opts, :codecs, [Keyword.get(opts, :codec, SurrealDB.Codec.CBOR)])
+    codec = List.last(codecs)
 
     connect_opts =
       [protocols: [:http1], mode: :active]
@@ -49,9 +60,11 @@ defmodule SurrealDB.Engine.HTTP do
       host: host,
       port: port,
       path: path,
-      content_type: content_type,
+      content_type: codec.content_type(),
+      accept: hd(codecs).content_type(),
       connect_opts: connect_opts,
-      codec: Keyword.get(opts, :codec, SurrealDB.Codec.CBOR)
+      codec: codec,
+      codecs: codecs
     }
 
     open(conn)
@@ -147,13 +160,13 @@ defmodule SurrealDB.Engine.HTTP do
         :unknown
 
       {:ok, mint, responses} ->
-        {events, requests} = process_responses(responses, conn, conn.requests, [])
+        {events, requests, conn} = process_responses(responses, conn, conn.requests, [])
         {:ok, events, %{conn | mint: mint, requests: requests}}
 
       # The connection dropped. Whatever completed before it is still delivered; the rest
       # is lost, and the next request reconnects.
       {:error, mint, reason, responses} ->
-        {events, _requests} = process_responses(responses, conn, conn.requests, [])
+        {events, _requests, conn} = process_responses(responses, conn, conn.requests, [])
         Mint.HTTP.close(mint)
         {:ok, events ++ [{:reset, reason}], %{conn | mint: mint, requests: %{}}}
     end
@@ -165,7 +178,7 @@ defmodule SurrealDB.Engine.HTTP do
     :ok
   end
 
-  defp process_responses([], _conn, requests, events), do: {Enum.reverse(events), requests}
+  defp process_responses([], conn, requests, events), do: {Enum.reverse(events), requests, conn}
 
   defp process_responses([{:status, ref, status} | rest], conn, requests, events) do
     requests = update_request(requests, ref, &%{&1 | status: status})
@@ -188,6 +201,7 @@ defmodule SurrealDB.Engine.HTTP do
         process_responses(rest, conn, requests, events)
 
       {request, requests} ->
+        conn = negotiate(conn, request)
         event = response_event(conn, request, IO.iodata_to_binary(request.body))
         process_responses(rest, conn, requests, [event | events])
     end
@@ -207,6 +221,34 @@ defmodule SurrealDB.Engine.HTTP do
   defp process_responses([_other | rest], conn, requests, events) do
     process_responses(rest, conn, requests, events)
   end
+
+  # Every request asks for the preferred codec (`Accept: application/cbor; v=2`) but is sent
+  # in the one the server is known to read. A server that answers in the preferred codec
+  # reads it too, so later requests switch to it; older servers answer plain `cbor`, and
+  # the connection stays on it.
+  defp negotiate(conn, %{status: status, headers: headers}) when status in 200..299 do
+    case response_codec(conn, headers) do
+      nil ->
+        conn
+
+      codec ->
+        if preference(conn, codec) < preference(conn, conn.codec),
+          do: %{conn | codec: codec, content_type: codec.content_type()},
+          else: conn
+    end
+  end
+
+  defp negotiate(conn, _request), do: conn
+
+  defp response_codec(conn, headers) do
+    content_type = media_type(header(headers, "content-type") || "")
+    Enum.find(conn.codecs, &(media_type(&1.content_type()) == content_type))
+  end
+
+  defp preference(conn, codec),
+    do: Enum.find_index(conn.codecs, &(&1 == codec)) || length(conn.codecs)
+
+  defp media_type(content_type), do: content_type |> String.downcase() |> String.replace(" ", "")
 
   defp update_request(requests, ref, fun) do
     case Map.fetch(requests, ref) do
@@ -254,8 +296,8 @@ defmodule SurrealDB.Engine.HTTP do
           _ -> nil
         end
 
-      String.starts_with?(content_type, conn.codec.content_type()) ->
-        case conn.codec.decode(body) do
+      String.starts_with?(content_type, "application/cbor") ->
+        case (response_codec(conn, [{"content-type", content_type}]) || conn.codec).decode(body) do
           {:ok, %{} = map} -> map
           _ -> nil
         end
@@ -281,7 +323,7 @@ defmodule SurrealDB.Engine.HTTP do
   defp reason_phrase(_status), do: "Request Failed"
 
   defp build_headers(conn, session) do
-    [{"content-type", conn.content_type}, {"accept", conn.content_type}]
+    [{"content-type", conn.content_type}, {"accept", conn.accept}]
     |> maybe_header("surreal-ns", session[:namespace])
     |> maybe_header("surreal-db", session[:database])
     |> maybe_header("authorization", bearer(session[:token]))

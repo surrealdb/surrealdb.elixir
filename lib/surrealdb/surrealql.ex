@@ -15,7 +15,18 @@ defmodule SurrealDB.SurrealQL do
       "{ tags: ['a', 1.5f] }"
   """
 
-  alias SurrealDB.{Bytes, Datetime, Duration, Geometry, None, Range, RecordId, Table, Uuid}
+  alias SurrealDB.{
+    Bytes,
+    Datetime,
+    Duration,
+    Geometry,
+    None,
+    Number,
+    Range,
+    RecordId,
+    Table,
+    Uuid
+  }
 
   # Words the SurrealQL lexer may read as keywords, so they are quoted as table names.
   @reserved ~w(ALTER BEGIN BREAK CANCEL COMMIT CONTINUE CREATE DEFINE DELETE FOR IF INFO
@@ -73,6 +84,15 @@ defmodule SurrealDB.SurrealQL do
   def to_surql(string) when is_binary(string), do: quote_str(string)
   def to_surql(integer) when is_integer(integer), do: Integer.to_string(integer)
   def to_surql(float) when is_float(float), do: format_float(float) <> "f"
+
+  # A sized number takes its kind as a suffix, such as `5u8` or `1.5f32`.
+  def to_surql(%Number{value: value, kind: kind}) when is_integer(value),
+    do: Integer.to_string(value) <> Atom.to_string(kind)
+
+  def to_surql(%Number{value: value, kind: kind}) when is_float(value),
+    do: format_float(value) <> Atom.to_string(kind)
+
+  def to_surql(%Number{value: value, kind: kind}), do: "<#{kind}> " <> to_surql(value)
   def to_surql(atom) when is_atom(atom), do: to_surql(Atom.to_string(atom))
   # `Uuid.new/1` takes any string, so check the value before it goes into a literal: a
   # quote in it would end the literal early.

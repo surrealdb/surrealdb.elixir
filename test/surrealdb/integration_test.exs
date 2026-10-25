@@ -8,7 +8,8 @@ defmodule SurrealDB.IntegrationTest do
         start --user root --pass root memory
       mix test --include integration
 
-  CI runs them against the latest 3.x release and the nightly build.
+  CI runs them against the latest 3.x release and the nightly build. The tests that need
+  `cbor.2` (SurrealDB 4.0 and later) are skipped when the server does not negotiate it.
 
   Override the URL with the SURREALDB_URL environment variable (default
   `ws://localhost:8000/rpc`).
@@ -19,6 +20,7 @@ defmodule SurrealDB.IntegrationTest do
   @moduletag :integration
 
   @url System.get_env("SURREALDB_URL", "ws://localhost:8000/rpc")
+  @cbor2 SurrealDB.Test.ProtocolProbe.cbor2?(@url)
 
   # A fresh database per test, so tests never see each other's data and every run starts
   # from a database that does not exist yet.
@@ -371,6 +373,74 @@ defmodule SurrealDB.IntegrationTest do
                    %{u: uuid, text: uuid.value}
                  )
       end
+    end
+  end
+
+  describe "sized numbers over cbor.2" do
+    unless @cbor2, do: @describetag(skip: "the server does not negotiate cbor.2")
+
+    test "the connection negotiates cbor.2 over WebSocket and HTTP" do
+      assert SurrealDB.Connection.session_info(connect()).codec == SurrealDB.Codec.CBOR2
+
+      http = String.replace(@url, ~r/^ws/, "http")
+      db = start_supervised!({SurrealDB.Connection, url: http}, id: :http)
+      assert {:ok, _version} = SurrealDB.version(db)
+      assert SurrealDB.Connection.session_info(db).codec == SurrealDB.Codec.CBOR2
+    end
+
+    test "sized numbers come back with their kind" do
+      db = connect()
+      alias SurrealDB.Number
+
+      assert {:ok, [numbers]} =
+               SurrealDB.query(
+                 db,
+                 "RETURN [5u8, -1i8, 300i16, 70000u32, 18446744073709551615u64, 1.5f16, 0.1f32, 7]"
+               )
+
+      assert numbers == [
+               Number.u8(5),
+               Number.i8(-1),
+               Number.i16(300),
+               Number.u32(70_000),
+               Number.u64(18_446_744_073_709_551_615),
+               Number.f16(1.5),
+               Number.f32(0.1),
+               7
+             ]
+    end
+
+    test "sized numbers sent as parameters keep their kind" do
+      db = connect()
+      alias SurrealDB.Number
+
+      numbers = [
+        Number.u8(255),
+        Number.i32(-5),
+        Number.u64(18_446_744_073_709_551_615),
+        Number.f32(2.5)
+      ]
+
+      assert {:ok, [^numbers]} = SurrealDB.query(db, "RETURN $n", %{n: numbers})
+
+      assert {:ok, %{"n" => ^numbers}} =
+               SurrealDB.create(db, SurrealDB.RecordId.new("sized", 1), %{"n" => numbers})
+
+      assert {:ok, [[%{"n" => ^numbers}]]} = SurrealDB.query(db, "SELECT n FROM sized")
+    end
+  end
+
+  describe "sized numbers over plain cbor" do
+    if @cbor2, do: @describetag(skip: "the server negotiates cbor.2")
+
+    test "a server before 4.0 keeps the connection on cbor, and sized numbers widen" do
+      db = connect()
+      assert SurrealDB.Connection.session_info(db).codec == SurrealDB.Codec.CBOR
+
+      assert {:ok, [[5, 1.5]]} =
+               SurrealDB.query(db, "RETURN $n", %{
+                 n: [SurrealDB.Number.u8(5), SurrealDB.Number.f32(1.5)]
+               })
     end
   end
 

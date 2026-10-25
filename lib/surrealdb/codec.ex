@@ -29,6 +29,7 @@ defmodule SurrealDB.Codec do
   @doc "Resolves a codec name or module to a codec module."
   @spec resolve(atom() | module()) :: t()
   def resolve(:cbor), do: SurrealDB.Codec.CBOR
+  def resolve(:cbor2), do: SurrealDB.Codec.CBOR2
   def resolve(:json), do: SurrealDB.Codec.JSON
   def resolve(module) when is_atom(module), do: module
 end

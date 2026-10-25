@@ -58,6 +58,9 @@ jobs:
       - name: Compile (warnings as errors)
         run: mix compile --warnings-as-errors
 
+      - name: Fetch the conformance vectors
+        run: scripts/fetch-protocol-vectors.sh
+
       - name: Run tests
         run: mix test
 

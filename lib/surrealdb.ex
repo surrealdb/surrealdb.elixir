@@ -67,7 +67,9 @@ defmodule SurrealDB do
     * `:url` (required) - connection URL, for example `"ws://localhost:8000/rpc"`.
     * `:namespace` / `:database` - selected on connect via `use`.
     * `:auth` - a `SurrealDB.Auth` struct to sign in with on connect.
-    * `:codec` - `:cbor` (default) or `:json`.
+    * `:codec` - `:cbor` (default), `:cbor2` or `:json`. `:cbor` uses `cbor.2` when the
+      server speaks it (SurrealDB 4.0 and later) and plain `cbor` otherwise; see
+      `SurrealDB.Codec`.
     * `:name` - a name to register the process under.
     * `:connect_timeout` - milliseconds to wait for each connect-time call (`version`,
       `signin`, `use`) (default 15000).

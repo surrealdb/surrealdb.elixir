@@ -72,7 +72,7 @@ defmodule SurrealDB.TypesTest do
       assert {:error, _} = RecordId.parse("person:")
       assert {:error, _} = RecordId.parse("person:`unterminated")
       assert {:error, _} = RecordId.parse("person:a b")
-      assert {:error, _} = RecordId.parse("temp:['london', 2024]")
+      assert {:error, _} = RecordId.parse("person:[\"\\q\"]")
 
       # An unquoted table name must be an identifier; quoted it can be anything.
       assert {:error, _} = RecordId.parse("123:foo")

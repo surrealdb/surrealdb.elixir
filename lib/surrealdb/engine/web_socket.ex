@@ -3,8 +3,9 @@ defmodule SurrealDB.Engine.WebSocket do
   WebSocket transport engine, backed by `Mint.WebSocket`.
 
   It holds a persistent connection to the SurrealDB `/rpc` endpoint and supports live
-  queries. The codec's subprotocol is negotiated during the upgrade (`cbor` or `json`), and
-  frames are sent as binary or text accordingly.
+  queries. The codec's subprotocol is negotiated during the upgrade, and frames are sent as
+  binary or text accordingly. With several codecs on offer (`cbor.2, cbor` by default), the
+  server picks the first it speaks: SurrealDB 4.0 picks `cbor.2`, older servers `cbor`.
 
   The upgrade handshake is performed synchronously while the socket is in passive mode; the
   socket is then switched to active mode so the connection process receives frames as
@@ -15,12 +16,15 @@ defmodule SurrealDB.Engine.WebSocket do
 
   require Logger
 
-  defstruct [:mint, :websocket, :ref, :frame_type]
+  defstruct [:mint, :websocket, :ref, :frame_type, :codec]
 
   @upgrade_timeout 10_000
 
   @impl true
   def supports_live?, do: true
+
+  @impl true
+  def codec(%__MODULE__{codec: codec}), do: codec
 
   @impl true
   def connect(%URI{} = uri, opts) do
@@ -30,7 +34,8 @@ defmodule SurrealDB.Engine.WebSocket do
     host = uri.host || "localhost"
     port = uri.port || default_port(ws_scheme)
     path = rpc_path(uri.path)
-    subprotocol = Keyword.get(opts, :subprotocol, "cbor")
+    codecs = Keyword.get(opts, :codecs, [Keyword.get(opts, :codec, SurrealDB.Codec.CBOR)])
+    subprotocol = Keyword.get(opts, :subprotocol, Enum.map_join(codecs, ", ", & &1.subprotocol()))
     frame_type = Keyword.get(opts, :frame_type, :binary)
 
     connect_opts =
@@ -42,9 +47,16 @@ defmodule SurrealDB.Engine.WebSocket do
     with {:ok, mint} <- Mint.HTTP.connect(http_scheme, host, port, connect_opts) do
       # Once the TCP/TLS connection is open, any failure closes it so the socket is not leaked.
       with {:ok, mint, ref} <- Mint.WebSocket.upgrade(ws_scheme, mint, path, upgrade_headers),
-           {:ok, mint, websocket} <- finish_upgrade(mint, ref),
+           {:ok, mint, websocket, chosen} <- finish_upgrade(mint, ref),
            {:ok, mint} <- set_active(mint) do
-        {:ok, %__MODULE__{mint: mint, websocket: websocket, ref: ref, frame_type: frame_type}}
+        {:ok,
+         %__MODULE__{
+           mint: mint,
+           websocket: websocket,
+           ref: ref,
+           frame_type: frame_type,
+           codec: chosen_codec(codecs, chosen)
+         }}
       else
         {:error, mint, reason} ->
           Mint.HTTP.close(mint)
@@ -107,9 +119,24 @@ defmodule SurrealDB.Engine.WebSocket do
 
   defp finish_upgrade(mint, ref) do
     case recv_upgrade(mint, ref, nil, nil) do
-      {:ok, mint, status, headers} -> Mint.WebSocket.new(mint, ref, status, headers)
-      other -> other
+      {:ok, mint, status, headers} ->
+        with {:ok, mint, websocket} <- Mint.WebSocket.new(mint, ref, status, headers) do
+          {:ok, mint, websocket, header(headers, "sec-websocket-protocol")}
+        end
+
+      other ->
+        other
     end
+  end
+
+  defp header(headers, name) do
+    Enum.find_value(headers, fn {key, value} -> String.downcase(key) == name && value end)
+  end
+
+  # The subprotocol the server chose. A server that names none speaks the last one offered,
+  # the oldest.
+  defp chosen_codec(codecs, chosen) do
+    Enum.find(codecs, List.last(codecs), &(&1.subprotocol() == chosen))
   end
 
   defp recv_upgrade(mint, ref, status, headers) do

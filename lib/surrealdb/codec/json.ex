@@ -13,7 +13,7 @@ defmodule SurrealDB.Codec.JSON do
 
   @behaviour SurrealDB.Codec
 
-  alias SurrealDB.{Bytes, Datetime, Duration, FileRef, Geometry, None, Range, RecordId}
+  alias SurrealDB.{Bytes, Datetime, Duration, FileRef, Geometry, None, Number, Range, RecordId}
   alias SurrealDB.{RecordIdRange, StringRecordId, Table, Uuid}
 
   @impl true
@@ -41,6 +41,7 @@ defmodule SurrealDB.Codec.JSON do
   defp prepare(%DateTime{} = datetime), do: DateTime.to_iso8601(datetime)
   defp prepare(%Duration{nanoseconds: nanoseconds}), do: "#{nanoseconds}ns"
   defp prepare(%Bytes{data: data}), do: Base.encode64(data)
+  defp prepare(%Number{value: value}), do: value
 
   defp prepare(%Geometry{type: :collection, coordinates: geometries}) do
     %{"type" => "GeometryCollection", "geometries" => Enum.map(geometries, &prepare/1)}

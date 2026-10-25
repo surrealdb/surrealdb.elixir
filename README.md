@@ -12,10 +12,13 @@ It aims for feature parity with the official JavaScript SDKs (`surrealdb` and
 
 - **Two transport engines**, chosen automatically from the connection URL scheme:
   WebSocket (`ws`/`wss`) and HTTP (`http`/`https`).
-- **Two protocols**: CBOR (default, full type fidelity) and JSON.
+- **Two protocols**: CBOR (default, full type fidelity) and JSON. CBOR uses `cbor.2`
+  when the server speaks it (SurrealDB 4.0 and later) and plain `cbor` otherwise.
 - **Native value types**: `RecordId`, `RecordIdRange`, `Table`, `Uuid`, `Duration`,
-  `Datetime`, `Decimal`, `Geometry`, `Range`, `FileRef`, `Bytes`, `None`, and sets as
-  `MapSet`.
+  `Datetime`, `Decimal`, `Geometry`, `Range`, `FileRef`, `Bytes`, `None`, sized numbers
+  (`Number`), and sets as `MapSet`.
+- **Conformance**: the CBOR codec passes the shared SurrealDB conformance vectors
+  (surrealdb-protocol v0.14.0).
 - **Full RPC surface**: `use`, `signin`, `signup`, `authenticate`, `refresh`, `revoke`,
   `invalidate`, `reset`, `let`, `unset`, `query`, `select`, `create`, `insert`,
   `insert_relation`, `update`, `upsert`, `merge`, `patch`, `delete`, `relate`, `run`,
@@ -62,7 +65,8 @@ Options:
 - `:url` (required) - for example `"ws://localhost:8000/rpc"` or `"https://db.example/rpc"`.
 - `:namespace` / `:database` - selected on connect via `use`.
 - `:auth` - a `SurrealDB.Auth` struct to sign in with on connect.
-- `:codec` - `:cbor` (default) or `:json`.
+- `:codec` - `:cbor` (default), `:cbor2` or `:json`. See
+  [Choosing the engine and protocol](#choosing-the-engine-and-protocol).
 - `:name` - register the process under a name.
 - `:timeout` - request timeout in milliseconds, or `:infinity` (default 30000).
   `SurrealDB.query/4` takes a per-request `timeout:` too.
@@ -209,6 +213,27 @@ SurrealDB.create(db, "tag", %{names: MapSet.new(["a", "b"]), ref: Uuid.v7()})
 With the CBOR protocol these types round-trip with full fidelity. With JSON they are
 projected onto their closest JSON representation.
 
+### Sized numbers
+
+SurrealDB 4.0 adds sized number kinds, such as `5u8` and `1.5f32`. They come back as
+`SurrealDB.Number` structs, and you send one the same way:
+
+```elixir
+alias SurrealDB.Number
+
+{:ok, [n]} = SurrealDB.query(db, "RETURN 5u8")
+n #=> %SurrealDB.Number{kind: :u8, value: 5}
+
+SurrealDB.create(db, "reading", %{level: Number.u8(200), ratio: Number.f32(0.25)})
+```
+
+The kinds are `:i8`, `:u8`, `:i16`, `:u16`, `:i32`, `:u32`, `:u64`, `:f16` and `:f32`.
+Building one checks the range, and a float kind rounds to its precision. Plain integers
+and floats stay plain `int` and `float` values.
+
+Sized numbers need the `cbor.2` protocol. On a server before 4.0, or over JSON, a sized
+number is sent as a plain number (a `u64` above the signed 64-bit limit as a decimal).
+
 ## Authentication
 
 ```elixir
@@ -347,6 +372,17 @@ that start with `OPTION IMPORT;`, as exports do.
 
 The HTTP engine does not support live queries. Use a `ws`/`wss` URL for those.
 
+With the default `codec: :cbor`, the SDK negotiates the CBOR version with the server:
+
+- **WebSocket**: it offers the subprotocols `cbor.2, cbor`. SurrealDB 4.0 picks `cbor.2`,
+  and older servers pick `cbor`.
+- **HTTP**: each request asks for `cbor.2` (`Accept: application/cbor; v=2`) and is sent as
+  plain `application/cbor`. Once the server answers in `cbor.2`, requests are sent in it
+  too. Older servers answer in `cbor`, and the connection stays on it.
+
+`SurrealDB.Connection.session_info/1` reports the codec in use. Pass `codec: :cbor2` to
+require `cbor.2`.
+
 ## Agent Memory
 
 Agent Memory is a typed REST service for agent memory. Create a client pinned to one context
@@ -429,7 +465,17 @@ mix test --include integration
 
 Override the server URL with the `SURREALDB_URL` environment variable. CI runs the
 integration tests against the latest 3.x release (`surrealdb/surrealdb:v3`) and the nightly
-build (`surrealdb/surrealdb:nightly`).
+build (`surrealdb/surrealdb:nightly`). The tests that need `cbor.2` are skipped when the
+server does not negotiate it.
+
+The CBOR codec runs the shared conformance vectors from
+[surrealdb-protocol](https://github.com/surrealdb/surrealdb-protocol) v0.14.0. They are
+downloaded rather than committed; fetch them before running the tests (without them the
+conformance suite is skipped):
+
+```sh
+scripts/fetch-protocol-vectors.sh
+```
 
 ## License
 

@@ -87,7 +87,15 @@ defmodule SurrealDB.Engine do
   @doc "Whether this engine supports live queries."
   @callback supports_live?() :: boolean()
 
-  @optional_callbacks cancel: 2
+  @doc """
+  The codec the server agreed to speak, once the engine knows it. The connection encodes
+  and decodes with it from then on. A WebSocket learns it from the upgrade; HTTP switches
+  to `cbor.2` after the first reply in it. Optional; without it the connection keeps the
+  codec it was given.
+  """
+  @callback codec(conn()) :: SurrealDB.Codec.t() | nil
+
+  @optional_callbacks cancel: 2, codec: 1
 
   @doc "Resolves the engine module to use for a URL scheme."
   @spec for_scheme(String.t()) :: {:ok, module()} | {:error, term()}

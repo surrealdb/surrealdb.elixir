@@ -95,8 +95,10 @@ defmodule SurrealDB.Codec.CBORTest do
       assert roundtrip(Duration.from_parts(5, 250)) == Duration.from_parts(5, 250)
     end
 
-    test "Duration strings (tag 13) accept years" do
-      assert CBOR.decode(<<0xCD, 0x62, "1y">>) == {:ok, Duration.new(365, :day)}
+    test "the text tags 0, 9 and 13 are refused, as SurrealDB 4.0 refuses them" do
+      assert {:error, %ArgumentError{}} = CBOR.decode(<<0xCD, 0x62, "1y">>)
+      assert {:error, %ArgumentError{}} = CBOR.decode(<<0xC0, 0x64, "2024">>)
+      assert {:error, %ArgumentError{}} = CBOR.decode(<<0xC9, 0x61, "x">>)
     end
 
     test "Datetime preserves seconds and nanos" do
@@ -159,9 +161,10 @@ defmodule SurrealDB.Codec.CBORTest do
       refute match?(%Bytes{}, roundtrip("plain string"))
     end
 
-    test "None and Future" do
+    test "None, and Future which is sent but never received" do
       assert roundtrip(None.none()) == None.none()
-      assert %Future{} = roundtrip(Future.new())
+      assert CBOR.encode(Future.new()) == <<0xCF, 0xF6>>
+      assert {:error, %ArgumentError{}} = CBOR.decode(<<0xCF, 0xF6>>)
     end
   end
 
@@ -249,7 +252,11 @@ defmodule SurrealDB.Codec.CBORTest do
         CBOR.encode(%{:a => 1, "a" => 2})
       end
 
-      assert roundtrip(%{:a => 1, "b" => 2, 3 => 4}) == %{"a" => 1, "b" => 2, 3 => 4}
+      assert roundtrip(%{:a => 1, "b" => 2}) == %{"a" => 1, "b" => 2}
+
+      assert_raise ArgumentError, ~r/map key 3 is not a string/, fn ->
+        CBOR.encode(%{3 => 4})
+      end
     end
   end
 

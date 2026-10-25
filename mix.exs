@@ -37,6 +37,7 @@ defmodule SurrealDB.MixProject do
       {:jason, "~> 1.4"},
       {:decimal, "~> 2.1"},
       {:bypass, "~> 2.1", only: :test},
+      {:yaml_elixir, "~> 2.11", only: :test},
       {:ex_doc, "~> 0.34", only: :dev, runtime: false}
     ]
   end
@@ -74,6 +75,7 @@ defmodule SurrealDB.MixProject do
         Protocols: [
           SurrealDB.Codec,
           SurrealDB.Codec.CBOR,
+          SurrealDB.Codec.CBOR2,
           SurrealDB.Codec.JSON
         ],
         "Value types": [
@@ -82,6 +84,7 @@ defmodule SurrealDB.MixProject do
           SurrealDB.Uuid,
           SurrealDB.Duration,
           SurrealDB.Datetime,
+          SurrealDB.Number,
           SurrealDB.Geometry,
           SurrealDB.Range,
           SurrealDB.Future,
