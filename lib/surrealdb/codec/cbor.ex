@@ -22,6 +22,10 @@ defmodule SurrealDB.Codec.CBOR do
   A record id whose key is a range (tag 8 holding tag 49) decodes to a
   `SurrealDB.RecordIdRange`.
 
+  Floats that the BEAM cannot represent (infinities and NaN) are decoded to the atoms
+  `:infinity`, `:neg_infinity`, and `:nan`, and those atoms are encoded back as the
+  matching IEEE 754 values.
+
   The implementation is a focused CBOR encoder and decoder covering the major types the
   protocol uses, rather than a general purpose CBOR library, so the custom tags are handled
   natively in both directions.
@@ -79,6 +83,10 @@ defmodule SurrealDB.Codec.CBOR do
   defp enc(false), do: <<0xF4>>
   defp enc(true), do: <<0xF5>>
   defp enc(nil), do: <<0xF6>>
+
+  defp enc(:infinity), do: <<0xFB, 0x7FF0000000000000::64>>
+  defp enc(:neg_infinity), do: <<0xFB, 0xFFF0000000000000::64>>
+  defp enc(:nan), do: <<0xFB, 0x7FF8000000000000::64>>
 
   defp enc(%None{}), do: [head(6, 6), enc(nil)]
   defp enc(%Table{name: name}), do: [head(6, 7), enc(name)]
@@ -193,8 +201,8 @@ defmodule SurrealDB.Codec.CBOR do
   defp decode_item(<<0xF6, rest::binary>>), do: {nil, rest}
   defp decode_item(<<0xF7, rest::binary>>), do: {nil, rest}
   defp decode_item(<<0xF9, half::16, rest::binary>>), do: {half_to_float(half), rest}
-  defp decode_item(<<0xFA, float::float-32, rest::binary>>), do: {float, rest}
-  defp decode_item(<<0xFB, float::float-64, rest::binary>>), do: {float, rest}
+  defp decode_item(<<0xFA, bits::bits-32, rest::binary>>), do: {float_32(bits), rest}
+  defp decode_item(<<0xFB, bits::bits-64, rest::binary>>), do: {float_64(bits), rest}
   defp decode_item(<<0xF8, _simple, rest::binary>>), do: {nil, rest}
 
   defp decode_item(<<byte, _::binary>> = bin) do
@@ -333,13 +341,25 @@ defmodule SurrealDB.Codec.CBOR do
 
   defp at(list, index) when is_list(list), do: Enum.at(list, index, 0)
 
+  # The BEAM has no infinity or NaN floats, and a binary float match fails on them, so
+  # the special values are recognised from the exponent bits first.
+  defp float_32(<<sign::1, 0xFF::8, mantissa::23>>), do: special(sign, mantissa)
+  defp float_32(<<float::float-32>>), do: float
+
+  defp float_64(<<sign::1, 0x7FF::11, mantissa::52>>), do: special(sign, mantissa)
+  defp float_64(<<float::float-64>>), do: float
+
+  defp special(_sign, mantissa) when mantissa != 0, do: :nan
+  defp special(0, 0), do: :infinity
+  defp special(1, 0), do: :neg_infinity
+
   defp half_to_float(bits) do
     sign = if (bits >>> 15 &&& 1) == 1, do: -1.0, else: 1.0
     exponent = bits >>> 10 &&& 0x1F
     mantissa = bits &&& 0x3FF
 
     cond do
-      exponent == 0x1F -> 0.0
+      exponent == 0x1F -> special(bits >>> 15, mantissa)
       exponent == 0 -> sign * :math.pow(2, -14) * (mantissa / 1024)
       true -> sign * :math.pow(2, exponent - 15) * (1 + mantissa / 1024)
     end

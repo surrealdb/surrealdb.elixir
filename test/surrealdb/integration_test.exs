@@ -758,6 +758,20 @@ defmodule SurrealDB.IntegrationTest do
     end
   end
 
+  test "infinities and NaN round-trip through the server" do
+    db = connect()
+
+    assert {:ok, [[:infinity, :neg_infinity, :nan]]} =
+             SurrealDB.query(db, "RETURN [math::inf, -math::inf, NaN]")
+
+    assert {:ok, [[true, true, true]]} =
+             SurrealDB.query(
+               db,
+               "RETURN [$a = math::inf, $b = -math::inf, type::is_float($c)]",
+               %{a: :infinity, b: :neg_infinity, c: :nan}
+             )
+  end
+
   test "works over the HTTP engine too" do
     http_url = String.replace(@url, ~r/^ws/, "http")
     db = connect(url: http_url)
