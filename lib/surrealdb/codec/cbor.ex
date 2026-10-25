@@ -25,6 +25,11 @@ defmodule SurrealDB.Codec.CBOR do
   The implementation is a focused CBOR encoder and decoder covering the major types the
   protocol uses, rather than a general purpose CBOR library, so the custom tags are handled
   natively in both directions.
+
+  The encoder only writes what every supported server reads: datetimes, uuids and
+  durations use their binary tags (12, 37 and 14, never the text tags 0, 9 and 13),
+  integers must fit in 64 bits signed, and a map may not repeat a key (an atom key counts as
+  its name). A value that breaks one of these raises `ArgumentError`.
   """
 
   @behaviour SurrealDB.Codec
@@ -46,6 +51,9 @@ defmodule SurrealDB.Codec.CBOR do
     Table,
     Uuid
   }
+
+  @min_int -0x8000000000000000
+  @max_int 0x7FFFFFFFFFFFFFFF
 
   @impl true
   def content_type, do: "application/cbor"
@@ -119,6 +127,15 @@ defmodule SurrealDB.Codec.CBOR do
 
   defp enc(%Bytes{data: data}), do: [head(2, byte_size(data)), data]
 
+  # SurrealDB integers are 64-bit signed. A bigger one would be written as an unsigned or
+  # truncated CBOR integer, which an older server reads as a different number and a newer
+  # one refuses, so it is rejected here. Send such a value as a `Decimal`.
+  defp enc(integer) when is_integer(integer) and (integer > @max_int or integer < @min_int) do
+    raise ArgumentError,
+          "integer #{integer} is outside the 64-bit signed range SurrealDB accepts; " <>
+            "send it as a Decimal"
+  end
+
   defp enc(integer) when is_integer(integer) and integer >= 0, do: head(0, integer)
   defp enc(integer) when is_integer(integer), do: head(1, -1 - integer)
   defp enc(float) when is_float(float), do: <<0xFB, float::float-64>>
@@ -132,8 +149,20 @@ defmodule SurrealDB.Codec.CBOR do
   end
 
   defp enc(map) when is_map(map) do
-    pairs = Enum.map(map, fn {key, value} -> [enc(map_key(key)), enc(value)] end)
-    [head(5, map_size(map)) | pairs]
+    pairs = Enum.map(map, fn {key, value} -> {map_key(key), value} end)
+    check_unique_keys!(pairs, map_size(map))
+    [head(5, map_size(map)) | Enum.map(pairs, fn {key, value} -> [enc(key), enc(value)] end)]
+  end
+
+  # An atom key is written as its name, so `%{a: 1, "a" => 2}` would put the key twice,
+  # which a newer server refuses and an older one resolves to one of the values.
+  defp check_unique_keys!(pairs, size) do
+    keys = Enum.map(pairs, &elem(&1, 0))
+
+    if length(Enum.uniq(keys)) != size do
+      duplicate = Enum.find(keys, fn key -> Enum.count(keys, &(&1 == key)) > 1 end)
+      raise ArgumentError, "duplicate map key #{inspect(duplicate)} once atom keys are strings"
+    end
   end
 
   defp map_key(key) when is_atom(key), do: Atom.to_string(key)
