@@ -41,7 +41,7 @@ defmodule SurrealDB.RecordId do
       {:ok, %SurrealDB.RecordId{table: "person", id: "123"}}
 
       iex> SurrealDB.RecordId.parse("person")
-      {:error, "expected `:` after the table name in \"person\""}
+      {:error, "expected `:` after the table name in \\"person\\""}
   """
   @spec parse(String.t()) :: {:ok, t()} | {:error, String.t()}
   def parse(string) when is_binary(string) do
@@ -116,24 +116,17 @@ defmodule SurrealDB.RecordId do
     if Regex.match?(~r/^-?\d+$/, key), do: String.to_integer(key), else: key
   end
 
-  @doc "Returns the canonical `table:id` string representation."
+  @doc """
+  Returns the canonical SurrealQL form, as the server prints it.
+
+      iex> SurrealDB.RecordId.to_string(SurrealDB.RecordId.new("person", "complex id"))
+      "person:`complex id`"
+
+      iex> SurrealDB.RecordId.to_string(SurrealDB.RecordId.new("temp", ["london", 2024]))
+      "temp:['london', 2024]"
+  """
   @spec to_string(t()) :: String.t()
-  def to_string(%__MODULE__{table: table, id: id}) do
-    "#{escape(table)}:#{format_id(id)}"
-  end
-
-  defp format_id(id) when is_binary(id), do: escape(id)
-  defp format_id(id) when is_integer(id), do: Integer.to_string(id)
-  defp format_id(id), do: inspect(id)
-
-  # SurrealDB identifiers that are not simple alphanumerics are wrapped in backticks.
-  defp escape(part) when is_binary(part) do
-    if Regex.match?(~r/^[a-zA-Z_][a-zA-Z0-9_]*$/, part) do
-      part
-    else
-      "`" <> String.replace(part, "`", "\\`") <> "`"
-    end
-  end
+  def to_string(%__MODULE__{} = record), do: SurrealDB.SurrealQL.to_surql(record)
 
   defimpl String.Chars do
     def to_string(record_id), do: SurrealDB.RecordId.to_string(record_id)
