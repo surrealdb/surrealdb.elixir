@@ -469,15 +469,16 @@ defmodule SurrealDB.Connection do
   end
 
   @doc false
-  # The delay before reconnect attempt `attempt` (1-based): `delay * multiplier^(attempt-1)`,
-  # spread by up to `jitter` either way and capped at `max_delay`.
+  # The delay before reconnect attempt `attempt` (1-based), as in the JS SDK:
+  # `delay * multiplier^attempt`, spread by up to `jitter` either way, then capped at
+  # `max_delay`. The first retry therefore waits `delay * multiplier`, not `delay`.
   def backoff(config, attempt) do
     base = config[:delay] * :math.pow(config[:multiplier], exponent(config, attempt))
     spread = 1 + config[:jitter] * (2 * :rand.uniform() - 1)
-    round(min(min(base, config[:max_delay]) * spread, config[:max_delay]))
+    round(min(base * spread, config[:max_delay]))
   end
 
-  # The exponent stops growing once the delay has reached `max_delay`, so an unlimited
+  # The exponent stops growing once the delay is far past `max_delay`, so an unlimited
   # number of attempts can't overflow `:math.pow/2`.
   defp exponent(config, attempt) do
     delay = config[:delay]
@@ -485,9 +486,9 @@ defmodule SurrealDB.Connection do
     max_delay = config[:max_delay]
 
     cond do
-      multiplier <= 1 -> attempt - 1
+      multiplier <= 1 -> attempt
       delay <= 0 or max_delay <= delay -> 0
-      true -> min(attempt - 1, ceil(:math.log(max_delay / delay) / :math.log(multiplier)))
+      true -> min(attempt, ceil(:math.log(max_delay * 1.0e6 / delay) / :math.log(multiplier)))
     end
   end
 

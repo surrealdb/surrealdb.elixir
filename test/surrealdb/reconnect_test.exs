@@ -468,15 +468,15 @@ defmodule SurrealDB.ReconnectTest do
   test "backoff stops growing at the cap, however many attempts" do
     config = [delay: 1_000, max_delay: 60_000, multiplier: 2.0, jitter: 0.0]
     assert Connection.backoff(config, 5_000) == 60_000
-    assert Connection.backoff(Keyword.put(config, :jitter, 0.1), 1_000_000) in 54_000..60_000
+    assert Connection.backoff(Keyword.put(config, :jitter, 0.1), 1_000_000) == 60_000
     assert Connection.backoff(Keyword.put(config, :multiplier, 1.0), 1_000_000) == 1_000
   end
 
   test "backoff grows by the multiplier up to the cap" do
     config = [delay: 100, max_delay: 1_000, multiplier: 2.0, jitter: 0.0]
-    assert Enum.map(1..6, &Connection.backoff(config, &1)) == [100, 200, 400, 800, 1_000, 1_000]
+    assert Enum.map(1..6, &Connection.backoff(config, &1)) == [200, 400, 800, 1_000, 1_000, 1_000]
 
     jittered = Connection.backoff(Keyword.put(config, :jitter, 0.1), 1)
-    assert jittered in 90..110
+    assert jittered in 180..220
   end
 end
