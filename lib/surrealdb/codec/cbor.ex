@@ -150,6 +150,10 @@ defmodule SurrealDB.Codec.CBOR do
 
   # The server writes a zero duration as `[]` and drops zero nanoseconds. The seconds may
   # use the whole unsigned 64-bit range.
+  defp enc(%Duration{nanoseconds: ns} = duration, _f) when ns < 0 do
+    raise ArgumentError, "duration #{inspect(duration)} is negative; SurrealDB durations are unsigned"
+  end
+
   defp enc(%Duration{} = duration, _f) do
     parts =
       case Duration.to_parts(duration) do
