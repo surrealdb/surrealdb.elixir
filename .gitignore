@@ -9,3 +9,6 @@ erl_crash.dump
 *.beam
 /config/*.secret.exs
 .elixir_ls/
+
+# Conformance vectors, fetched by scripts/fetch-protocol-vectors.sh and not committed
+/test/fixtures/surrealdb-protocol/*.yaml

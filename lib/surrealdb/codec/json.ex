@@ -13,7 +13,8 @@ defmodule SurrealDB.Codec.JSON do
 
   @behaviour SurrealDB.Codec
 
-  alias SurrealDB.{Bytes, Datetime, Duration, Geometry, None, Range, RecordId, Table, Uuid}
+  alias SurrealDB.{Bytes, Datetime, Duration, FileRef, Geometry, None, Number, Range, RecordId}
+  alias SurrealDB.{RecordIdRange, StringRecordId, Table, Uuid}
 
   @impl true
   def content_type, do: "application/json"
@@ -30,6 +31,7 @@ defmodule SurrealDB.Codec.JSON do
   defp prepare(%None{}), do: nil
   defp prepare(%Table{name: name}), do: name
   defp prepare(%RecordId{} = record), do: RecordId.to_string(record)
+  defp prepare(%StringRecordId{id: id}), do: id
   defp prepare(%Uuid{value: value}), do: value
   defp prepare(%Decimal{} = decimal), do: Decimal.to_string(decimal, :normal)
 
@@ -39,6 +41,7 @@ defmodule SurrealDB.Codec.JSON do
   defp prepare(%DateTime{} = datetime), do: DateTime.to_iso8601(datetime)
   defp prepare(%Duration{nanoseconds: nanoseconds}), do: "#{nanoseconds}ns"
   defp prepare(%Bytes{data: data}), do: Base.encode64(data)
+  defp prepare(%Number{value: value}), do: value
 
   defp prepare(%Geometry{type: :collection, coordinates: geometries}) do
     %{"type" => "GeometryCollection", "geometries" => Enum.map(geometries, &prepare/1)}
@@ -51,6 +54,13 @@ defmodule SurrealDB.Codec.JSON do
   defp prepare(%Range{begin: begin_bound, end: end_bound}) do
     %{"begin" => prepare_bound(begin_bound), "end" => prepare_bound(end_bound)}
   end
+
+  defp prepare(%RecordIdRange{table: table, begin: begin_bound, end: end_bound}) do
+    %{"table" => table, "begin" => prepare_bound(begin_bound), "end" => prepare_bound(end_bound)}
+  end
+
+  defp prepare(%FileRef{} = file), do: FileRef.to_string(file)
+  defp prepare(%MapSet{} = set), do: set |> MapSet.to_list() |> prepare()
 
   defp prepare(list) when is_list(list), do: Enum.map(list, &prepare/1)
 

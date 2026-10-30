@@ -19,11 +19,24 @@ defmodule SurrealDB.Datetime do
   @spec from_unix(integer(), non_neg_integer()) :: t()
   def from_unix(seconds, nanos \\ 0), do: %__MODULE__{seconds: seconds, nanos: nanos}
 
-  @doc "Builds a datetime from a native `DateTime`."
+  @doc """
+  Builds a datetime from a native `DateTime`.
+
+  Before 1970 the seconds are negative and the nanoseconds still count forwards from
+  them, so `nanos` is always in `0..999_999_999`.
+  """
   @spec from_datetime(DateTime.t()) :: t()
   def from_datetime(%DateTime{} = dt) do
-    nanos = DateTime.to_unix(dt, :nanosecond)
-    %__MODULE__{seconds: div(nanos, 1_000_000_000), nanos: rem(nanos, 1_000_000_000)}
+    dt |> DateTime.to_unix(:nanosecond) |> from_unix_nanos()
+  end
+
+  @doc "Builds a datetime from nanoseconds since the Unix epoch."
+  @spec from_unix_nanos(integer()) :: t()
+  def from_unix_nanos(nanos) when is_integer(nanos) do
+    %__MODULE__{
+      seconds: Integer.floor_div(nanos, 1_000_000_000),
+      nanos: Integer.mod(nanos, 1_000_000_000)
+    }
   end
 
   @doc """
@@ -33,6 +46,30 @@ defmodule SurrealDB.Datetime do
   @spec to_datetime(t()) :: DateTime.t()
   def to_datetime(%__MODULE__{seconds: seconds, nanos: nanos}) do
     DateTime.from_unix!(seconds * 1_000_000_000 + nanos, :nanosecond)
+  end
+
+  @doc """
+  Formats as an RFC 3339 string in UTC with full nanosecond precision, dropping trailing
+  zeros from the fraction.
+  """
+  @spec to_iso8601(t()) :: String.t()
+  def to_iso8601(%__MODULE__{seconds: seconds, nanos: nanos}) do
+    base = seconds |> DateTime.from_unix!() |> DateTime.to_iso8601() |> String.trim_trailing("Z")
+
+    fraction =
+      case nanos do
+        0 ->
+          ""
+
+        _ ->
+          "." <>
+            (nanos
+             |> Integer.to_string()
+             |> String.pad_leading(9, "0")
+             |> String.trim_trailing("0"))
+      end
+
+    base <> fraction <> "Z"
   end
 
   defimpl Inspect do

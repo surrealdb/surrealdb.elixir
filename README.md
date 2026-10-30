@@ -12,12 +12,20 @@ It aims for feature parity with the official JavaScript SDKs (`surrealdb` and
 
 - **Two transport engines**, chosen automatically from the connection URL scheme:
   WebSocket (`ws`/`wss`) and HTTP (`http`/`https`).
-- **Two protocols**: CBOR (default, full type fidelity) and JSON.
-- **Native value types**: `RecordId`, `Table`, `Uuid`, `Duration`, `Datetime`, `Decimal`,
-  `Geometry`, `Range`, `Bytes`, and `None`.
-- **Full RPC surface**: `use`, `signin`, `signup`, `authenticate`, `invalidate`, `let`,
-  `unset`, `query`, `select`, `create`, `insert`, `insert_relation`, `update`, `upsert`,
-  `merge`, `patch`, `delete`, `relate`, `run`, `info`, `version`, plus `export`/`import`.
+- **Two protocols**: CBOR (default, full type fidelity) and JSON. CBOR uses `cbor.2`
+  when the server speaks it (SurrealDB 4.0 and later) and plain `cbor` otherwise.
+- **Native value types**: `RecordId`, `RecordIdRange`, `Table`, `Uuid`, `Duration`,
+  `Datetime`, `Decimal`, `Geometry`, `Range`, `FileRef`, `Bytes`, `None`, sized numbers
+  (`Number`), and sets as `MapSet`.
+- **Conformance**: the CBOR codec passes the shared SurrealDB conformance vectors
+  (surrealdb-protocol v0.14.0).
+- **Full RPC surface**: `use`, `signin`, `signup`, `authenticate`, `refresh`, `revoke`,
+  `invalidate`, `reset`, `let`, `unset`, `query`, `select`, `create`, `insert`,
+  `insert_relation`, `update`, `upsert`, `merge`, `patch`, `delete`, `relate`, `run`,
+  `info`, `version`, `gql`, plus `export`/`import`.
+- **Streaming queries** as Elixir streams, and calls to `DEFINE API` endpoints.
+- **Sessions and interactive transactions** with handles you pass in place of the
+  connection.
 - **Live queries** delivered to any process as messages.
 - **Agent Memory client** with the complete tool surface and namespaces.
 - Works in any Elixir project: it is a plain library with a supervisable connection
@@ -57,9 +65,39 @@ Options:
 - `:url` (required) - for example `"ws://localhost:8000/rpc"` or `"https://db.example/rpc"`.
 - `:namespace` / `:database` - selected on connect via `use`.
 - `:auth` - a `SurrealDB.Auth` struct to sign in with on connect.
-- `:codec` - `:cbor` (default) or `:json`.
+- `:codec` - `:cbor` (default), `:cbor2` or `:json`. See
+  [Choosing the engine and protocol](#choosing-the-engine-and-protocol).
 - `:name` - register the process under a name.
+- `:timeout` - request timeout in milliseconds, or `:infinity` (default 30000).
+  `SurrealDB.query/4` takes a per-request `timeout:` too.
+- `:renew_access` - renew access tokens before they expire (default `true`).
+- `:version_check` - refuse servers outside `>= 2.1.0` and `< 5.0.0` (default `true`).
 - `:transport_opts` - extra transport options, for example TLS settings.
+
+`SurrealDB.health/1` checks the server's `/health` endpoint, `SurrealDB.version/1` returns
+its version, and `SurrealDB.reset/1` signs out and clears the session.
+
+### Reconnecting
+
+A WebSocket connection reconnects automatically with exponential backoff when it drops,
+and restores its session before it serves requests again: authentication, namespace and
+database, `let` parameters, attached sessions, and live queries (which keep their ids).
+Open transactions are not restored. Requests in flight when
+it dropped fail rather than run twice; requests made while reconnecting wait and are sent
+once it is back. Subscribe to status events to follow along:
+
+```elixir
+:ok = SurrealDB.subscribe_status(db)
+
+receive do
+  {:surrealdb, :status, :reconnecting, %{attempt: n, error: error}} -> ...
+  {:surrealdb, :status, :connected, _info} -> ...
+  {:surrealdb, :status, :disconnected, %{error: error}} -> ...  # gave up; the process stops
+end
+```
+
+Tune it with `reconnect: [attempts: 10, delay: 500, max_delay: 30_000]`, or turn it off with
+`reconnect: false`.
 
 ### In a supervision tree
 
@@ -86,33 +124,77 @@ Now any process can call `SurrealDB.query(MyApp.SurrealDB, "...")`.
 
 # Select a whole table, a single record, or a range
 {:ok, people} = SurrealDB.select(db, "person")
-{:ok, one} = SurrealDB.select(db, "person:tobie")
+tobie = SurrealDB.RecordId.new("person", "tobie")
+{:ok, one} = SurrealDB.select(db, tobie)
 
 # Update, merge, patch, delete
-{:ok, _} = SurrealDB.merge(db, "person:tobie", %{active: true})
-{:ok, _} = SurrealDB.patch(db, "person:tobie", [%{"op" => "replace", "path" => "/age", "value" => 31}])
-{:ok, _} = SurrealDB.delete(db, "person:tobie")
+{:ok, _} = SurrealDB.merge(db, tobie, %{active: true})
+{:ok, _} = SurrealDB.patch(db, tobie, [%{"op" => "replace", "path" => "/age", "value" => 31}])
+{:ok, _} = SurrealDB.delete(db, tobie)
 
 # Parameterised queries. Each statement's result is returned in order.
 {:ok, [rows]} = SurrealDB.query(db, "SELECT * FROM person WHERE age > $min", %{min: 18})
 
+# If any statement fails, the error still carries every statement's outcome.
+{:error, %SurrealDB.Error{kind: :query, details: %{results: results}}} =
+  SurrealDB.query(db, "RETURN 1; THROW 'no'; RETURN 3")
+
+# Or always get one {:ok, value} | {:error, error} per statement.
+{:ok, [{:ok, 1}, {:error, _}, {:ok, 3}]} =
+  SurrealDB.query_results(db, "RETURN 1; THROW 'no'; RETURN 3")
+
 # Graph edges
-{:ok, _} = SurrealDB.relate(db, "person:tobie", "wrote", "article:surreal", %{year: 2024})
+article = SurrealDB.RecordId.new("article", "surreal")
+{:ok, _} = SurrealDB.relate(db, tobie, "wrote", article, %{year: 2024})
 
 # Functions
 {:ok, uuid} = SurrealDB.run(db, "rand::uuid")
 ```
 
+### Streaming results
+
+`query_stream/4` returns an Elixir `Stream` of frames as the server produces them, so large
+results are not buffered in one reply. Stopping early cancels the query on the server.
+
+```elixir
+db
+|> SurrealDB.query_stream("SELECT * FROM event")
+|> Stream.flat_map(fn
+  {:rows, 0, rows} -> rows
+  _frame -> []
+end)
+|> Enum.take(1_000)
+```
+
+Rows are provisional until their statement's `{:finished, index, %{error: nil}}` frame.
+`stream_query/4` sends the same frames to a process as messages instead.
+
+### GQL and API endpoints
+
+```elixir
+{:ok, [names]} = SurrealDB.gql(db, "MATCH (a:person)-[:knows]->(b:person) RETURN b.name")
+
+# Call an endpoint defined with DEFINE API
+{:ok, %{status: 201, body: body}} = SurrealDB.api(db, "/users", method: :post, body: %{name: "Tobie"})
+```
+
 A "thing" passed to `select/2`, `create/3`, and friends can be:
 
-- a bare string without a colon (`"person"`) or a `SurrealDB.Table` - a whole table.
-- a string with a colon (`"person:tobie"`) or a `SurrealDB.RecordId` - one record.
-- a `SurrealDB.Range` - a record id range.
+- a string (`"person"`) or a `SurrealDB.Table` - a whole table. A string is always a
+  table name, even when it contains a colon. (JSON cannot tell such a name from a record
+  id, so over the JSON codec a table name with a colon returns an `:unsupported` error.)
+- a `SurrealDB.RecordId` - one record. Parse text with `SurrealDB.RecordId.parse!/1`, or
+  wrap it in a `SurrealDB.StringRecordId` to have the server parse it.
+- a `SurrealDB.RecordIdRange` - the records in a range of ids. (CBOR only: over JSON it
+  returns an `:unsupported` error.)
+
+The SDK never guesses that a string is a record id, so a value like `"user:1234"` from user
+input stays a string.
 
 ## Value types
 
 ```elixir
-alias SurrealDB.{RecordId, Duration, Datetime, Geometry, Range}
+alias SurrealDB.{RecordId, RecordIdRange, Duration, Datetime, Geometry, Uuid}
 
 SurrealDB.create(db, "event", %{
   at: Datetime.from_datetime(DateTime.utc_now()),
@@ -121,12 +203,36 @@ SurrealDB.create(db, "event", %{
   author: RecordId.new("person", "tobie")
 })
 
-# Record id ranges
-SurrealDB.select(db, Range.new({:incl, RecordId.new("temperature", 1)}, {:excl, RecordId.new("temperature", 100)}))
+# Record id ranges: temperature:1..100
+SurrealDB.select(db, RecordIdRange.new("temperature", {:incl, 1}, {:excl, 100}))
+
+# Sets are MapSets, and UUIDs can be generated client side
+SurrealDB.create(db, "tag", %{names: MapSet.new(["a", "b"]), ref: Uuid.v7()})
 ```
 
 With the CBOR protocol these types round-trip with full fidelity. With JSON they are
 projected onto their closest JSON representation.
+
+### Sized numbers
+
+SurrealDB 4.0 adds sized number kinds, such as `5u8` and `1.5f32`. They come back as
+`SurrealDB.Number` structs, and you send one the same way:
+
+```elixir
+alias SurrealDB.Number
+
+{:ok, [n]} = SurrealDB.query(db, "RETURN 5u8")
+n #=> %SurrealDB.Number{kind: :u8, value: 5}
+
+SurrealDB.create(db, "reading", %{level: Number.u8(200), ratio: Number.f32(0.25)})
+```
+
+The kinds are `:i8`, `:u8`, `:i16`, `:u16`, `:i32`, `:u32`, `:u64`, `:f16` and `:f32`.
+Building one checks the range, and a float kind rounds to its precision. Plain integers
+and floats stay plain `int` and `float` values.
+
+Sized numbers need the `cbor.2` protocol. On a server before 4.0, or over JSON, a sized
+number is sent as a plain number (a `u64` above the signed 64-bit limit as a decimal).
 
 ## Authentication
 
@@ -146,6 +252,78 @@ projected onto their closest JSON representation.
 # Reuse a token later
 {:ok, _} = SurrealDB.authenticate(db, token)
 {:ok, _} = SurrealDB.invalidate(db)
+```
+
+When a record access method is defined `WITH REFRESH`, `signin/2` and `signup/2` return
+an access and refresh token pair, and the connection keeps both:
+
+```elixir
+{:ok, %{"access" => _, "refresh" => _} = pair} = SurrealDB.signin(db, record_auth)
+
+{:ok, new_pair} = SurrealDB.refresh(db)        # exchange the refresh token for a new pair
+{:ok, _} = SurrealDB.authenticate(other, pair)  # authenticate with a pair, keeping the refresh token
+{:ok, _} = SurrealDB.revoke(db)                 # the refresh token can no longer be used
+```
+
+The connection renews the access token a minute before it expires (or halfway through a
+shorter lifetime): with the refresh token when it has one, otherwise by signing in again
+with the credentials it signed in with. Turn this off with `renew_access: false`. After a
+reconnect, a refused access token is refreshed the same way.
+
+## Sessions and transactions
+
+A connection can carry several sessions, each with its own namespace, database,
+authentication, and parameters. A session handle goes wherever a connection does:
+
+```elixir
+{:ok, tenant} = SurrealDB.new_session(db)
+{:ok, _} = SurrealDB.signin(tenant, %SurrealDB.Auth.Root{user: "root", pass: "root"})
+{:ok, _} = SurrealDB.use(tenant, namespace: "app", database: "tenant_a")
+{:ok, rows} = SurrealDB.select(tenant, "person")
+
+# Or start from a copy of an existing session's state.
+{:ok, copy} = SurrealDB.fork_session(db)
+
+{:ok, ids} = SurrealDB.sessions(db)
+{:ok, _} = SurrealDB.close_session(tenant)
+```
+
+Interactive transactions work the same way: calls with the transaction handle run inside
+it until you commit or cancel.
+
+```elixir
+{:ok, txn} = SurrealDB.begin(db)
+{:ok, _} = SurrealDB.create(txn, "account", %{balance: 100})
+{:ok, _} = SurrealDB.commit(txn)   # or SurrealDB.cancel(txn)
+
+# transaction/2 commits when the function succeeds and cancels when it returns
+# {:error, _} or raises.
+{:ok, :moved} =
+  SurrealDB.transaction(db, fn txn ->
+    {:ok, _} = SurrealDB.merge(txn, from, %{balance: 90})
+    {:ok, _} = SurrealDB.merge(txn, to, %{balance: 110})
+    :moved
+  end)
+```
+
+Sessions and transactions need a WebSocket connection and SurrealDB 3.0 or later.
+
+## Errors
+
+Every function returns `{:error, %SurrealDB.Error{}}` on failure. `kind` says where the
+error came from (`:rpc` for the server, `:connection`, `:timeout`, `:http`, and so on). For
+server errors, `server_kind` is the server's error kind and `details` its structured
+details:
+
+```elixir
+case SurrealDB.select(db, "missing") do
+  {:error, %SurrealDB.Error{server_kind: :not_found} = error} ->
+    SurrealDB.Error.detail_kinds(error)   # ["Table"]
+    SurrealDB.Error.detail_fields(error)  # %{"name" => "missing"}
+end
+
+SurrealDB.Error.token_expired?(error)
+SurrealDB.Error.transaction_conflict?(error)
 ```
 
 ## Live queries
@@ -169,6 +347,22 @@ SurrealDB.kill(db, live_id)
 
 `action` is one of `:create`, `:update`, or `:delete`.
 
+## Export and import
+
+```elixir
+{:ok, script} = SurrealDB.export(db)
+{:ok, schema} = SurrealDB.export(db, records: false, tables: {:exclude, ["audit"]})
+
+case SurrealDB.import(other_db, script) do
+  {:ok, :imported} -> :ok
+  # An import is not a transaction: the other statements were still applied.
+  {:error, %SurrealDB.Error{details: %{failures: failures}}} -> failures
+end
+```
+
+Both use the server's HTTP endpoints whatever the engine. The server only imports scripts
+that start with `OPTION IMPORT;`, as exports do.
+
 ## Choosing the engine and protocol
 
 ```elixir
@@ -177,6 +371,17 @@ SurrealDB.kill(db, live_id)
 ```
 
 The HTTP engine does not support live queries. Use a `ws`/`wss` URL for those.
+
+With the default `codec: :cbor`, the SDK negotiates the CBOR version with the server:
+
+- **WebSocket**: it offers the subprotocols `cbor.2, cbor`. SurrealDB 4.0 picks `cbor.2`,
+  and older servers pick `cbor`.
+- **HTTP**: each request asks for `cbor.2` (`Accept: application/cbor; v=2`) and is sent as
+  plain `application/cbor`. Once the server answers in `cbor.2`, requests are sent in it
+  too. Older servers answer in `cbor`, and the connection stays on it.
+
+`SurrealDB.Connection.session_info/1` reports the codec in use. Pass `codec: :cbor2` to
+require `cbor.2`.
 
 ## Agent Memory
 
@@ -253,12 +458,24 @@ Integration tests run against a real SurrealDB server and are excluded by defaul
 server and include them:
 
 ```sh
-docker run --rm -p 8000:8000 surrealdb/surrealdb:latest start --user root --pass root
+docker run --rm -p 8000:8000 surrealdb/surrealdb:v3 start --user root --pass root memory
 
 mix test --include integration
 ```
 
-Override the server URL with the `SURREALDB_URL` environment variable.
+Override the server URL with the `SURREALDB_URL` environment variable. CI runs the
+integration tests against the latest 3.x release (`surrealdb/surrealdb:v3`) and the nightly
+build (`surrealdb/surrealdb:nightly`). The tests that need `cbor.2` are skipped when the
+server does not negotiate it.
+
+The CBOR codec runs the shared conformance vectors from
+[surrealdb-protocol](https://github.com/surrealdb/surrealdb-protocol) v0.14.0. They are
+downloaded rather than committed; fetch them before running the tests (without them the
+conformance suite is skipped):
+
+```sh
+scripts/fetch-protocol-vectors.sh
+```
 
 ## License
 

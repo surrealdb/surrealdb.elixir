@@ -15,7 +15,7 @@ concurrency:
 jobs:
   test:
     name: Test (Elixir ${{ matrix.elixir }} / OTP ${{ matrix.otp }})
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
 
     strategy:
       fail-fast: false
@@ -58,5 +58,70 @@ jobs:
       - name: Compile (warnings as errors)
         run: mix compile --warnings-as-errors
 
+      - name: Fetch the conformance vectors
+        run: scripts/fetch-protocol-vectors.sh
+
       - name: Run tests
         run: mix test
+
+      - name: Build the hex package
+        run: mix hex.build
+
+  integration:
+    name: Integration (SurrealDB ${{ matrix.surrealdb }})
+    runs-on: ubuntu-24.04
+
+    strategy:
+      fail-fast: false
+      matrix:
+        # v3 is the latest 3.x release; nightly is the next release line.
+        surrealdb: ["v3", "nightly"]
+
+    env:
+      MIX_ENV: test
+      SURREALDB_URL: ws://127.0.0.1:8000/rpc
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Start SurrealDB
+        run: |
+          docker run --detach --name surrealdb --publish 8000:8000 \
+            surrealdb/surrealdb:${{ matrix.surrealdb }} \
+            start --user root --pass root memory
+          # /ready, unlike /health, only succeeds once startup (including the root user)
+          # has finished.
+          for _ in $(seq 1 60); do
+            if curl --silent --fail http://127.0.0.1:8000/ready; then break; fi
+            sleep 1
+          done
+          curl --silent --fail http://127.0.0.1:8000/ready
+          curl --silent --fail http://127.0.0.1:8000/version
+          echo
+
+      - name: Set up Elixir
+        uses: erlef/setup-beam@e6d7c94229049569db56a7ad5a540c051a010af9 # v1.20.4
+        with:
+          elixir-version: "1.18.3"
+          otp-version: "27.3"
+
+      - name: Cache deps and build
+        uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        with:
+          path: |
+            deps
+            _build
+          key: ${{ runner.os }}-mix-27.3-1.18.3-${{ hashFiles('**/mix.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-mix-27.3-1.18.3-
+
+      - name: Install dependencies
+        run: mix deps.get
+
+      - name: Run integration tests
+        run: mix test --only integration
+
+      - name: Server logs
+        if: failure()
+        run: docker logs surrealdb

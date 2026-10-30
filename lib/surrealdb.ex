@@ -25,17 +25,38 @@ defmodule SurrealDB do
 
   Methods such as `select/2` and `create/3` accept a "thing" that identifies what to act on:
 
-    * a `SurrealDB.Table` or a bare string without a colon (for example `"person"`) targets
-      a whole table.
-    * a `SurrealDB.RecordId` or a string with a colon (for example `"person:tobie"`) targets
-      a single record.
-    * a `SurrealDB.Range` targets a record id range.
+    * a string (for example `"person"`) or a `SurrealDB.Table` targets a whole table. A
+      string is always a table name, even if it contains a colon. JSON cannot tell such a
+      name from a record id, so over the JSON codec it returns an `:unsupported` error.
+    * a `SurrealDB.RecordId` targets a single record. Build one with
+      `SurrealDB.RecordId.new/2`, or parse text with `SurrealDB.RecordId.parse!/1`.
+    * a `SurrealDB.StringRecordId` targets a single record whose id the server parses.
+    * a `SurrealDB.RecordIdRange` targets the records in a range of ids, for example
+      `SurrealDB.RecordIdRange.new("person", {:incl, 1}, {:excl, 100})`. JSON has no
+      way to send one, so over the JSON codec it returns an `:unsupported` error.
+
+  The SDK never guesses that a string is a record id: a value such as `"user:1234"` read
+  from user input stays a string.
   """
 
-  alias SurrealDB.{Connection, Error, RecordId, Table, Uuid}
+  alias SurrealDB.{Connection, Error, RecordId, StringRecordId, Table, Transaction, Uuid}
 
-  @type conn :: GenServer.server()
-  @type thing :: String.t() | Table.t() | RecordId.t() | SurrealDB.Range.t()
+  @typedoc """
+  A connection handle, or a `SurrealDB.Session` or `SurrealDB.Transaction` on one. Every
+  call that takes a connection also takes a session and runs in it. A transaction runs
+  queries and record operations (`query`, `select`, `create`, and so on); calls that change
+  session state (`use`, `signin`, `let`, ...), live queries, `run`, and `export`/`import`
+  return an `:unsupported` error for one.
+  """
+  @type conn :: GenServer.server() | SurrealDB.Session.t() | Transaction.t()
+  @type thing ::
+          String.t()
+          | Table.t()
+          | RecordId.t()
+          | StringRecordId.t()
+          | SurrealDB.RecordIdRange.t()
+          | SurrealDB.Range.t()
+  @type record_ref :: RecordId.t() | StringRecordId.t()
   @type result :: {:ok, term()} | {:error, Error.t()}
 
   @doc """
@@ -46,10 +67,26 @@ defmodule SurrealDB do
     * `:url` (required) - connection URL, for example `"ws://localhost:8000/rpc"`.
     * `:namespace` / `:database` - selected on connect via `use`.
     * `:auth` - a `SurrealDB.Auth` struct to sign in with on connect.
-    * `:codec` - `:cbor` (default) or `:json`.
+    * `:codec` - `:cbor` (default), `:cbor2` or `:json`. `:cbor` uses `cbor.2` when the
+      server speaks it (SurrealDB 4.0 and later) and plain `cbor` otherwise; see
+      `SurrealDB.Codec`.
     * `:name` - a name to register the process under.
-    * `:connect_timeout` - milliseconds to wait for the connect-time `use`/`signin`
-      (default 15000).
+    * `:connect_timeout` - milliseconds to wait for each connect-time call (`version`,
+      `signin`, `use`) (default 15000).
+    * `:timeout` - milliseconds before a request times out, or `:infinity` (default 30000).
+      Calls that take options, such as `query/4`, can override it per request.
+    * `:reconnect` - whether a WebSocket connection reconnects and restores its session
+      after it drops (default `true`). Pass a keyword list to tune the backoff:
+      `attempts` (default 5, or `:infinity`), `delay` (first delay in ms, default 1000),
+      `max_delay` (default 60000), `multiplier` (default 2.0), and `jitter` (default 0.1).
+      See `SurrealDB.Connection` for what is restored.
+    * `:renew_access` - when `true` (the default), the connection renews a session's access
+      token a minute before it expires: with the refresh token when the session has one,
+      otherwise by signing in again with the credentials it signed in with. A session
+      authenticated with only a token is not renewed.
+    * `:version_check` - when `true` (the default), the connection asks the server for its
+      version and refuses to start unless it is supported: `>= 2.1.0` and `< 5.0.0`. See
+      `SurrealDB.Version`.
     * `:transport_opts` - extra options passed to the transport (for example TLS settings).
   """
   @spec start_link(keyword()) :: GenServer.on_start()
@@ -60,7 +97,21 @@ defmodule SurrealDB do
 
   @doc "Closes the connection and stops its process."
   @spec close(conn()) :: :ok
-  def close(conn), do: GenServer.stop(conn)
+  def close(conn), do: GenServer.stop(Connection.server(conn))
+
+  @doc """
+  Sends connection status events to `pid` (default: the caller):
+
+      {:surrealdb, :status, :reconnecting | :connected | :disconnected, info}
+
+  `info` holds the reconnect `:attempt` and, when there is one, the `:error`.
+  """
+  @spec subscribe_status(conn(), pid()) :: :ok
+  def subscribe_status(conn, pid \\ self()), do: Connection.subscribe_status(conn, pid)
+
+  @doc "Stops sending connection status events to `pid` (default: the caller)."
+  @spec unsubscribe_status(conn(), pid()) :: :ok
+  def unsubscribe_status(conn, pid \\ self()), do: Connection.unsubscribe_status(conn, pid)
 
   @doc "Returns session info: active namespace, database, engine, codec, and live support."
   @spec info_session(conn()) :: map()
@@ -68,23 +119,114 @@ defmodule SurrealDB do
 
   # ── Session and auth ───────────────────────────────────────────────────────
 
-  @doc "Selects the namespace and/or database to use. Pass `nil` to leave one unchanged."
+  @doc """
+  Selects the namespace and/or database to use.
+
+  A key that is missing or `nil` leaves that selection unchanged, so
+  `use(db, database: "other")` switches the database and keeps the namespace. Pass
+  `:unset` to clear a selection. Clearing the namespace also clears the database.
+
+      SurrealDB.use(db, namespace: "app", database: "prod")
+      SurrealDB.use(db, database: "staging")
+      SurrealDB.use(db, database: :unset)
+  """
   @spec use(conn(), keyword()) :: result()
   def use(conn, opts) do
-    Connection.call(conn, "use", [opts[:namespace], opts[:database]])
+    params = [use_param(opts, :namespace), use_param(opts, :database)]
+    Connection.call(conn, "use", params)
   end
 
-  @doc "Signs in with the given credentials and returns the auth token."
+  # The server reads NONE as "leave unchanged" and NULL as "clear".
+  defp use_param(opts, key) do
+    case Keyword.get(opts, key) do
+      nil -> SurrealDB.None.none()
+      :unset -> nil
+      name when is_binary(name) -> name
+    end
+  end
+
+  @doc """
+  Signs in with the given credentials and returns the auth token.
+
+  The token is a JWT string, or a map with `"access"` and `"refresh"` tokens when the
+  record access method was defined `WITH REFRESH`. Either way the connection keeps the
+  access token and sends it with every later request.
+  """
   @spec signin(conn(), SurrealDB.Auth.t()) :: result()
   def signin(conn, auth), do: Connection.call(conn, "signin", [SurrealDB.Auth.to_params(auth)])
 
-  @doc "Signs up via record access and returns the auth token."
+  @doc "Signs up via record access and returns the auth token, as `signin/2` does."
   @spec signup(conn(), SurrealDB.Auth.Record.t()) :: result()
   def signup(conn, auth), do: Connection.call(conn, "signup", [SurrealDB.Auth.to_params(auth)])
 
-  @doc "Authenticates the connection with an existing token."
-  @spec authenticate(conn(), String.t()) :: result()
-  def authenticate(conn, token), do: Connection.call(conn, "authenticate", [token])
+  @typedoc """
+  An access token, or an access and refresh token pair as `signin/2` returns it for a
+  record access method defined `WITH REFRESH`.
+  """
+  @type tokens :: String.t() | %{required(String.t() | atom()) => String.t()}
+
+  @doc """
+  Authenticates the connection with an existing token.
+
+  Pass the access and refresh token pair (`%{"access" => _, "refresh" => _}`) to keep the
+  refresh token too, so `refresh/1` and automatic renewal can use it.
+  """
+  @spec authenticate(conn(), tokens()) :: result()
+  def authenticate(conn, token) when is_binary(token),
+    do: Connection.call(conn, "authenticate", [token])
+
+  def authenticate(conn, tokens) when is_map(tokens) do
+    %{"access" => access, "refresh" => refresh} = token_pair(tokens)
+    Connection.call(conn, "authenticate", [access], meta: %{refresh_token: refresh})
+  end
+
+  @doc """
+  Exchanges a refresh token for a new access and refresh token pair, and authenticates the
+  session with the new access token. The old refresh token can not be used again.
+
+  With no tokens given, it uses the pair the session holds from `signin/2`, `signup/2`, or
+  `authenticate/2`.
+
+      {:ok, %{"access" => access, "refresh" => refresh}} = SurrealDB.refresh(db)
+  """
+  @spec refresh(conn(), tokens() | nil) :: result()
+  def refresh(conn, tokens \\ nil) do
+    with {:ok, pair} <- stored_pair(conn, tokens) do
+      Connection.call(conn, "refresh", [pair])
+    end
+  end
+
+  @doc """
+  Revokes a refresh token so it can not be used to get new access tokens. The session stays
+  authenticated until its access token expires.
+
+  With no tokens given, it revokes the refresh token the session holds.
+  """
+  @spec revoke(conn(), tokens() | nil) :: result()
+  def revoke(conn, tokens \\ nil) do
+    with {:ok, pair} <- stored_pair(conn, tokens) do
+      Connection.call(conn, "revoke", [pair])
+    end
+  end
+
+  defp stored_pair(conn, nil) do
+    case Connection.session_info(conn) do
+      %{token: access, refresh_token: refresh} when is_binary(access) and is_binary(refresh) ->
+        {:ok, %{"access" => access, "refresh" => refresh}}
+
+      _ ->
+        {:error, Error.new(:auth, "the session has no refresh token")}
+    end
+  end
+
+  defp stored_pair(_conn, tokens) when is_map(tokens), do: {:ok, token_pair(tokens)}
+
+  defp token_pair(tokens) do
+    %{
+      "access" => tokens["access"] || tokens[:access],
+      "refresh" => tokens["refresh"] || tokens[:refresh]
+    }
+  end
 
   @doc "Invalidates the current session authentication."
   @spec invalidate(conn()) :: result()
@@ -94,9 +236,24 @@ defmodule SurrealDB do
   @spec info(conn()) :: result()
   def info(conn), do: Connection.call(conn, "info", [])
 
-  @doc "Returns the SurrealDB server version."
+  @doc "Returns the SurrealDB server version, for example `\"surrealdb-3.3.4\"`."
   @spec version(conn()) :: result()
   def version(conn), do: Connection.call(conn, "version", [])
+
+  @doc """
+  Checks the server's health with the HTTP `/health` endpoint, derived from the connection
+  URL whatever the engine. Returns `:ok` when the server and its storage are healthy.
+  """
+  @spec health(conn(), keyword()) :: :ok | {:error, Error.t()}
+  def health(conn, opts \\ []), do: SurrealDB.Rest.health(Connection.session_info(conn), opts)
+
+  @doc """
+  Resets the session: signs out and clears the namespace, database, and connection
+  parameters. The server also kills the session's live queries and cancels its open
+  transactions.
+  """
+  @spec reset(conn()) :: result()
+  def reset(conn), do: Connection.call(conn, "reset", [])
 
   @doc "Defines a connection-scoped parameter usable in later queries as `$name`."
   @spec let(conn(), String.t(), term()) :: result()
@@ -110,18 +267,426 @@ defmodule SurrealDB do
   @spec unset(conn(), String.t()) :: result()
   def unset(conn, name), do: Connection.call(conn, "unset", [name])
 
+  # ── Sessions and transactions ─────────────────────────────────────────────
+
+  @doc """
+  Starts a new session on the connection and returns its handle.
+
+  A session has its own namespace, database, authentication, and parameters, and starts
+  with none of them set. Pass the handle wherever a connection is expected. Sessions are
+  restored after a reconnect, with their state and live queries.
+
+  Needs a WebSocket connection and SurrealDB 3.0 or later.
+  """
+  @spec new_session(conn()) :: {:ok, SurrealDB.Session.t()} | {:error, Error.t()}
+  def new_session(%Transaction{}),
+    do: {:error, Error.new(:unsupported, "sessions cannot be started in a transaction")}
+
+  def new_session(conn) do
+    server = Connection.server(conn)
+    session = %SurrealDB.Session{conn: server, id: Uuid.v4()}
+
+    case Connection.call(session, "attach", []) do
+      {:ok, _} -> {:ok, session}
+      {:error, error} -> {:error, error}
+    end
+  end
+
+  @doc """
+  Starts a new session with a copy of another session's state: namespace, database,
+  authentication, and parameters. Changes to either afterwards do not affect the other.
+  Pass the connection to fork its default session.
+  """
+  @spec fork_session(conn()) :: {:ok, SurrealDB.Session.t()} | {:error, Error.t()}
+  def fork_session(conn) do
+    source = Connection.session_info(conn)
+    {_server, source_sid, _txn} = Connection.target(conn)
+
+    with :ok <- attached(source),
+         {:ok, session} <- new_session(conn),
+         :ok <- copy_session(session, source, source_sid) do
+      {:ok, session}
+    end
+  end
+
+  defp attached(%{attached: true}), do: :ok
+
+  defp attached(%{session: id}) do
+    message = "session #{id} is not attached: it was closed, or dropped after a reconnect"
+    {:error, Error.new(:connection, message)}
+  end
+
+  defp copy_session(session, source, source_sid) do
+    authenticate = fn ->
+      meta = %{copy_auth_from: source_sid}
+      Connection.call(session, "authenticate", [source.token], meta: meta)
+    end
+
+    steps =
+      [
+        source.token && authenticate,
+        (source.namespace || source.database) &&
+          fn ->
+            __MODULE__.use(session, namespace: source.namespace, database: source.database)
+          end
+      ] ++ Enum.map(source.vars, fn {name, value} -> fn -> let(session, name, value) end end)
+
+    steps
+    |> Enum.filter(& &1)
+    |> Enum.reduce_while(:ok, fn step, :ok ->
+      case step.() do
+        {:ok, _} ->
+          {:cont, :ok}
+
+        {:error, error} ->
+          close_session(session)
+          {:halt, {:error, error}}
+      end
+    end)
+  end
+
+  @doc "Lists the ids of the sessions attached to the connection."
+  @spec sessions(conn()) :: {:ok, [Uuid.t()]} | {:error, Error.t()}
+  def sessions(conn) do
+    # Over JSON the ids arrive as strings.
+    case Connection.call(Connection.server(conn), "sessions", []) do
+      {:ok, ids} when is_list(ids) ->
+        {:ok, Enum.map(ids, fn id -> if is_binary(id), do: Uuid.new(id), else: id end)}
+
+      other ->
+        other
+    end
+  end
+
+  @doc """
+  Closes a session. The server kills its live queries and cancels its open transactions.
+  """
+  @spec close_session(SurrealDB.Session.t()) :: result()
+  def close_session(%SurrealDB.Session{} = session), do: Connection.call(session, "detach", [])
+
+  @doc """
+  Begins an interactive transaction and returns its handle. Pass the handle wherever a
+  connection is expected and the call runs inside the transaction, then `commit/1` or
+  `cancel/1` it. `transaction/2` does that for you.
+
+  Begin on a session handle to run the transaction in that session.
+
+  Needs a WebSocket connection and SurrealDB 3.0 or later.
+  """
+  @spec begin(conn()) :: {:ok, Transaction.t()} | {:error, Error.t()}
+  def begin(%Transaction{}),
+    do: {:error, Error.new(:unsupported, "transactions cannot be nested")}
+
+  def begin(conn) do
+    {server, session, _txn} = Connection.target(conn)
+
+    case Connection.call(conn, "begin", []) do
+      {:ok, %Uuid{} = id} ->
+        {:ok, %Transaction{conn: server, id: id, session: session && Uuid.new(session)}}
+
+      {:ok, id} when is_binary(id) ->
+        {:ok, %Transaction{conn: server, id: Uuid.new(id), session: session && Uuid.new(session)}}
+
+      {:error, error} ->
+        {:error, error}
+    end
+  end
+
+  @doc "Commits a transaction."
+  @spec commit(Transaction.t()) :: result()
+  def commit(%Transaction{} = txn), do: Connection.call(txn_session(txn), "commit", [txn.id])
+
+  @doc "Cancels a transaction, discarding its changes."
+  @spec cancel(Transaction.t()) :: result()
+  def cancel(%Transaction{} = txn), do: Connection.call(txn_session(txn), "cancel", [txn.id])
+
+  # `commit` and `cancel` name the transaction in their params and run in its session.
+  defp txn_session(%Transaction{conn: conn, session: nil}), do: conn
+
+  defp txn_session(%Transaction{conn: conn, session: id}),
+    do: %SurrealDB.Session{conn: conn, id: id}
+
+  @doc """
+  Runs `fun` in a transaction, committing it when `fun` succeeds and cancelling it when
+  `fun` fails.
+
+  `fun` receives the transaction handle. When it returns `{:error, reason}` the
+  transaction is cancelled and `{:error, reason}` is returned. When it raises, throws, or
+  exits, the transaction is cancelled and the exception propagates. Otherwise the
+  transaction is committed and the result returned: `{:ok, value}` as is, any other value
+  as `{:ok, value}`. A failed commit returns its error.
+
+      SurrealDB.transaction(db, fn txn ->
+        with {:ok, _} <- SurrealDB.merge(txn, from, %{balance: from_balance - 10}),
+             {:ok, _} <- SurrealDB.merge(txn, to, %{balance: to_balance + 10}) do
+          :transferred
+        end
+      end)
+      #=> {:ok, :transferred}
+
+  A transaction that conflicts with another fails to commit with an error for which
+  `SurrealDB.Error.transaction_conflict?/1` is true, and can be retried.
+  """
+  @spec transaction(conn(), (Transaction.t() -> term())) :: result()
+  def transaction(conn, fun) when is_function(fun, 1) do
+    with {:ok, txn} <- begin(conn) do
+      result =
+        try do
+          fun.(txn)
+        catch
+          kind, reason ->
+            cancel_quietly(txn)
+            :erlang.raise(kind, reason, __STACKTRACE__)
+        end
+
+      case result do
+        {:error, _reason} = error ->
+          cancel_quietly(txn)
+          error
+
+        result ->
+          with {:ok, _} <- commit(txn) do
+            case result do
+              {:ok, _value} -> result
+              value -> {:ok, value}
+            end
+          end
+      end
+    end
+  end
+
+  # Cleaning up after a failed callback must not replace its error: the connection may be
+  # what failed.
+  defp cancel_quietly(txn) do
+    cancel(txn)
+  catch
+    _kind, _reason -> :ok
+  end
+
   # ── Queries ──────────────────────────────────────────────────────────────────
 
   @doc """
   Runs a SurrealQL query with optional bound variables.
 
-  Returns `{:ok, results}` with one entry per statement, or `{:error, error}` for the first
-  statement that failed.
+  Returns `{:ok, results}` with one result per statement when every statement succeeded.
+
+  When any statement fails it returns `{:error, %SurrealDB.Error{kind: :query}}`. The
+  error's `details.results` holds every statement's outcome, in order, as `{:ok, value}`
+  or `{:error, error}`, so nothing after the first failure is lost:
+
+      case SurrealDB.query(db, "CREATE a; THROW 'no'; CREATE b") do
+        {:ok, [a, _, b]} -> {a, b}
+        {:error, %SurrealDB.Error{kind: :query, details: %{results: results}}} -> results
+      end
+
+  Use `query_results/3` to always get the per-statement outcomes.
+
+  ## Options
+
+    * `:timeout` - milliseconds before the request times out, or `:infinity`. Defaults to
+      the connection's `:timeout`.
   """
-  @spec query(conn(), String.t(), map()) :: result()
-  def query(conn, surql, vars \\ %{}) do
-    Connection.call(conn, "query", [surql, vars])
+  @spec query(conn(), String.t(), map(), keyword()) :: result()
+  def query(conn, surql, vars \\ %{}, opts \\ []) do
+    Connection.call(conn, "query", [surql, vars], call_opts(opts))
   end
+
+  @doc """
+  Runs a SurrealQL query and returns every statement's outcome, in order, as
+  `{:ok, value}` or `{:error, %SurrealDB.Error{}}`. A failed statement does not hide the
+  ones after it.
+
+      {:ok, [{:ok, _}, {:error, error}, {:ok, _}]} =
+        SurrealDB.query_results(db, "CREATE a; THROW 'no'; CREATE b")
+  """
+  @spec query_results(conn(), String.t(), map(), keyword()) ::
+          {:ok, [{:ok, term()} | {:error, Error.t()}]} | {:error, Error.t()}
+  def query_results(conn, surql, vars \\ %{}, opts \\ []) do
+    Connection.call(conn, "query", [surql, vars], [meta: %{statements: true}] ++ call_opts(opts))
+  end
+
+  defp call_opts(opts), do: Keyword.take(opts, [:timeout])
+
+  @doc """
+  Runs a query with the server's streaming protocol and sends its results to a process as
+  they are produced, rather than all at once. Returns `{:ok, ref}`; the frames arrive as
+
+      {:surrealdb, :stream, ref, frame}
+
+  in this order:
+
+    * `{:begin, %{statements: n}}` - the stream is open. `n` is an upper bound on the
+      statements that will finish.
+    * `{:rows, index, rows}` - rows from statement `index`; more may follow. The statement's
+      value is every row it sent, in order.
+    * `{:value, index, value}` - statement `index` produced one value rather than rows.
+    * `{:finished, index, %{error: error, single: single, time: time, type: type}}` -
+      statement `index` is done. When `error` is set the statement failed and the rows
+      already sent for it must be discarded. With no payload frames, the statement's value
+      is `[]`, or `None` when `single` is true.
+    * `{:end, %{results: n, error: error}}` - the last frame. An `error` here retracts every
+      statement that had not finished, for example after a timeout or a failed commit.
+    * `{:error, error}` - the request failed (for example the connection was lost). Nothing
+      follows it.
+
+  Rows are provisional until their statement's `:finished` frame. `query_stream/4` wraps
+  this in an Elixir `Stream`. Needs a WebSocket connection and a server with the
+  `query_stream` method; an older server fails the request with a method-not-found error.
+
+  ## Options
+
+    * `:to` - the process to send frames to (default: the caller).
+    * `:timeout` - milliseconds before the stream fails with a `:timeout` error (default
+      `:infinity`).
+  """
+  @spec stream_query(conn(), String.t(), map(), keyword()) ::
+          {:ok, reference()} | {:error, Error.t()}
+  def stream_query(conn, surql, vars \\ %{}, opts \\ []) do
+    pid = Keyword.get(opts, :to, self())
+    Connection.stream(conn, "query_stream", [surql, vars], pid, Keyword.take(opts, [:timeout]))
+  end
+
+  @doc """
+  Cancels a streaming query started with `stream_query/4`. The server stops running it and
+  no more frames are sent for it.
+  """
+  @spec cancel_query(conn(), reference()) :: result()
+  def cancel_query(conn, ref) when is_reference(ref) do
+    case Connection.cancel_stream(conn, ref) do
+      {:ok, _} = ok ->
+        ok
+
+      # The stream finished before the cancel reached the server.
+      {:error, %Error{} = error} = result ->
+        if error.message =~ ~r/no streaming query/i, do: {:ok, nil}, else: result
+    end
+  end
+
+  @doc """
+  Runs a query with the server's streaming protocol and returns an Elixir `Stream` of its
+  frames, as `stream_query/4` describes them, ending with the `{:end, _}` frame (or
+  `{:error, error}`). The query starts when the stream is enumerated, and stopping early
+  cancels it.
+
+      db
+      |> SurrealDB.query_stream("SELECT * FROM event")
+      |> Stream.flat_map(fn
+        {:rows, 0, rows} -> rows
+        _frame -> []
+      end)
+      |> Enum.take(1_000)
+
+  Takes the `:timeout` option.
+  """
+  @spec query_stream(conn(), String.t(), map(), keyword()) :: Enumerable.t()
+  def query_stream(conn, surql, vars \\ %{}, opts \\ []) do
+    Stream.resource(
+      fn ->
+        server = Connection.server(conn)
+        monitor = Process.monitor(server)
+
+        case stream_query(conn, surql, vars, Keyword.put(opts, :to, self())) do
+          {:ok, ref} -> {:open, ref, monitor}
+          {:error, error} -> {:failed, error, monitor}
+        end
+      end,
+      fn
+        {:open, ref, monitor} = acc ->
+          receive do
+            {:surrealdb, :stream, ^ref, {:end, _info} = frame} ->
+              {[frame], {:done, ref, monitor}}
+
+            {:surrealdb, :stream, ^ref, {:error, _error} = frame} ->
+              {[frame], {:done, ref, monitor}}
+
+            {:surrealdb, :stream, ^ref, frame} ->
+              {[frame], acc}
+
+            {:DOWN, ^monitor, :process, _pid, reason} ->
+              error = Error.new(:connection, "the connection stopped: #{inspect(reason)}")
+              {[{:error, error}], {:done, ref, monitor}}
+          end
+
+        {:failed, error, monitor} ->
+          {[{:error, error}], {:done, nil, monitor}}
+
+        {:done, _ref, _monitor} = acc ->
+          {:halt, acc}
+      end,
+      fn
+        {:open, ref, monitor} ->
+          cancel_query(conn, ref)
+          Process.demonitor(monitor, [:flush])
+          flush_frames(ref)
+
+        {:done, _ref, monitor} ->
+          Process.demonitor(monitor, [:flush])
+      end
+    )
+  end
+
+  defp flush_frames(ref) do
+    receive do
+      {:surrealdb, :stream, ^ref, _frame} -> flush_frames(ref)
+    after
+      0 -> :ok
+    end
+  end
+
+  @doc """
+  Runs a GQL (ISO graph query language) query, returning one result per statement as
+  `query/4` does. Needs a server built with GQL support.
+
+      {:ok, [rows]} = SurrealDB.gql(db, "MATCH (p:person)-[:knows]->(f:person) RETURN f.name")
+  """
+  @spec gql(conn(), String.t(), map(), keyword()) :: result()
+  def gql(conn, query, vars \\ %{}, opts \\ []) do
+    Connection.call(conn, "gql", [query, vars], call_opts(opts))
+  end
+
+  @doc """
+  Calls a user-defined API endpoint (`DEFINE API`) through the connection, with
+  `api::invoke`, and returns the response as `%{status: _, headers: _, body: _}`.
+
+      {:ok, %{status: 200, body: body}} =
+        SurrealDB.api(db, "/users", method: :post, body: %{name: "Tobie"})
+
+  ## Options
+
+    * `:method` - `:get` (default), `:post`, `:put`, `:patch`, `:delete`, and so on.
+    * `:body` - the request body.
+    * `:query` - query parameters, as a map of strings.
+    * `:headers` - request headers, as a map of strings.
+    * `:timeout` - milliseconds before the request times out.
+  """
+  @spec api(conn(), String.t(), keyword()) ::
+          {:ok, %{status: integer(), headers: map(), body: term()}} | {:error, Error.t()}
+  def api(conn, path, opts \\ []) do
+    request =
+      %{"method" => opts |> Keyword.get(:method, :get) |> to_string() |> String.downcase()}
+      |> put_present("body", Keyword.get(opts, :body))
+      |> put_present("query", Keyword.get(opts, :query))
+      |> put_present("headers", Keyword.get(opts, :headers))
+
+    sql = "RETURN api::invoke($path, $request)"
+
+    case query(conn, sql, %{"path" => path, "request" => request}, call_opts(opts)) do
+      {:ok, [%{"status" => status} = response]} ->
+        {:ok, %{status: status, headers: response["headers"] || %{}, body: response["body"]}}
+
+      {:ok, [other]} ->
+        {:error, Error.new(:decode, "unexpected API response: #{inspect(other)}")}
+
+      {:error, %Error{kind: :query, details: %{results: [{:error, error}]}}} ->
+        {:error, error}
+
+      {:error, error} ->
+        {:error, error}
+    end
+  end
+
+  defp put_present(map, _key, nil), do: map
+  defp put_present(map, key, value), do: Map.put(map, key, value)
 
   @doc """
   Runs a query and returns the raw per-statement objects, each with `"status"`, `"time"`,
@@ -193,11 +758,22 @@ defmodule SurrealDB do
   Creates a graph edge from `from` to `to` through the `relation` table, with optional edge
   `data`.
 
-      SurrealDB.relate(db, "person:tobie", "wrote", "article:surreal", %{year: 2024})
+      alias SurrealDB.RecordId
+      SurrealDB.relate(db, RecordId.new("person", "tobie"), "wrote",
+        RecordId.new("article", "surreal"), %{year: 2024})
+
+  `from` and `to` must be record ids (or lists of them); a string raises `ArgumentError`.
   """
-  @spec relate(conn(), thing(), String.t() | Table.t(), thing(), map()) :: result()
+  @spec relate(
+          conn(),
+          record_ref() | [record_ref()],
+          String.t() | Table.t(),
+          record_ref() | [record_ref()],
+          map()
+        ) ::
+          result()
   def relate(conn, from, relation, to, data \\ %{}) do
-    params = [normalize_thing(from), normalize_thing(relation), normalize_thing(to), data]
+    params = [record!(from), normalize_thing(relation), record!(to), data]
     Connection.call(conn, "relate", params)
   end
 
@@ -220,7 +796,12 @@ defmodule SurrealDB do
 
   Notifications are delivered to the subscriber process as messages:
 
-      {:surrealdb, :live, live_id, %{action: :create | :update | :delete, result: record}}
+      {:surrealdb, :live, live_id,
+       %{action: :create | :update | :delete | :killed, result: value, record: record_id}}
+
+  `:killed` is the last message for a live query: the server ended it (for example the
+  table was removed), and the connection forgets it. Subscribers are monitored; when the
+  last subscriber of a live query exits, the connection kills the live query.
 
   ## Options
 
@@ -236,10 +817,22 @@ defmodule SurrealDB do
     Connection.call(conn, "live", [normalize_thing(table), diff], meta: %{subscriber: subscriber})
   end
 
-  @doc "Registers `pid` to also receive notifications for an existing live query id."
+  @doc """
+  Adds `pid` to the processes that receive notifications for an existing live query id.
+  Existing subscribers keep receiving them too.
+  """
   @spec subscribe_live(conn(), Uuid.t() | String.t(), pid()) :: :ok
   def subscribe_live(conn, live_id, pid \\ self()) do
     Connection.subscribe_live(conn, live_id, pid)
+  end
+
+  @doc """
+  Stops delivering notifications for a live query to `pid`. The live query keeps running
+  on the server; use `kill/2` to stop it.
+  """
+  @spec unsubscribe_live(conn(), Uuid.t() | String.t(), pid()) :: :ok
+  def unsubscribe_live(conn, live_id, pid \\ self()) do
+    Connection.unsubscribe_live(conn, live_id, pid)
   end
 
   @doc "Stops a live query."
@@ -260,34 +853,73 @@ defmodule SurrealDB do
 
   Uses the HTTP `/export` endpoint, derived from the connection URL, regardless of the
   connection's engine.
+
+  ## Options
+
+  With no options everything is exported. These choose what is included, each `true` or
+  `false`: `:users`, `:accesses`, `:params`, `:functions`, `:analyzers`, `:versions`,
+  `:records`, and on SurrealDB 3.x also `:database_definition`, `:apis`, `:buckets`,
+  `:modules`, `:configs`, and `:sequences`. `:tables` is `true`, `false`, a list of table
+  names, or `{:exclude, names}`.
+
+      SurrealDB.export(db, tables: ["person"], records: false)
+
+    * `:timeout` - milliseconds to wait for the response (default 60000).
   """
   @spec export(conn(), keyword()) :: {:ok, String.t()} | {:error, Error.t()}
-  def export(conn, opts \\ []), do: SurrealDB.Rest.export(Connection.session_info(conn), opts)
+  def export(conn, opts \\ [])
+  def export(%Transaction{}, _opts), do: {:error, http_in_txn("export")}
+  def export(conn, opts), do: SurrealDB.Rest.export(Connection.session_info(conn), opts)
 
   @doc """
-  Imports a SurrealQL script into the selected namespace and database.
+  Imports a SurrealQL script into the selected namespace and database, as `export/2`
+  writes it.
 
-  Uses the HTTP `/import` endpoint, derived from the connection URL.
+  Uses the HTTP `/import` endpoint, derived from the connection URL. The server requires the
+  script to start with `OPTION IMPORT;`, which an export always does.
+
+  An import is not a transaction: statements that fail do not stop the others. When any
+  fail, it returns `{:error, %SurrealDB.Error{kind: :query}}` whose `details.failures` lists
+  the error of each failed statement, in order.
+
+      case SurrealDB.import(db, script) do
+        {:ok, :imported} -> :ok
+        {:error, %SurrealDB.Error{details: %{failures: failures}}} -> failures
+      end
+
+  ## Options
+
+    * `:timeout` - milliseconds to wait for the response (default 60000).
   """
-  @spec import(conn(), String.t(), keyword()) :: {:ok, term()} | {:error, Error.t()}
-  def import(conn, surql, opts \\ []) do
+  @spec import(conn(), String.t(), keyword()) :: {:ok, :imported} | {:error, Error.t()}
+  def import(conn, surql, opts \\ [])
+  def import(%Transaction{}, _surql, _opts), do: {:error, http_in_txn("import")}
+
+  def import(conn, surql, opts) do
     SurrealDB.Rest.import(Connection.session_info(conn), surql, opts)
   end
+
+  # The HTTP endpoints run outside any transaction, so its writes would survive a cancel.
+  defp http_in_txn(name),
+    do: Error.new(:unsupported, "#{name} goes over HTTP and cannot run in a transaction")
 
   # ── Thing normalisation ──────────────────────────────────────────────────────
 
   @doc false
   def normalize_thing(%Table{} = table), do: table
   def normalize_thing(%RecordId{} = record), do: record
+  def normalize_thing(%StringRecordId{} = record), do: record
   def normalize_thing(%SurrealDB.Range{} = range), do: range
-
-  def normalize_thing(string) when is_binary(string) do
-    if String.contains?(string, ":") do
-      RecordId.parse(string)
-    else
-      Table.new(string)
-    end
-  end
-
+  def normalize_thing(string) when is_binary(string), do: Table.new(string)
   def normalize_thing(other), do: other
+
+  defp record!(%RecordId{} = record), do: record
+  defp record!(%StringRecordId{} = record), do: record
+  defp record!(records) when is_list(records), do: Enum.map(records, &record!/1)
+
+  defp record!(other) do
+    raise ArgumentError,
+          "expected a SurrealDB.RecordId or SurrealDB.StringRecordId, got: #{inspect(other)}. " <>
+            "Strings are never treated as record ids; use SurrealDB.RecordId.parse!/1."
+  end
 end

@@ -8,7 +8,15 @@ defmodule SurrealDB.Engine.Mock do
 
   Live notifications can be injected in a test by sending the connection process a
   `{:mock_message, encoded_payload}` message; `handle_transport/2` forwards it like any
-  other engine message.
+  other engine message. Send `:mock_closed` to simulate a dead transport, or
+  `{:mock_reset, reason}` to simulate lost in-flight requests. A responder that returns
+  `:noreply` leaves the request unanswered, `{:delay, ms, result}` (or
+  `{:delay, ms, {:error, error}}`) answers after `ms`, `{:batch, result, payloads}` delivers
+  the reply and the extra payloads in one transport message, `{:closing, result}` answers
+  and closes the transport in the same batch, `{:send_error, reason}` fails the send
+  itself, and `{:frames, results}` answers it with one response per result, as a
+  streaming query is answered. A responder of arity 3 also gets the decoded request, to
+  check its `"session"` and `"txn"` fields.
   """
 
   @behaviour SurrealDB.Engine
@@ -19,31 +27,85 @@ defmodule SurrealDB.Engine.Mock do
   def connect(_uri, opts) do
     codec = SurrealDB.Codec.resolve(Keyword.get(opts, :codec, :cbor))
     responder = Keyword.get(opts, :responder, &default_responder/2)
-    {:ok, %__MODULE__{codec: codec, responder: responder}}
+
+    # A responder can refuse the connection by answering the pseudo-method "__connect__"
+    # with `{:error, reason}`.
+    case respond(responder, "__connect__", [], %{}) do
+      {:error, reason} -> {:error, reason}
+      _ -> {:ok, %__MODULE__{codec: codec, responder: responder}}
+    end
   end
 
   @impl true
-  def request(%__MODULE__{codec: codec, responder: responder} = conn, payload, _session) do
+  def request(%__MODULE__{codec: codec, responder: responder} = conn, _id, payload, _session) do
     {:ok, request} = codec.decode(IO.iodata_to_binary(payload))
     id = request["id"]
     method = request["method"]
     params = request["params"] || []
 
-    response =
-      case responder.(method, params) do
-        {:ok, result} -> %{"id" => id, "result" => result}
-        {:error, error} -> %{"id" => id, "error" => error}
-      end
+    case respond(responder, method, params, request) do
+      {:send_error, reason} ->
+        {:error, reason}
 
-    send(self(), {:mock_message, codec.encode(response)})
-    {:ok, conn}
+      :noreply ->
+        :ok
+
+      {:failed, error} ->
+        send(self(), {:mock_failed, id, error})
+
+      {:ok, result} ->
+        send(self(), {:mock_message, codec.encode(%{"id" => id, "result" => result})})
+
+      {:frames, results} ->
+        for result <- results do
+          send(self(), {:mock_message, codec.encode(%{"id" => id, "result" => result})})
+        end
+
+      {:closing, result} ->
+        send(self(), {:mock_closing, codec.encode(%{"id" => id, "result" => result})})
+
+      {:error, error} ->
+        send(self(), {:mock_message, codec.encode(%{"id" => id, "error" => error})})
+
+      {:delay, ms, {:error, error}} ->
+        reply = codec.encode(%{"id" => id, "error" => error})
+        Process.send_after(self(), {:mock_message, reply}, ms)
+
+      {:delay, ms, result} ->
+        reply = codec.encode(%{"id" => id, "result" => result})
+        Process.send_after(self(), {:mock_message, reply}, ms)
+
+      {:batch, result, payloads} ->
+        reply = codec.encode(%{"id" => id, "result" => result})
+        send(self(), {:mock_batch, [reply | Enum.map(payloads, &codec.encode/1)]})
+    end
+    |> case do
+      {:error, reason} -> {:error, reason}
+      _sent -> {:ok, conn}
+    end
   end
+
+  # A 3-arity responder also gets the whole request, to see its session and txn.
+  defp respond(responder, method, params, request) when is_function(responder, 3),
+    do: responder.(method, params, request)
+
+  defp respond(responder, method, params, _request), do: responder.(method, params)
 
   @impl true
   def handle_transport(conn, {:mock_message, payload}) do
     {:ok, [{:message, IO.iodata_to_binary(payload)}], conn}
   end
 
+  def handle_transport(conn, {:mock_batch, payloads}) do
+    {:ok, Enum.map(payloads, &{:message, IO.iodata_to_binary(&1)}), conn}
+  end
+
+  def handle_transport(conn, {:mock_closing, payload}),
+    do: {:ok, [{:message, IO.iodata_to_binary(payload)}, :closed], conn}
+
+  def handle_transport(conn, {:mock_failed, id, error}), do: {:ok, [{:failed, id, error}], conn}
+  def handle_transport(conn, :mock_closed), do: {:ok, [:closed], conn}
+  def handle_transport(conn, {:mock_reset, reason}), do: {:ok, [{:reset, reason}], conn}
   def handle_transport(_conn, _message), do: :unknown
 
   @impl true
@@ -52,10 +114,11 @@ defmodule SurrealDB.Engine.Mock do
   @impl true
   def supports_live?, do: true
 
+  defp default_responder("__connect__", _params), do: :ok
   defp default_responder("use", _params), do: {:ok, nil}
   defp default_responder("signin", _params), do: {:ok, "mock.jwt.token"}
   defp default_responder("signup", _params), do: {:ok, "mock.jwt.token"}
   defp default_responder("authenticate", _params), do: {:ok, nil}
-  defp default_responder("version", _params), do: {:ok, "surrealdb-2.0.0"}
+  defp default_responder("version", _params), do: {:ok, "surrealdb-3.0.0"}
   defp default_responder(_method, params), do: {:ok, params}
 end
