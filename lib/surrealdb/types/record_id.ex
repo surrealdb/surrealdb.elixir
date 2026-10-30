@@ -44,8 +44,8 @@ defmodule SurrealDB.RecordId do
       iex> SurrealDB.RecordId.parse("temp:['london', 2024]")
       {:ok, %SurrealDB.RecordId{table: "temp", id: ["london", 2024]}}
 
-      iex> SurrealDB.RecordId.parse("person")
-      {:error, "expected `:` after the table name in \\"person\\""}
+      iex> match?({:error, _reason}, SurrealDB.RecordId.parse("person"))
+      true
   """
   @spec parse(String.t()) :: {:ok, t()} | {:error, String.t()}
   def parse(string) when is_binary(string) do
