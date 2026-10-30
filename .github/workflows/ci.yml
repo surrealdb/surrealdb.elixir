@@ -64,6 +64,9 @@ jobs:
       - name: Run tests
         run: mix test
 
+      - name: Build the hex package
+        run: mix hex.build
+
   integration:
     name: Integration (SurrealDB ${{ matrix.surrealdb }})
     runs-on: ubuntu-24.04
